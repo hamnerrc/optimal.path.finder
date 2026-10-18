@@ -129,3 +129,53 @@ assumption.
 39. When you're ready for GitHub Pages: what's the GitHub repo (or should I
     create one with `gh`, and under what name)?
     Answer: I have created an empty repo at https://github.com/hamnerrc/optimal.path.finder for you to deploy to
+
+
+=============================================================================
+ROUND 3 (2026-10-18): DONE FROM YOUR ROUND 2 ANSWERS, AND OPEN POINTS
+=============================================================================
+
+Done:
+- Area mode: equal roundness -> the loop enclosing more area wins (Q24).
+  Roads are loaded up to 20% beyond the area (Q25). The coverage target is
+  now a slider with a plain-language explanation, default 90% (Q26).
+- Start point mode explains that loops start at an intersection (Q28).
+- Pace can be typed as min/mi, min/km, mph or km/h (Q30). The Run/Bike
+  switch is gone, since it only changed the time estimate.
+- Big searches (Q31-33). Measured limit for loading every road at once: a
+  10 mi loop in central Chicago is ~80 sq mi, a 73 MB download (~50 s),
+  ~200k intersections, ~650 MB of browser memory. So searches over 80 sq mi
+  run in stages: a rough loop on major roads (downloaded in tiles), then
+  every ~10 mi stretch is re-optimized with all roads within half a mile of
+  it. Tested on a 15 mi start loop and an area loop. The loop updates live,
+  Stop keeps the best so far, and it can be exported at any time. Search
+  times now go up to 10 minutes.
+- New "Place" tab (Q34): search a city, county, state, lake or park and its
+  real boundary becomes the area.
+- 3-point (rotatable) rectangle and freehand polygon (Q35). GPX export (Q36).
+- "Find loops" skips start points whose loop is already up to date (Q37).
+
+40. Deploying to GitHub Pages (Q39): my push was blocked by Claude Code's
+    permission settings, so nothing is on GitHub yet. To deploy, run in the
+    project folder:
+        git remote add origin https://github.com/hamnerrc/optimal.path.finder.git
+        git push -u origin main
+    then on GitHub: Settings > Pages > Source "Deploy from a branch",
+    branch "main", folder "/ (root)". The site will be at
+    https://hamnerrc.github.io/optimal.path.finder/
+    Or allow pushes for me and I'll do it.
+    Answer:
+
+41. Q34 said "precompute borders for all cities, counties, lakes". Instead,
+    boundaries are looked up when you search (OpenStreetMap via Nominatim);
+    precomputing them all would be gigabytes. Is search-by-name enough, or
+    do you also want to browse, e.g. click the map to pick the county or city
+    you clicked in?
+    Answer:
+
+42. Jagged boundaries (city limits with annexed lobes) give low-roundness
+    loops: Lawrence, KS at 80% coverage comes out around IQ 0.2-0.3, and
+    results vary quite a bit between runs. Longer search times help. Is it
+    worth running several independent searches and keeping the best (more
+    consistent, but proportionally slower), or is the current behavior OK?
+    Answer:
