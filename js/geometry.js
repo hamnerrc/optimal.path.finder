@@ -338,15 +338,33 @@ function createShapeRegion(shape) {
     return createPolygonRegion(shape.points, shape.type);
 }
 
-// The region roads are loaded from for an area search: the shape grown by
-// `factor` around its center, so the loop can use roads just outside it.
+// The region roads are loaded from for an area search: the shape's convex
+// hull grown by `factor` around its center, so the loop can use roads just
+// outside it, including around the outside of any inward notches (e.g. in
+// city limits).
 function marginRegion(region, factor) {
     if (region.type === "circle") return createCircleRegion(region.center, region.radiusMeters * factor);
     const bbox = region.bbox;
     const { toXY, toLatLng } = localProjection((bbox.minLat + bbox.maxLat) / 2, (bbox.minLng + bbox.maxLng) / 2);
-    const xy = region.outline.map(toXY);
+    const xy = convexHull(region.outline.map(toXY));
     const c = polygonCentroidXY(xy);
     return createPolygonRegion(xy.map(p => toLatLng(c.x + (p.x - c.x) * factor, c.y + (p.y - c.y) * factor)));
+}
+
+// Convex hull (monotone chain), counter-clockwise.
+function convexHull(points) {
+    const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+    const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    const half = (list) => {
+        const out = [];
+        for (const p of list) {
+            while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], p) <= 0) out.pop();
+            out.push(p);
+        }
+        out.pop();
+        return out;
+    };
+    return half(sorted).concat(half(sorted.reverse()));
 }
 
 function polygonCentroidXY(points) {
@@ -369,6 +387,6 @@ if (typeof module !== "undefined") {
         haversine, metersToMiles, milesToMeters, sqKmToSqMiles, localProjection, boundsOf,
         createCircleRegion, createCircleFromDiameter, createEllipseRegion, createRectangleRegion,
         createPolygonRegion, createCorridorRegion, simplifyLine, simplifyRing,
-        createShapeRegion, marginRegion, polygonCentroidXY
+        createShapeRegion, marginRegion, polygonCentroidXY, convexHull
     };
 }

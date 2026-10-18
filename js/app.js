@@ -223,7 +223,11 @@ function render() {
 
 function routeHintText(ready, blocked, pending) {
     if (blocked) return "Finish the shape first.";
-    if (ready && !pending) return "Move a pin, change a length or pick a longer search time to search again.";
+    if (ready && !pending) {
+        return state.mode === "distance"
+            ? "Move a pin, change a length or pick a longer search time to search again."
+            : "Change the area, the coverage or the search time to search again.";
+    }
     if (ready) return "";
     if (state.mode === "distance") return "Add a start point to continue.";
     return state.mode === "shape" ? "Draw an area to continue." : "Choose a place to continue.";

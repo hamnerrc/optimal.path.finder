@@ -806,7 +806,25 @@ function* solveLoop(network, params, control = {}) {
         yield progress(improved);
     }
 
-    const final = best || bestAny;
+    // Polish: drop any waypoint whose removal improves the loop. This clears
+    // out-and-back spikes (e.g. up one side of a divided road and back down
+    // the other) that random moves only remove occasionally.
+    let final = best || bestAny;
+    const minPoints = isRefine ? 0 : isStart ? 2 : 3;
+    for (let pass = 0, changed = true; changed && pass < 3 && final?.loop && !control.stop; pass++) {
+        changed = false;
+        for (let i = 0; i < final.points.length && final.points.length > minPoints; i++) {
+            const cand = tryWaypoints(final.points.filter((_, k) => k !== i), final);
+            if (cand.loop && cand.score > final.score && (cand.feasible || !final.feasible)) {
+                final = cand;
+                consider(cand);
+                changed = true;
+                i--;
+            }
+        }
+        yield progress(false);
+    }
+
     if (!final || !final.loop) throw new Error("Couldn't find a loop here.");
     return buildResult(g, final, params, startNode, targetXY, true);
 }
@@ -882,22 +900,6 @@ function centroid(points) {
         return { x: points.reduce((s, p) => s + p.x, 0) / points.length, y: points.reduce((s, p) => s + p.y, 0) / points.length };
     }
     return { x: cx / (3 * area), y: cy / (3 * area) };
-}
-
-// Convex hull (monotone chain), counter-clockwise.
-function convexHull(points) {
-    const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
-    const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
-    const half = (list) => {
-        const out = [];
-        for (const p of list) {
-            while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], p) <= 0) out.pop();
-            out.push(p);
-        }
-        out.pop();
-        return out;
-    };
-    return half(sorted).concat(half(sorted.reverse()));
 }
 
 function polygonPerimeter(points) {
