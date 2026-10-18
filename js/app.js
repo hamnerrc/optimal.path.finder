@@ -29,6 +29,7 @@ const ui = {
     chooseCircleButton: $("chooseCircleButton"),
     chooseEllipseButton: $("chooseEllipseButton"),
     chooseRectangleButton: $("chooseRectangleButton"),
+    choosePolygonButton: $("choosePolygonButton"),
     shapeDrawTitle: $("shapeDrawTitle"),
     shapeDrawInstructions: $("shapeDrawInstructions"),
     shapeDrawProgress: $("shapeDrawProgress"),
@@ -41,7 +42,19 @@ const ui = {
     editShapeButton: $("editShapeButton"),
     redrawShapeButton: $("redrawShapeButton"),
     deleteShapeButton: $("deleteShapeButton"),
+
+    placeSection: $("placeSection"),
+    placeForm: $("placeForm"),
+    placeInput: $("placeInput"),
+    placeResults: $("placeResults"),
+    placeSaved: $("placeSaved"),
+    placeSummaryName: $("placeSummaryName"),
+    placeSummaryDetail: $("placeSummaryDetail"),
+    clearPlaceButton: $("clearPlaceButton"),
+
+    coverageSection: $("coverageSection"),
     coverageInput: $("coverageInput"),
+    coverageOutput: $("coverageOutput"),
 
     routesSection: $("routesSection"),
     routeList: $("routeList"),
@@ -55,14 +68,14 @@ const ui = {
     statTime: $("statTime"),
     statClimb: $("statClimb"),
     routeWarning: $("routeWarning"),
-    activityButtons: document.querySelectorAll("[data-activity]"),
     paceInput: $("paceInput"),
-    paceUnit: $("paceUnit"),
+    paceFormatSelect: $("paceFormatSelect"),
     reverseButton: $("reverseButton"),
     elevationSummary: $("elevationSummary"),
     elevationChart: $("elevationChart"),
     saveRouteButton: $("saveRouteButton"),
     exportKmlButton: $("exportKmlButton"),
+    exportGpxButton: $("exportGpxButton"),
 
     savedSection: $("savedSection"),
     savedCount: $("savedCount"),
@@ -95,8 +108,12 @@ const ui = {
 const SHAPES = {
     circle: { label: "circle", points: 2, instructions: "Click two points on the map, one on each side of the circle." },
     ellipse: { label: "ellipse", points: 3, instructions: "Click three points on the map that the ellipse's edge should pass through." },
-    rectangle: { label: "rectangle", points: 2, instructions: "Click two opposite corners of the rectangle." }
+    rectangle: { label: "rectangle", points: 3, instructions: "Click two corners along one side, then a point on the opposite side to set the width." },
+    // Freehand: any number of corners (at least minPoints).
+    polygon: { label: "freehand shape", points: Infinity, minPoints: 3, instructions: "Click the map to add corners. Click \u201cUse this shape\u201d when done (3 or more)." }
 };
+
+const shapeReady = (type, count) => SHAPES[type].points === Infinity ? count >= SHAPES[type].minPoints : count === SHAPES[type].points;
 
 const storedPrefs = loadPrefs();
 const prefs = {
@@ -104,9 +121,9 @@ const prefs = {
     defaultDistanceM: storedPrefs.defaultDistanceM > 0 ? storedPrefs.defaultDistanceM : milesToMeters(CONFIG.defaultDistanceMiles),
     coveragePercent: storedPrefs.coveragePercent > 0 ? storedPrefs.coveragePercent : CONFIG.defaultCoveragePercent,
     effort: CONFIG.searchEffort[storedPrefs.effort] ? storedPrefs.effort : CONFIG.defaultEffort,
-    activity: storedPrefs.activity === "bike" ? "bike" : "run",
-    runPaceSecPerM: storedPrefs.runPaceSecPerM > 0 ? storedPrefs.runPaceSecPerM : CONFIG.defaultRunPaceSecPerMile / METERS_PER_MILE,
-    bikeSpeedMps: storedPrefs.bikeSpeedMps > 0 ? storedPrefs.bikeSpeedMps : milesToMeters(CONFIG.defaultBikeSpeedMph) / 3600
+    // Pace is stored as a speed (m/s) and shown in the chosen format.
+    paceFormat: PACE_FORMATS[storedPrefs.paceFormat] ? storedPrefs.paceFormat : (storedPrefs.units === "km" ? "min/km" : "min/mi"),
+    speedMps: storedPrefs.speedMps > 0 ? storedPrefs.speedMps : METERS_PER_MILE / CONFIG.defaultPaceSecPerMile
 };
 const rememberPrefs = () => savePrefs(prefs);
 setUnits(prefs.units);
@@ -125,10 +142,13 @@ const state = {
     draft: null,               // { type, points } while drawing
     editSnapshot: null,        // points before editing, restored on cancel
 
-    network: null,             // most recently loaded road network
-    loading: null,             // AbortController while a search runs
+    place: null,               // { name, kind, outline: [{ lat, lng }] }
+    placeLayer: null,
 
-    routes: [],                // found or loaded loops, see addRoute()
+    network: null,             // most recently loaded road network
+    loading: null,             // { controller, control } while a search runs
+
+    routes: [],                // found or loaded loops, see showLoop()
     activeRouteId: null,
     nextRouteId: 1,
 
@@ -145,6 +165,8 @@ function render() {
     ui.modeTabs.forEach(tab => tab.setAttribute("aria-selected", String(tab.dataset.mode === mode)));
     ui.distanceSection.hidden = mode !== "distance";
     ui.shapeSection.hidden = mode !== "shape";
+    ui.placeSection.hidden = mode !== "place";
+    ui.coverageSection.hidden = mode === "distance";
 
     // Distance mode
     ui.pickButton.classList.toggle("is-active", interaction === "pick");
@@ -160,21 +182,30 @@ function render() {
     if (step === "draw") renderDrawProgress();
     if (step === "saved" || step === "edit") renderShapeSummary();
 
+    // Place mode
+    ui.placeSaved.hidden = !state.place;
+    if (state.place) {
+        ui.placeSummaryName.textContent = state.place.name;
+        ui.placeSummaryDetail.textContent = `${state.place.kind} · ${formatArea(createPolygonRegion(state.place.outline).areaSqKm * 1e6)}`;
+    }
+
     // Map cursor
     map.getContainer().classList.toggle("is-picking", interaction === "pick" || interaction === "draw");
 
     // Footer
-    const ready = searchJobs().length > 0;
+    const jobs = searchJobs();
+    const ready = jobs.length > 0;
+    const pending = jobs.filter(job => !isUpToDate(job)).length;
     const blocked = interaction === "draw" || interaction === "edit";
-    ui.getRouteButton.disabled = !ready || blocked || Boolean(loading);
+    ui.getRouteButton.disabled = !ready || !pending || blocked || Boolean(loading);
     ui.getRouteButton.classList.toggle("is-loading", Boolean(loading));
     ui.cancelLoadButton.hidden = !loading;
     ui.searchProgress.hidden = !loading;
     if (!loading) {
-        const count = state.mode === "distance" ? state.starts.length : 1;
-        ui.getRouteLabel.textContent = count > 1 ? `Find ${count} loops` : "Find loop";
+        ui.getRouteLabel.textContent = ready && !pending ? "Loops are up to date"
+            : pending > 1 ? `Find ${pending} loops` : "Find loop";
     }
-    ui.routeHint.textContent = loading ? "" : routeHintText(ready, blocked);
+    ui.routeHint.textContent = loading ? "" : routeHintText(ready, blocked, pending);
     ui.routeHint.hidden = !ui.routeHint.textContent;
 
     // Network
@@ -190,10 +221,12 @@ function render() {
     renderSaved();
 }
 
-function routeHintText(ready, blocked) {
+function routeHintText(ready, blocked, pending) {
     if (blocked) return "Finish the shape first.";
+    if (ready && !pending) return "Move a pin, change a length or pick a longer search time to search again.";
     if (ready) return "";
-    return state.mode === "distance" ? "Add a start point to continue." : "Draw an area to continue.";
+    if (state.mode === "distance") return "Add a start point to continue.";
+    return state.mode === "shape" ? "Draw an area to continue." : "Choose a place to continue.";
 }
 
 function renderDrawProgress() {
@@ -201,10 +234,11 @@ function renderDrawProgress() {
     const total = SHAPES[type].points;
     ui.shapeDrawTitle.textContent = `Draw ${SHAPES[type].label}`;
     ui.shapeDrawInstructions.textContent = SHAPES[type].instructions;
-    ui.shapeDrawProgress.innerHTML =
-        Array.from({ length: total }, (_, i) => `<span class="${i < points.length ? "done" : ""}"></span>`).join("") +
-        `<em>${points.length} of ${total} points</em>`;
-    ui.finalizeShapeButton.disabled = points.length !== total;
+    ui.shapeDrawProgress.innerHTML = total === Infinity
+        ? `<em>${points.length} point${points.length === 1 ? "" : "s"}</em>`
+        : Array.from({ length: total }, (_, i) => `<span class="${i < points.length ? "done" : ""}"></span>`).join("") +
+          `<em>${points.length} of ${total} points</em>`;
+    ui.finalizeShapeButton.disabled = !shapeReady(type, points.length);
 }
 
 function renderShapeSummary() {
@@ -214,6 +248,9 @@ function renderShapeSummary() {
     if (region.type === "circle") {
         ui.shapeSummaryType.textContent = "Circle";
         ui.shapeSummaryDetail.textContent = `${formatDistance(region.radiusMeters)} radius · ${area}`;
+    } else if (region.type === "polygon") {
+        ui.shapeSummaryType.textContent = "Freehand shape";
+        ui.shapeSummaryDetail.textContent = `${region.outline.length} corners · ${area}`;
     } else {
         const [w, h] = region.type === "rectangle" ? region.sizeMeters : region.semiAxesMeters.map(m => m * 2);
         ui.shapeSummaryType.textContent = region.type === "rectangle" ? "Rectangle" : "Ellipse";
@@ -254,6 +291,7 @@ function setMode(mode) {
     // Show only the active mode's drawings.
     toggleLayer(layers.starts, mode === "distance");
     toggleLayer(layers.shape, mode === "shape");
+    toggleLayer(layers.place, mode === "place");
     render();
 }
 
@@ -403,7 +441,7 @@ function addDraftPoint(latlng) {
 
 function redrawDraft() {
     const { type, points } = state.draft;
-    if (points.length === SHAPES[type].points) drawShapeOutline({ type, points }, "pending");
+    if (shapeReady(type, points.length)) drawShapeOutline({ type, points }, "pending");
 }
 
 function cancelDrawing() {
@@ -415,7 +453,7 @@ function cancelDrawing() {
 
 function finalizeShape() {
     const { type, points } = state.draft;
-    if (points.length !== SHAPES[type].points) return;
+    if (!shapeReady(type, points.length)) return;
     clearHandles();
     state.shape = { type, points: [...points] };
     state.draft = null;
@@ -491,6 +529,7 @@ function drawShapeOutline(shape, variant) {
 ui.chooseCircleButton.addEventListener("click", () => startDrawing("circle"));
 ui.chooseEllipseButton.addEventListener("click", () => startDrawing("ellipse"));
 ui.chooseRectangleButton.addEventListener("click", () => startDrawing("rectangle"));
+ui.choosePolygonButton.addEventListener("click", () => startDrawing("polygon"));
 ui.cancelDrawButton.addEventListener("click", () => { cancelDrawing(); render(); });
 ui.finalizeShapeButton.addEventListener("click", finalizeShape);
 ui.editShapeButton.addEventListener("click", startEditing);
@@ -500,11 +539,14 @@ ui.cancelEditButton.addEventListener("click", cancelEditing);
 ui.doneEditButton.addEventListener("click", finishEditing);
 
 ui.coverageInput.value = prefs.coveragePercent;
+ui.coverageOutput.textContent = `${prefs.coveragePercent}%`;
 ui.coverageInput.addEventListener("input", () => {
     const value = parseFloat(ui.coverageInput.value);
     if (value > 0 && value <= 100) {
         prefs.coveragePercent = value;
+        ui.coverageOutput.textContent = `${value}%`;
         rememberPrefs();
+        render();
     }
 });
 
@@ -529,6 +571,7 @@ document.addEventListener("keydown", (e) => {
         render();
     }
     ui.searchResults.hidden = true;
+    ui.placeResults.hidden = true;
 });
 
 // Cursor position readout, throttled to one DOM write per frame.
@@ -553,104 +596,133 @@ updateCoords();
 // Finding loops
 // ==========================================================================
 
-// One job per loop to find: each start point, or the drawn area.
+// One job per loop to find: each start point, or the drawn area / place.
 function searchJobs() {
+    const timeBudgetMs = CONFIG.searchEffort[prefs.effort].ms;
     if (state.mode === "distance") {
-        return state.starts.map(start => ({
-            kind: "start",
-            start,
-            region: startRegion(start),
-            label: `Start ${startNumber(start.id)}`
-        }));
+        return state.starts.map(start => {
+            const { lat, lng } = start.latlng;
+            return {
+                kind: "start",
+                start,
+                label: `Start ${startNumber(start.id)}`,
+                key: `start:${start.id}:${lat.toFixed(6)},${lng.toFixed(6)}:${Math.round(start.maxDistanceM)}:${prefs.effort}`,
+                region: startRegion(start),
+                objective: { mode: "start", start: { lat, lng }, maxLengthM: start.maxDistanceM },
+                timeBudgetMs
+            };
+        });
     }
-    if (!state.shape) return [];
+
+    let target, label;
+    if (state.mode === "shape" && state.shape) {
+        target = createShapeRegion(state.shape);
+        const name = SHAPES[state.shape.type].label;
+        label = `${name[0].toUpperCase()}${name.slice(1)} area`;
+    } else if (state.mode === "place" && state.place) {
+        target = createPolygonRegion(state.place.outline, "place");
+        label = state.place.name;
+    } else {
+        return [];
+    }
+    const outline = target.outline.map(p => ({ lat: p.lat, lng: p.lng }));
     return [{
         kind: "area",
-        shape: state.shape,
-        region: createShapeRegion(scaleShape(state.shape, CONFIG.areaMargin)),
-        target: createShapeRegion(state.shape),
-        label: `${SHAPES[state.shape.type].label[0].toUpperCase()}${SHAPES[state.shape.type].label.slice(1)} area`
+        label,
+        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${prefs.coveragePercent}:${prefs.effort}`,
+        region: marginRegion(target, CONFIG.areaMargin),
+        objective: { mode: "area", target: outline, coverage: prefs.coveragePercent / 100 },
+        timeBudgetMs
     }];
 }
 
-let previewLayer = null;
+// A finished loop already exists for exactly this job (same pin, length,
+// shape, coverage and search time), so there's nothing to recompute.
+const isUpToDate = (job) => state.routes.some(r => r.jobKey === job.key && !r.searching);
 
 async function findLoops() {
-    const jobs = searchJobs();
+    const jobs = searchJobs().filter(job => !isUpToDate(job));
     if (!jobs.length || state.loading) return;
 
     const sqKm = jobs.reduce((sum, job) => sum + job.region.areaSqKm, 0);
     if (sqKmToSqMiles(sqKm) > CONFIG.largeAreaSqMiles) {
         const ok = await confirmDialog(
-            "Large area",
-            `The roads to load cover about ${formatArea(sqKm * 1e6)}. Downloading them may take a while ` +
-            `and could slow your browser down. Continue anyway?`
+            "Large search",
+            `This search covers about ${formatArea(sqKm * 1e6)}. It runs in stages: first a rough loop on ` +
+            `major roads, then each stretch is improved using all roads. It can take several minutes. ` +
+            `You can stop it at any time and keep (or export) the best loop found so far.`
         );
         if (!ok) return;
     }
 
     const controller = new AbortController();
-    state.loading = controller;
+    const control = { stop: false };
+    state.loading = { controller, control };
     layers.network.clearLayers();
     render();
 
     const found = [];
-    try {
-        for (const [index, job] of jobs.entries()) {
-            const prefix = jobs.length > 1 ? `${job.label} (${index + 1} of ${jobs.length}): ` : "";
-            showProgress(0, `${prefix}Downloading roads…`);
-            const osm = await fetchRoads(job.region, controller.signal);
-
-            showProgress(0, `${prefix}Building road network…`);
-            await nextFrame();
-            const network = buildRoadNetwork(osm, job.region);
-            if (network.edges.length === 0) {
-                toast(`${job.label}: no roads found here.`, "warning");
-                continue;
+    let stopped = false;
+    for (const [index, job] of jobs.entries()) {
+        if (control.stop) break;
+        const prefix = jobs.length > 1 ? `${job.label} (${index + 1} of ${jobs.length}): ` : "";
+        let route = null;
+        const show = (loop) => {
+            const isNew = !route;
+            route = showLoop(route, loop, job);
+            if (isNew) {
+                found.push(route);
+                if (found.length === 1) {
+                    selectRoute(route.id);
+                    fitBounds(route.layer.getBounds());
+                }
             }
-            state.network = network;
-            drawNetwork(network);
-            console.log("[Network]", network);
+        };
 
-            const params = job.kind === "start"
-                ? { mode: "start", start: { lat: job.start.latlng.lat, lng: job.start.latlng.lng }, maxLengthM: job.start.maxDistanceM }
-                : { mode: "area", target: job.target.outline.map(p => ({ lat: p.lat, lng: p.lng })), coverage: prefs.coveragePercent / 100 };
-            params.timeBudgetMs = CONFIG.searchEffort[prefs.effort].ms;
-
-            let bestText = "";
-            const result = await runSolver(network, params, {
+        try {
+            const result = await searchLoop(job, {
                 signal: controller.signal,
-                onProgress: ({ fraction, best }) => {
-                    if (best) {
-                        drawPreview(best);
-                        bestText = ` Best so far: ${formatDistance(best.lengthM)}, ${formatArea(best.areaM2)}.`;
-                    }
-                    showProgress(fraction, `${prefix}Searching…${bestText}`);
+                control,
+                onStatus: (text, fraction) => showProgress(fraction, `${prefix}${text}${route ? ` Best so far: ${formatDistance(route.lengthM)}, ${formatArea(route.areaM2)}.` : ""}`),
+                onLoop: show,
+                onNetwork: (network) => {
+                    state.network = network;
+                    drawNetwork(network);
+                    console.log("[Network]", network);
                 }
             });
-            drawPreview(null);
-            found.push(addRoute(result, job));
-        }
-    } catch (err) {
-        if (err.name === "AbortError") {
-            toast("Search cancelled.");
-        } else {
+            show(result);
+            route.searching = false;
+            // A search that ran to the end needn't be repeated.
+            if (!control.stop) route.jobKey = job.key;
+        } catch (err) {
+            if (route) route.searching = false;
+            if (err.name === "AbortError") {
+                stopped = true;
+                break;
+            }
             console.error("[Search] Failed:", err);
-            toast(err instanceof OverpassError ? err.message : err.message || "Couldn't find a loop. Check your connection and try again.", "error");
+            toast(`${jobs.length > 1 ? `${job.label}: ` : ""}${err.message || "Couldn't find a loop. Check your connection and try again."}`, "error", 6000);
         }
-    } finally {
-        drawPreview(null);
-        state.loading = null;
-        render();
     }
 
-    if (found.length) {
-        selectRoute(found[0].id);
-        fitBounds(L.latLngBounds(found.flatMap(r => [r.layer.getBounds().getSouthWest(), r.layer.getBounds().getNorthEast()])));
-        const infeasible = found.filter(r => !r.feasible).length;
-        if (infeasible) toast(`${infeasible} loop${infeasible > 1 ? "s don't" : " doesn't"} meet every requirement. See the warning under the loop.`, "warning", 6000);
-        else toast(found.length > 1 ? `Found ${found.length} loops.` : "Loop found.", "success");
+    state.loading = null;
+    render();
+    if (!found.length) {
+        if (stopped) toast("Search stopped before a loop was found.");
+        return;
     }
+
+    const active = activeRoute();
+    if (active) {
+        renderRouteDetail();
+        if (active.elevation === null) loadElevation(active);
+    }
+    fitBounds(L.latLngBounds(found.flatMap(r => [r.layer.getBounds().getSouthWest(), r.layer.getBounds().getNorthEast()])));
+    const infeasible = found.filter(r => !r.feasible).length;
+    if (stopped) toast("Search stopped. Kept the best loop found so far.", "info", 5000);
+    else if (infeasible) toast(`${infeasible} loop${infeasible > 1 ? "s don't" : " doesn't"} meet every requirement. See the warning under the loop.`, "warning", 6000);
+    else toast(found.length > 1 ? `Found ${found.length} loops.` : "Loop found.", "success");
 }
 
 function showProgress(fraction, text) {
@@ -659,56 +731,76 @@ function showProgress(fraction, text) {
     ui.getRouteLabel.textContent = fraction > 0 ? "Searching…" : "Loading…";
 }
 
-function drawPreview(result) {
-    if (previewLayer) layers.routes.removeLayer(previewLayer);
-    previewLayer = result ? L.polyline(result.coords, previewStyle).addTo(layers.routes) : null;
+// Stopping keeps every loop found so far, including the one being improved.
+function stopSearch() {
+    if (!state.loading) return;
+    state.loading.control.stop = true;
+    state.loading.controller.abort();
 }
 
-// Yields so the browser can paint the loading state before heavy work.
-const nextFrame = () => new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
-
 ui.getRouteButton.addEventListener("click", findLoops);
-ui.cancelLoadButton.addEventListener("click", () => state.loading?.abort());
+ui.cancelLoadButton.addEventListener("click", stopSearch);
 
 ui.showNetworkInput.addEventListener("change", () => toggleLayer(layers.network, ui.showNetworkInput.checked));
 
+const formatSeconds = (ms) => ms < 60000 ? `${ms / 1000} s` : `${ms / 60000} min`;
 for (const [key, { label, ms }] of Object.entries(CONFIG.searchEffort)) {
-    ui.effortSelect.add(new Option(`${label} (${ms / 1000} s per loop)`, key, false, key === prefs.effort));
+    ui.effortSelect.add(new Option(`${label} (${formatSeconds(ms)} per loop)`, key, false, key === prefs.effort));
 }
 ui.effortSelect.addEventListener("change", () => {
     prefs.effort = ui.effortSelect.value;
     rememberPrefs();
+    render();
 });
 
 // ==========================================================================
 // Loops on the map and in the panel
 // ==========================================================================
 
-// route: { id, label, mode, startId, coords, cum, lengthM, areaM2, iq,
-//          coverage, feasible, warning, startOffsetM, reversed,
-//          elevation (null | data | "loading" | "error"), layer }
-function addRoute(result, job) {
-    // A new loop replaces the previous one for the same start point or area.
-    const replaces = state.routes.find(r =>
-        (job.kind === "start" && r.startId === job.start.id) || (job.kind === "area" && r.mode === "area" && !r.savedName));
-    if (replaces) removeRoute(replaces.id, false);
+// route: { id, label, mode, startId, jobKey, searching, coords, cum,
+//          lengthM, areaM2, iq, coverage, feasible, warning, startOffsetM,
+//          reversed, elevation (null | data | "loading" | "error"), layer }
 
-    const route = createRoute({
-        label: job.label,
-        mode: result.mode,
-        startId: job.kind === "start" ? job.start.id : null,
-        coords: result.coords,
-        lengthM: result.lengthM,
-        areaM2: result.areaM2,
-        iq: result.iq,
-        coverage: result.coverage ?? null,
-        feasible: result.feasible,
-        startOffsetM: 0,
-        reversed: false
+// Creates the route for a job on its first loop, then updates it in place as
+// the search finds better loops.
+function showLoop(route, loop, job) {
+    if (!route) {
+        // A new loop replaces the previous one for the same start point or area.
+        const replaces = state.routes.find(r =>
+            (job.kind === "start" && r.startId === job.start.id) || (job.kind === "area" && r.mode === "area" && !r.savedName));
+        if (replaces) removeRoute(replaces.id, false);
+        route = createRoute({
+            label: job.label,
+            mode: job.objective.mode,
+            startId: job.kind === "start" ? job.start.id : null,
+            searching: true,
+            coords: loop.coords,
+            startOffsetM: 0,
+            reversed: false
+        });
+    } else {
+        route.coords = loop.coords;
+        route.cum = cumulativeDistances(loop.coords);
+        route.layer.setLatLngs(loop.coords);
+        route.elevation = null;
+    }
+
+    Object.assign(route, {
+        lengthM: loop.lengthM,
+        areaM2: loop.areaM2,
+        iq: loop.iq,
+        coverage: loop.coverage ?? null,
+        feasible: loop.feasible
     });
     // Start where the loop passes closest to the pin.
     if (job.kind === "start") route.startOffsetM = nearestOffset(route, job.start.latlng);
-    route.warning = routeWarning(route, result, job);
+    route.warning = routeWarning(route, loop, job);
+
+    if (route.id === state.activeRouteId) {
+        drawRouteDecor();
+        renderRouteDetail();
+    }
+    renderRoutes();
     return route;
 }
 
@@ -735,8 +827,8 @@ function routeWarning(route, result, job) {
     }
     // The search measures coverage on a simplified outline; allow for the
     // small difference from the exact figure.
-    if (job.kind === "area" && result.coverage < prefs.coveragePercent / 100 - 0.005) {
-        notes.push(`It only encloses ${Math.round(result.coverage * 100)}% of the area (target ${prefs.coveragePercent}%). ` +
+    if (job.kind === "area" && result.coverage < job.objective.coverage - 0.005) {
+        notes.push(`It only encloses ${Math.round(result.coverage * 100)}% of the area (target ${Math.round(job.objective.coverage * 100)}%). ` +
             `Try a lower target or a longer search.`);
     }
     return notes.join(" ");
@@ -760,7 +852,7 @@ function selectRoute(id) {
     render();
     renderRouteDetail();
     const route = activeRoute();
-    if (route && route.elevation === null) loadElevation(route);
+    if (route && route.elevation === null && !route.searching) loadElevation(route);
 }
 
 function removeRoute(id, rerender = true) {
@@ -796,7 +888,7 @@ function renderRoutes() {
         row.innerHTML = `
             <span class="route-swatch"></span>
             <span class="route-name"></span>
-            <span class="route-meta">${formatDistance(route.lengthM)}</span>
+            <span class="route-meta">${route.searching ? "searching… " : ""}${formatDistance(route.lengthM)}</span>
             <button type="button" class="icon-button danger" aria-label="Remove loop">
                 <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18" /></svg>
             </button>`;
@@ -882,40 +974,26 @@ ui.reverseButton.addEventListener("click", () => {
 // Pace and time estimate
 // --------------------------------------------------------------------------
 
-function estimatedSeconds(route) {
-    return prefs.activity === "run" ? route.lengthM * prefs.runPaceSecPerM : route.lengthM / prefs.bikeSpeedMps;
-}
+const estimatedSeconds = (route) => route.lengthM / prefs.speedMps;
 
+// Pace can be typed as min/mi, min/km ("8:30"), mph or km/h; switching the
+// format converts the value shown.
 function renderPaceInput() {
-    ui.activityButtons.forEach(b => b.setAttribute("aria-pressed", String(b.dataset.activity === prefs.activity)));
-    if (prefs.activity === "run") {
-        ui.paceInput.value = formatPace(prefs.runPaceSecPerM * units().distance.meters);
-        ui.paceUnit.textContent = units().paceLabel;
-        ui.paceInput.setAttribute("aria-label", "Running pace in minutes:seconds");
-    } else {
-        ui.paceInput.value = roundForInput(prefs.bikeSpeedMps * 3600 / units().distance.meters);
-        ui.paceUnit.textContent = units().speedLabel;
-        ui.paceInput.setAttribute("aria-label", "Cycling speed");
-    }
+    ui.paceFormatSelect.value = prefs.paceFormat;
+    ui.paceInput.value = formatPaceInput(prefs.speedMps, prefs.paceFormat);
+    ui.paceInput.placeholder = PACE_FORMATS[prefs.paceFormat].kind === "pace" ? "8:30" : "15";
 }
 
-ui.activityButtons.forEach(b => b.addEventListener("click", () => {
-    prefs.activity = b.dataset.activity;
+ui.paceFormatSelect.addEventListener("change", () => {
+    prefs.paceFormat = ui.paceFormatSelect.value;
     rememberPrefs();
     renderPaceInput();
-    renderRouteDetail();
-}));
+});
 
 ui.paceInput.addEventListener("input", () => {
-    if (prefs.activity === "run") {
-        const seconds = parsePace(ui.paceInput.value);
-        if (!(seconds > 0)) return;
-        prefs.runPaceSecPerM = seconds / units().distance.meters;
-    } else {
-        const speed = parseFloat(ui.paceInput.value);
-        if (!(speed > 0)) return;
-        prefs.bikeSpeedMps = speed * units().distance.meters / 3600;
-    }
+    const speed = parsePaceInput(ui.paceInput.value, prefs.paceFormat);
+    if (!(speed > 0)) return;
+    prefs.speedMps = speed;
     rememberPrefs();
     const route = activeRoute();
     if (route) ui.statTime.textContent = formatDuration(estimatedSeconds(route));
@@ -942,6 +1020,12 @@ function renderElevation(route) {
     const chart = ui.elevationChart;
     hideHoverMarker();
 
+    if (route.searching) {
+        ui.elevationSummary.textContent = "";
+        ui.statClimb.textContent = "…";
+        chart.innerHTML = `<p class="chart-message">Elevation loads when the search finishes.</p>`;
+        return;
+    }
     if (elevation === "loading" || elevation === null) {
         ui.elevationSummary.textContent = "";
         ui.statClimb.textContent = "…";
@@ -1042,6 +1126,13 @@ ui.exportKmlButton.addEventListener("click", () => {
     downloadText(`${safeFilename(name)}.kml`, routeToKml(route, name), "application/vnd.google-earth.kml+xml");
 });
 
+ui.exportGpxButton.addEventListener("click", () => {
+    const route = activeRoute();
+    if (!route) return;
+    const name = routeTitle(route);
+    downloadText(`${safeFilename(name)}.gpx`, routeToGpx(route, name), "application/gpx+xml");
+});
+
 ui.saveRouteButton.addEventListener("click", async () => {
     const route = activeRoute();
     if (!route) return;
@@ -1123,6 +1214,112 @@ async function deleteSaved(id) {
     storeSavedRoutes(state.saved);
     render();
 }
+
+// ==========================================================================
+// Place mode: capture a real place (city, county, state, lake, park…)
+// ==========================================================================
+
+// Boundary outlines are simplified to this many corners: plenty for a loop
+// that follows roads, and keeps the coverage check fast.
+const PLACE_MAX_POINTS = 400;
+
+let placeController = null;
+
+ui.placeForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const query = ui.placeInput.value.trim();
+    if (!query) return;
+
+    placeController?.abort();
+    placeController = new AbortController();
+    try {
+        const url = `${CONFIG.geocoder.url}?format=jsonv2&limit=10&polygon_geojson=1&polygon_threshold=0.0005&q=${encodeURIComponent(query)}`;
+        const response = await fetch(url, { signal: placeController.signal, headers: { "Accept-Language": navigator.language } });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        showPlaceResults((await response.json()).filter(p => /Polygon/.test(p.geojson?.type || "")));
+    } catch (err) {
+        if (err.name !== "AbortError") toast("Place search failed. Please try again.", "error");
+    }
+});
+
+function showPlaceResults(places) {
+    if (places.length === 0) {
+        ui.placeResults.innerHTML = `<li class="empty">No places with a boundary found. Try adding the state or country.</li>`;
+        ui.placeResults.hidden = false;
+        return;
+    }
+    ui.placeResults.replaceChildren(...places.map(place => {
+        const item = document.createElement("li");
+        const button = document.createElement("button");
+        button.type = "button";
+        button.innerHTML = `<span class="result-kind"></span><span class="result-name"></span>`;
+        button.querySelector(".result-kind").textContent = placeKind(place);
+        button.querySelector(".result-name").textContent = place.display_name;
+        button.addEventListener("click", () => {
+            ui.placeResults.hidden = true;
+            setPlace(place);
+        });
+        item.appendChild(button);
+        return item;
+    }));
+    ui.placeResults.hidden = false;
+}
+
+function placeKind(place) {
+    const kind = (place.addresstype || place.type || "area").replace(/_/g, " ");
+    return kind[0].toUpperCase() + kind.slice(1);
+}
+
+function setPlace(place) {
+    const outline = largestRing(place.geojson);
+    if (outline.length < 3) {
+        toast("That place has no usable boundary.", "warning");
+        return;
+    }
+    state.place = {
+        name: place.name || place.display_name.split(",")[0],
+        kind: placeKind(place),
+        outline: outline.length > PLACE_MAX_POINTS ? simplifyRing(outline, PLACE_MAX_POINTS) : outline
+    };
+    ui.placeInput.value = "";
+    drawPlace();
+    fitBounds(state.placeLayer.getBounds());
+    render();
+}
+
+// Outer ring of a GeoJSON Polygon, or of a MultiPolygon's largest part.
+function largestRing(geojson) {
+    const rings = geojson.type === "Polygon" ? [geojson.coordinates[0]] : geojson.coordinates.map(poly => poly[0]);
+    let best = [], bestArea = -1;
+    for (const ring of rings) {
+        const points = ring.map(([lng, lat]) => ({ lat, lng }));
+        if (points.length > 1 && points[0].lat === points[points.length - 1].lat && points[0].lng === points[points.length - 1].lng) points.pop();
+        if (points.length < 3) continue;
+        const area = createPolygonRegion(points).areaSqKm;
+        if (area > bestArea) {
+            bestArea = area;
+            best = points;
+        }
+    }
+    return best;
+}
+
+function drawPlace() {
+    layers.place.clearLayers();
+    state.placeLayer = state.place
+        ? createRegionLayer(createPolygonRegion(state.place.outline, "place")).addTo(layers.place)
+        : null;
+}
+
+ui.clearPlaceButton.addEventListener("click", () => {
+    state.place = null;
+    drawPlace();
+    render();
+});
+
+document.addEventListener("click", (e) => {
+    if (!ui.placeForm.contains(e.target)) ui.placeResults.hidden = true;
+});
 
 // ==========================================================================
 // Place search (Nominatim) and geolocation

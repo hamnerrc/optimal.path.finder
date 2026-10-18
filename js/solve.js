@@ -6,15 +6,18 @@
 
 // Resolves with the solver result. onProgress({ fraction, best }) is called
 // periodically; `best` is the best loop so far when it has changed.
-function runSolver(network, params, { signal, onProgress }) {
+// Setting control.stop (then calling control.onStop) ends the search early
+// with the best loop so far; aborting `signal` rejects instead.
+function runSolver(network, params, { signal, onProgress, control = {} }) {
     // Only plain data can be sent to a worker (the region has functions).
     const graph = { nodes: network.nodes, edges: network.edges };
     let worker = null;
     try {
         worker = new Worker("js/solver-worker.js");
     } catch {
-        return runSolverInline(graph, params, { signal, onProgress });
+        return runSolverInline(graph, params, { signal, onProgress, control });
     }
+    control.onStop = () => worker.postMessage({ type: "stop" });
 
     return new Promise((resolve, reject) => {
         const finish = () => {
@@ -42,14 +45,15 @@ function runSolver(network, params, { signal, onProgress }) {
             // The worker script failed to load (e.g. file://): fall back.
             event.preventDefault();
             finish();
-            runSolverInline(graph, params, { signal, onProgress }).then(resolve, reject);
+            runSolverInline(graph, params, { signal, onProgress, control }).then(resolve, reject);
         };
-        worker.postMessage({ network: graph, params });
+        worker.postMessage({ type: "run", network: graph, params });
     });
 }
 
-async function runSolverInline(graph, params, { signal, onProgress }) {
-    const generator = solveLoop(graph, params);
+async function runSolverInline(graph, params, { signal, onProgress, control }) {
+    control.onStop = null;
+    const generator = solveLoop(graph, params, control);
     const sliceMs = 40;
     for (;;) {
         if (signal?.aborted) throw new DOMException("Search cancelled", "AbortError");

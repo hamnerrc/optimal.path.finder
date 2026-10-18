@@ -41,19 +41,50 @@ const CONFIG = {
     // how far beyond the drawn area roads are loaded (1.3 = 30% larger), so
     // the loop can use roads just outside its edge.
     defaultCoveragePercent: 90,
-    areaMargin: 1.3,
+    areaMargin: 1.2,
 
-    // How long the solver searches for each loop.
+    // How long the solver searches for each loop. You can stop a search
+    // early and keep the best loop found so far.
     searchEffort: {
         quick: { label: "Quick", ms: 3000 },
         normal: { label: "Normal", ms: 8000 },
-        thorough: { label: "Thorough", ms: 25000 }
+        long: { label: "Long", ms: 30000 },
+        extended: { label: "Extended", ms: 120000 },
+        max: { label: "Very long", ms: 600000 }
     },
     defaultEffort: "normal",
 
-    // Default pace for time estimates: seconds per mile (run), mph (bike).
-    defaultRunPaceSecPerMile: 540,
-    defaultBikeSpeedMph: 15,
+    // Default pace for time estimates, in seconds per mile.
+    defaultPaceSecPerMile: 540,
+
+    // Big searches. Up to fullDetailMaxSqMiles of download area, every road
+    // is loaded at once (about a 10 mi loop in a dense city: ~200k
+    // intersections, ~70 MB from Overpass). Larger searches go in two stages:
+    // a rough loop on major roads only, downloaded in tiles, then a pass
+    // along that loop that loads all roads in a corridor around each stretch
+    // and improves it locally.
+    chunked: {
+        fullDetailMaxSqMiles: 80,
+        coarseRoadTypes: [
+            "motorway", "motorway_link", "trunk", "trunk_link",
+            "primary", "primary_link", "secondary", "secondary_link",
+            "tertiary", "tertiary_link"
+        ],
+        // Above this area tertiary roads are dropped from the rough stage.
+        tertiaryMaxSqMiles: 5000,
+        tileDegrees: 0.5,
+        largeTileDegrees: 1,
+        // Start mode: no point on a loop of length L is further than L/2 from
+        // the start, but the roundest loops stay within about L/π. The rough
+        // stage loads roads within this fraction of L.
+        startRadiusFraction: 0.4,
+        // Share of the search time spent on the rough loop (the rest goes to
+        // refining), and the minimum per refined stretch.
+        coarseShare: 0.35,
+        minRefineMs: 1500,
+        segmentLengthM: 16000,
+        corridorRadiusM: 800
+    },
 
     // Ask for confirmation before downloading areas larger than this.
     largeAreaSqMiles: 300,
@@ -78,7 +109,8 @@ const CONFIG = {
         // Tried in order; the next one is used if a server is busy or down.
         endpoints: [
             "https://overpass-api.de/api/interpreter",
-            "https://overpass.private.coffee/api/interpreter"
+            "https://overpass.private.coffee/api/interpreter",
+            "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
         ],
         timeoutSeconds: 90,
         cacheSize: 6
@@ -87,8 +119,8 @@ const CONFIG = {
     elevation: {
         url: "https://api.open-meteo.com/v1/elevation",
         batchSize: 100,          // coordinates per request (API limit)
-        maxSamples: 300,
-        minSpacingM: 25,
+        maxSamples: 200,
+        minSpacingM: 40,
         climbThresholdM: 2       // ignore up/down wiggles smaller than this
     },
 

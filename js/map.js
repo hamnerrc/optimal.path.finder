@@ -26,6 +26,7 @@ const layers = {
     network: L.layerGroup().addTo(map),
     starts: L.layerGroup().addTo(map),
     shape: L.layerGroup().addTo(map),
+    place: L.layerGroup().addTo(map),
     routes: L.layerGroup().addTo(map),
     routeDecor: L.layerGroup().addTo(map)
 };
@@ -132,9 +133,6 @@ const routeStyle = (active) => ({
     fillOpacity: active ? 0.1 : 0.05,
     lineJoin: "round"
 });
-
-// The search's best-so-far loop, drawn dashed while it runs.
-const previewStyle = { color: CONFIG.colors.pending, weight: 4, opacity: 0.9, dashArray: "8 8", fill: false, interactive: false };
 
 // Fits the region into the part of the map not covered by the side panel.
 function fitRegion(region) {

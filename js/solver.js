@@ -2,13 +2,15 @@
 // Loop solver
 //
 // Finds a closed loop on the road network that encloses as much territory as
-// possible. Two objectives are supported:
+// possible. Two objectives are supported (plus "refine", which improves one
+// stretch of an existing loop; see solveLoop):
 //
 //   "start"  The loop must pass through a start point and be no longer than
 //            maxLengthM. Maximizes the enclosed area.
 //   "area"   No start point. Maximizes the isoperimetric quotient
 //            (4π·area / length², 1 for a perfect circle) among loops that
-//            cover at least `coverage` of a target shape.
+//            cover at least `coverage` of a target shape. Ties go to the
+//            loop enclosing more area.
 //
 // Method: a loop is described by a ring of waypoints. Consecutive waypoints
 // are joined with A* shortest paths, where streets already used by the loop
@@ -26,7 +28,10 @@ const SOLVER = {
     nodeReusePenaltyM: 400,   // extra cost for crossing the loop at an intersection
     gridCellM: 250,           // spatial index cell size for snapping
     coverageRows: 160,        // scanlines used to measure coverage
-    maxWaypoints: 40
+    maxWaypoints: 40,
+    // Area mode: weight of the "bigger is better" tiebreak between loops of
+    // equal roundness. Small, so it only decides near-ties.
+    areaTiebreak: 0.005
 };
 
 // --------------------------------------------------------------------------
@@ -323,21 +328,23 @@ class Router {
 }
 
 // --------------------------------------------------------------------------
-// Loops
+// Paths through waypoints
 // --------------------------------------------------------------------------
 
-// Routes through the waypoint nodes and back to the first one.
-// `reuse` (optional) maps "a,b" to a leg routed earlier between waypoints a
-// and b; those legs are kept and only the missing ones are routed, which
-// makes moving a single waypoint cheap.
-// Returns { edges, dirs, nodes, length, area, repeats, legs } or null.
-function buildLoop(g, router, waypoints, reuse) {
+// Routes through the waypoint nodes in order; when `closed`, back to the
+// first one as well. `reuse` (optional) maps "a,b" to a leg routed earlier
+// between waypoints a and b; those legs are kept and only the missing ones
+// are routed, which makes moving a single waypoint cheap.
+// Returns { edges, dirs, nodes, endNode, length, cross, area, repeats, legs } or null.
+function buildPath(g, router, waypoints, closed, reuse) {
     router.beginLoop();
     router.usedNode[waypoints[0]] = router.loopStamp;
 
     const k = waypoints.length;
-    const keys = waypoints.map((a, j) => `${a},${waypoints[(j + 1) % k]}`);
-    const legs = new Array(k);
+    const legCount = closed ? k : k - 1;
+    const keys = [];
+    for (let j = 0; j < legCount; j++) keys.push(`${waypoints[j]},${waypoints[(j + 1) % k]}`);
+    const legs = new Array(legCount);
     if (reuse) {
         keys.forEach((key, j) => {
             const leg = reuse.get(key);
@@ -347,7 +354,7 @@ function buildLoop(g, router, waypoints, reuse) {
             }
         });
     }
-    for (let j = 0; j < k; j++) {
+    for (let j = 0; j < legCount; j++) {
         if (legs[j]) continue;
         const from = waypoints[j], to = waypoints[(j + 1) % k];
         const leg = from === to ? [] : router.route(from, to);
@@ -356,52 +363,47 @@ function buildLoop(g, router, waypoints, reuse) {
         router.markUsed(leg);
     }
 
+    // Concatenate, dropping out-and-back spurs (an edge followed by itself).
     const edges = [];
     const dirs = [];
     let at = waypoints[0];
     for (const leg of legs) {
         for (const e of leg) {
             const forward = g.eFrom[e] === at;
-            edges.push(e);
-            dirs.push(forward ? 1 : -1);
+            const dir = forward ? 1 : -1;
+            const last = edges.length - 1;
+            if (last >= 0 && edges[last] === e && dirs[last] === -dir) {
+                edges.pop();
+                dirs.pop();
+            } else {
+                edges.push(e);
+                dirs.push(dir);
+            }
             at = forward ? g.eTo[e] : g.eFrom[e];
         }
     }
-    if (edges.length < 2) return null;
+    if (closed && edges.length < 2) return null;
 
-    // Drop out-and-back spurs (an edge immediately followed by itself).
-    const keptEdges = [];
-    const keptDirs = [];
-    for (let i = 0; i < edges.length; i++) {
-        const last = keptEdges.length - 1;
-        if (last >= 0 && keptEdges[last] === edges[i] && keptDirs[last] === -dirs[i]) {
-            keptEdges.pop();
-            keptDirs.pop();
-        } else {
-            keptEdges.push(edges[i]);
-            keptDirs.push(dirs[i]);
-        }
-    }
-    if (keptEdges.length < 2) return null;
-
-    const loop = measureLoop(g, keptEdges, keptDirs);
-    loop.legs = new Map(keys.map((key, j) => [key, legs[j]]));
-    return loop;
+    const path = measurePath(g, edges, dirs, waypoints[0]);
+    path.legs = new Map(keys.map((key, j) => [key, legs[j]]));
+    return path;
 }
 
-function measureLoop(g, edges, dirs) {
+function measurePath(g, edges, dirs, firstNode) {
     let length = 0;
     let cross = 0;
     const nodes = new Array(edges.length);
     const nodeVisits = new Map();
     const edgeSet = new Set();
     let repeats = 0;
+    let endNode = firstNode;
 
     for (let i = 0; i < edges.length; i++) {
         const e = edges[i];
         length += g.eLen[e];
         cross += dirs[i] * g.eCross[e];
         const n = dirs[i] === 1 ? g.eFrom[e] : g.eTo[e];
+        endNode = dirs[i] === 1 ? g.eTo[e] : g.eFrom[e];
         nodes[i] = n;
         if (edgeSet.has(e)) repeats++;
         else edgeSet.add(e);
@@ -409,12 +411,13 @@ function measureLoop(g, edges, dirs) {
         nodeVisits.set(n, visits);
         if (visits > 1) repeats++;
     }
-    return { edges, dirs, nodes, length, area: Math.abs(cross) / 2, repeats };
+    return { edges, dirs, nodes, endNode, length, cross, area: Math.abs(cross) / 2, repeats };
 }
 
 // --------------------------------------------------------------------------
-// Coverage: fraction of a convex target polygon enclosed by the loop.
-// Scanline integration, even-odd rule for the loop.
+// Coverage: fraction of a target polygon enclosed by the loop.
+// Scanline integration with the even-odd rule, so the target can be any
+// simple polygon (convex or not) and the loop any closed outline.
 // --------------------------------------------------------------------------
 
 function createCoverageMeter(target) {
@@ -425,18 +428,15 @@ function createCoverageMeter(target) {
         maxY = Math.max(maxY, p.y);
     }
     const dy = (maxY - minY) / rows;
-    const rowY = Float64Array.from({ length: rows }, (_, r) => minY + (r + 0.5) * dy);
 
-    // The target's horizontal extent on each scanline.
-    const left = new Float64Array(rows).fill(Infinity);
-    const right = new Float64Array(rows).fill(-Infinity);
-    eachCrossing(target.map(p => p.x), target.map(p => p.y), minY, dy, rows, (r, x) => {
-        left[r] = Math.min(left[r], x);
-        right[r] = Math.max(right[r], x);
-    });
-
+    // The target's inside intervals on each scanline: [x0, x1, x2, x3, …].
+    const targetRows = Array.from({ length: rows }, () => []);
+    eachCrossing(target.map(p => p.x), target.map(p => p.y), minY, dy, rows, (r, x) => targetRows[r].push(x));
     let targetArea = 0;
-    for (let r = 0; r < rows; r++) if (right[r] > left[r]) targetArea += (right[r] - left[r]) * dy;
+    for (const row of targetRows) {
+        row.sort((a, b) => a - b);
+        for (let i = 0; i + 1 < row.length; i += 2) targetArea += (row[i + 1] - row[i]) * dy;
+    }
 
     const buckets = Array.from({ length: rows }, () => []);
 
@@ -447,13 +447,18 @@ function createCoverageMeter(target) {
             eachCrossing(xs, ys, minY, dy, rows, (r, x) => buckets[r].push(x));
             let covered = 0;
             for (let r = 0; r < rows; r++) {
-                const b = buckets[r];
-                if (b.length < 2) continue;
-                b.sort((a, c) => a - c);
-                for (let i = 0; i + 1 < b.length; i += 2) {
-                    const lo = Math.max(b[i], left[r]);
-                    const hi = Math.min(b[i + 1], right[r]);
+                const loop = buckets[r];
+                const tgt = targetRows[r];
+                if (loop.length < 2 || tgt.length < 2) continue;
+                loop.sort((a, c) => a - c);
+                // Overlap of two sorted interval lists.
+                let i = 0, j = 0;
+                while (i + 1 < loop.length && j + 1 < tgt.length) {
+                    const lo = Math.max(loop[i], tgt[j]);
+                    const hi = Math.min(loop[i + 1], tgt[j + 1]);
                     if (hi > lo) covered += hi - lo;
+                    if (loop[i + 1] < tgt[j + 1]) i += 2;
+                    else j += 2;
                 }
             }
             return targetArea > 0 ? covered * dy / targetArea : 0;
@@ -478,18 +483,80 @@ function createCoverageMeter(target) {
 }
 
 // --------------------------------------------------------------------------
+// Scoring
+// --------------------------------------------------------------------------
+
+// objective:
+//   mode        "start" | "area"
+//   maxLengthM  (start)  the loop may not be longer
+//   coverage    (area)   0..1 share of the target the loop must enclose
+//   targetArea  (area)   m², for the tiebreak
+// metrics: { length, area, repeats, coverage? }
+//
+// Start mode: score = area. Area mode: score = isoperimetric quotient, with
+// a small bonus for enclosing more area, so that of two equally round loops
+// the bigger one wins. Unmet requirements shrink the score steeply instead of
+// ruling the loop out, so the search can move through them.
+function scoreLoop(metrics, objective) {
+    const repeatFactor = 0.8 ** metrics.repeats;
+    if (objective.mode === "start") {
+        const over = metrics.length / objective.maxLengthM;
+        return {
+            score: metrics.area * (over > 1 ? over ** -10 : 1) * repeatFactor,
+            feasible: over <= 1 && metrics.repeats === 0
+        };
+    }
+    const iq = 4 * Math.PI * metrics.area / metrics.length ** 2;
+    const short = metrics.coverage / objective.coverage;
+    const sizeBonus = SOLVER.areaTiebreak * Math.min(metrics.area / objective.targetArea, 2);
+    return {
+        score: (iq + sizeBonus) * (short < 1 ? short ** 6 : 1) * repeatFactor,
+        feasible: short >= 1 && metrics.repeats === 0
+    };
+}
+
+// Measures a loop given as [[lat, lng], …] (closed or not) for an objective.
+// Used to compare loops built from pieces of different road networks.
+function measureCoordsLoop(coords, objective, targetOutline) {
+    const lat0 = coords[0][0], lng0 = coords[0][1];
+    const ky = DEG * EARTH_RADIUS_M;
+    const kx = ky * Math.cos(lat0 * DEG);
+    const xs = coords.map(c => (c[1] - lng0) * kx);
+    const ys = coords.map(c => (c[0] - lat0) * ky);
+    let cross = 0, length = 0;
+    for (let i = 0; i < coords.length; i++) {
+        const j = (i + 1) % coords.length;
+        cross += xs[i] * ys[j] - xs[j] * ys[i];
+        if (j > 0) length += haversine(coords[i][0], coords[i][1], coords[j][0], coords[j][1]);
+    }
+    const metrics = { length, area: Math.abs(cross) / 2, repeats: 0 };
+    if (objective.mode === "area") {
+        const meter = createCoverageMeter(targetOutline.map(p => ({ x: (p.lng - lng0) * kx, y: (p.lat - lat0) * ky })));
+        metrics.coverage = meter.measure(xs, ys);
+        objective = { ...objective, targetArea: meter.targetArea };
+    }
+    metrics.iq = 4 * Math.PI * metrics.area / length ** 2;
+    return { ...metrics, ...scoreLoop(metrics, objective) };
+}
+
+// --------------------------------------------------------------------------
 // Search
 // --------------------------------------------------------------------------
 
 // params:
-//   mode            "start" | "area"
-//   start           { lat, lng }                 (start mode)
-//   maxLengthM      number                       (start mode)
-//   target          [{ lat, lng }] convex outline (area mode)
-//   coverage        0..1                         (area mode)
+//   mode            "start" | "area" | "refine"
+//   start           { lat, lng }                 (start)
+//   maxLengthM      number                       (start; also refine of a start loop)
+//   target          [{ lat, lng }] outline       (area; also refine of an area loop)
+//   coverage        0..1                         (area; also refine of an area loop)
+//   objective       "start" | "area"             (refine: which score to use)
+//   segment         [[lat, lng], …]              (refine: the stretch to improve, A → B)
+//   fixed           [[lat, lng], …]              (refine: the rest of the loop, B → A)
 //   timeBudgetMs    number
 //   seed            number (optional)
-function* solveLoop(network, params) {
+// control: { stop: boolean } (optional). Setting stop ends the search early;
+// the best loop so far is still returned.
+function* solveLoop(network, params, control = {}) {
     const startTime = Date.now();
     const g = compileGraph(network);
     if (g.main.size < 3) throw new Error("The road network here is too small to make a loop.");
@@ -497,38 +564,78 @@ function* solveLoop(network, params) {
     const router = new Router(g);
     const random = mulberry32(params.seed ?? 12345);
     const gauss = () => Math.sqrt(-2 * Math.log(random() + 1e-12)) * Math.cos(2 * Math.PI * random());
-    const isStart = params.mode === "start";
+    const isRefine = params.mode === "refine";
+    const objectiveMode = isRefine ? params.objective : params.mode;
+    const isStart = objectiveMode === "start";
+    const closed = !isRefine;
 
     // Problem-specific setup ---------------------------------------------
-    let startNode = -1, origin, scale, coverageMeter = null, targetXY = null;
+    let startNode = -1, endNode = -1, origin, scale, coverageMeter = null, targetXY = null;
+    const objective = { mode: objectiveMode, maxLengthM: params.maxLengthM, coverage: params.coverage };
 
-    if (isStart) {
+    if (!isStart) {
+        targetXY = params.target.map(p => g.project(p.lat, p.lng));
+        coverageMeter = createCoverageMeter(targetXY);
+        objective.targetArea = coverageMeter.targetArea;
+    }
+
+    // Refine mode: the fixed rest of the loop adds a constant length and
+    // shoelace term; the path's ends are joined to it with straight lines.
+    let fixed = null;
+    if (isRefine) {
+        const segXY = params.segment.map(([lat, lng]) => g.project(lat, lng));
+        const fixedXY = params.fixed.map(([lat, lng]) => g.project(lat, lng));
+        const a = segXY[0], b = segXY[segXY.length - 1];
+        startNode = snapToNode(g, a.x, a.y);
+        endNode = snapToNode(g, b.x, b.y);
+        let cross = 0, length = 0;
+        for (let i = 1; i < fixedXY.length; i++) {
+            const p = fixedXY[i - 1], q = fixedXY[i];
+            cross += p.x * q.y - q.x * p.y;
+            length += Math.hypot(q.x - p.x, q.y - p.y);
+        }
+        // Few enough points for a quick coverage check each step.
+        const outline = simplifyLine(params.fixed.map(([lat, lng]) => ({ lat, lng })), 400).map(p => g.project(p.lat, p.lng));
+        fixed = { xy: fixedXY, first: fixedXY[0], last: fixedXY[fixedXY.length - 1], cross, length, outline };
+        origin = centroid(segXY);
+        let segLength = 0;
+        for (let i = 1; i < segXY.length; i++) segLength += Math.hypot(segXY[i].x - segXY[i - 1].x, segXY[i].y - segXY[i - 1].y);
+        scale = Math.max(segLength / 6, 200);
+    } else if (isStart) {
         const p = g.project(params.start.lat, params.start.lng);
         startNode = snapToNode(g, p.x, p.y);
         origin = { x: g.x[startNode], y: g.y[startNode] };
         scale = params.maxLengthM / (2 * Math.PI);
     } else {
-        targetXY = params.target.map(p => g.project(p.lat, p.lng));
-        coverageMeter = createCoverageMeter(targetXY);
         origin = centroid(targetXY);
         scale = Math.sqrt(coverageMeter.targetArea / Math.PI);
     }
 
-    const evaluate = (loop) => {
-        if (!loop) return { score: -Infinity, feasible: false };
-        const repeatFactor = 0.8 ** loop.repeats;
-        if (isStart) {
-            const over = loop.length / params.maxLengthM;
-            const feasible = over <= 1 && loop.repeats === 0;
-            return { score: loop.area * (over > 1 ? over ** -10 : 1) * repeatFactor, feasible };
+    // Whole-loop metrics for a candidate path.
+    const evaluate = (path) => {
+        if (!path) return { score: -Infinity, feasible: false };
+        const metrics = { length: path.length, area: path.area, repeats: path.repeats };
+        let xs = null, ys = null;
+        if (isRefine) {
+            const end = { x: g.x[path.endNode], y: g.y[path.endNode] };
+            const begin = { x: g.x[startNode], y: g.y[startNode] };
+            const cross = path.cross + fixed.cross +
+                (end.x * fixed.first.y - fixed.first.x * end.y) +
+                (fixed.last.x * begin.y - begin.x * fixed.last.y);
+            metrics.length = path.length + fixed.length;
+            metrics.area = Math.abs(cross) / 2;
+            if (!isStart) {
+                xs = path.nodes.map(n => g.x[n]).concat([end.x], fixed.outline.map(p => p.x));
+                ys = path.nodes.map(n => g.y[n]).concat([end.y], fixed.outline.map(p => p.y));
+            }
+        } else if (!isStart) {
+            xs = path.nodes.map(n => g.x[n]);
+            ys = path.nodes.map(n => g.y[n]);
         }
-        const xs = loop.nodes.map(n => g.x[n]);
-        const ys = loop.nodes.map(n => g.y[n]);
-        loop.coverage = coverageMeter.measure(xs, ys);
-        loop.iq = 4 * Math.PI * loop.area / loop.length ** 2;
-        const short = loop.coverage / params.coverage;
-        const feasible = short >= 1 && loop.repeats === 0;
-        return { score: loop.iq * (short < 1 ? short ** 6 : 1) * repeatFactor, feasible };
+        if (!isStart) metrics.coverage = coverageMeter.measure(xs, ys);
+        metrics.iq = 4 * Math.PI * metrics.area / metrics.length ** 2;
+        path.metrics = metrics;
+        return scoreLoop(metrics, objective);
     };
 
     // Waypoint sets are kept as continuous positions and snapped on evaluation.
@@ -536,18 +643,23 @@ function* solveLoop(network, params) {
     let evaluations = 0;
     const tryWaypoints = (points, base) => {
         const nodes = [];
-        if (isStart) nodes.push(startNode);
+        if (startNode >= 0) nodes.push(startNode);
         for (const p of points) {
             const n = snapToNode(g, p.x, p.y);
-            if (nodes[nodes.length - 1] !== n && n !== startNode) nodes.push(n);
+            if (nodes[nodes.length - 1] !== n && n !== startNode && n !== endNode) nodes.push(n);
         }
-        if (nodes.length > 2 && nodes[nodes.length - 1] === nodes[0]) nodes.pop();
+        if (isRefine) {
+            if (nodes[nodes.length - 1] !== endNode) nodes.push(endNode);
+        } else if (nodes.length > 2 && nodes[nodes.length - 1] === nodes[0]) {
+            nodes.pop();
+        }
         const key = nodes.join(",");
         let entry = cache.get(key);
         if (!entry) {
             evaluations++;
-            const loop = nodes.length >= (isStart ? 2 : 3) ? buildLoop(g, router, nodes, base?.loop?.legs) : null;
-            entry = { loop, ...evaluate(loop) };
+            const minNodes = isRefine ? 2 : isStart ? 2 : 3;
+            const path = nodes.length >= minNodes ? buildPath(g, router, nodes, closed, base?.loop?.legs) : null;
+            entry = { loop: path, ...evaluate(path) };
             if (cache.size > 5000) cache.clear();
             cache.set(key, entry);
         }
@@ -569,14 +681,24 @@ function* solveLoop(network, params) {
     const progress = (improved) => ({
         fraction: fraction(),
         evaluations,
-        best: improved ? buildResult(g, best, params, startNode, targetXY, false) : null
+        best: improved && !isRefine ? buildResult(g, best, params, startNode, targetXY, false) : null
     });
 
     // Initial candidates ---------------------------------------------------
     const seeds = [];
-    if (isStart) {
+    if (isRefine) {
+        // The current stretch itself, as waypoints along it.
+        const segXY = params.segment.map(([lat, lng]) => g.project(lat, lng));
+        let length = 0;
+        for (let i = 1; i < segXY.length; i++) length += Math.hypot(segXY[i].x - segXY[i - 1].x, segXY[i].y - segXY[i - 1].y);
+        const count = Math.round(Math.min(30, Math.max(3, length / 800)));
+        const points = resampleLine(segXY, count + 2).slice(1, -1);
+        const cand = tryWaypoints(points);
+        consider(cand);
+        seeds.push(cand);
+    } else if (isStart) {
         const directions = 8;
-        for (let d = 0; d < directions; d++) {
+        for (let d = 0; d < directions && !control.stop; d++) {
             const theta = (2 * Math.PI * d) / directions;
             let radius = scale * 0.8;
             let cand = null;
@@ -591,14 +713,27 @@ function* solveLoop(network, params) {
             if (cand) seeds.push(cand);
         }
     } else {
-        const perimeter = polygonPerimeter(targetXY);
-        const count = Math.round(Math.min(32, Math.max(10, perimeter / 600)));
-        for (const s of [Math.sqrt(params.coverage) + 0.02, 0.9, 1.0, 1.06]) {
-            const points = resample(targetXY, count).map(p => ({
-                x: origin.x + (p.x - origin.x) * s,
-                y: origin.y + (p.y - origin.y) * s
-            }));
-            const cand = tryWaypoints(points);
+        // The outline itself at a few scales, its convex hull (better for
+        // jagged outlines such as city limits) and circles of about the same
+        // area around its center.
+        const hull = convexHull(targetXY);
+        const count = Math.round(Math.min(40, Math.max(10, polygonPerimeter(hull) / 600)));
+        const radius = Math.sqrt(coverageMeter.targetArea / Math.PI);
+        const circle = Array.from({ length: count }, (_, i) => ({
+            x: origin.x + radius * Math.cos((2 * Math.PI * i) / count),
+            y: origin.y + radius * Math.sin((2 * Math.PI * i) / count)
+        }));
+        const shapes = [
+            ...[Math.sqrt(params.coverage) + 0.02, 1.0, 1.06].map(f => [resample(targetXY, count), f]),
+            ...[0.9, 1.0].map(f => [resample(hull, count), f]),
+            ...[0.95, 1.1, 1.25].map(f => [circle, f])
+        ];
+        for (const [points, f] of shapes) {
+            if (control.stop) break;
+            const cand = tryWaypoints(points.map(p => ({
+                x: origin.x + (p.x - origin.x) * f,
+                y: origin.y + (p.y - origin.y) * f
+            })));
             consider(cand);
             seeds.push(cand);
             yield progress(false);
@@ -609,39 +744,51 @@ function* solveLoop(network, params) {
     seeds.sort((a, b) => b.score - a.score);
     let current = best || seeds[0];
     if (!current || !current.loop) {
-        throw new Error("Couldn't form a loop here. Try a larger distance or a different start point.");
+        throw new Error(isRefine ? "Couldn't route this stretch." :
+            "Couldn't form a loop here. Try a larger distance or a different start point.");
     }
 
     // Simulated annealing over waypoint positions -------------------------
     let sinceImprovement = 0;
-    while (Date.now() - startTime < params.timeBudgetMs) {
+    while (Date.now() - startTime < params.timeBudgetMs && !control.stop) {
         const t = fraction();
         const temperature = 0.08 * (1 - t) ** 2 + 0.002;
         const sigma = scale * (0.3 * (1 - t) + 0.03);
         const points = current.points.map(p => ({ ...p }));
         const roll = random();
+        const minPoints = isRefine ? 0 : isStart ? 2 : 3;
 
-        if (roll < 0.6 || points.length < 4) {
+        if (points.length > 0 && (roll < 0.6 || points.length < 4)) {
             const i = Math.floor(random() * points.length);
             points[i] = { x: points[i].x + gauss() * sigma, y: points[i].y + gauss() * sigma };
-        } else if (roll < 0.75) {
+        } else if (roll < 0.75 && !isRefine) {
             const f = 1 + gauss() * 0.06 * (1 - t + 0.2);
             for (const p of points) {
                 p.x = origin.x + (p.x - origin.x) * f;
                 p.y = origin.y + (p.y - origin.y) * f;
             }
         } else if (roll < 0.88 && points.length < SOLVER.maxWaypoints) {
-            // Insert a point between two neighbours, pushed outward.
-            const i = Math.floor(random() * points.length);
-            const a = points[i];
-            const b = isStart && i === points.length - 1 ? origin : points[(i + 1) % points.length];
+            // Insert a point between two neighbours, pushed outward (or, when
+            // refining, to a random side).
+            const i = Math.floor(random() * (points.length + 1)) - 1;
+            const a = i >= 0 ? points[i] : { x: g.x[startNode], y: g.y[startNode] };
+            const b = i + 1 < points.length ? points[i + 1]
+                : isRefine ? { x: g.x[endNode], y: g.y[endNode] }
+                : isStart ? origin : points[0];
             const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-            const ox = mid.x - origin.x, oy = mid.y - origin.y;
+            let ox = mid.x - origin.x, oy = mid.y - origin.y;
+            if (isRefine) {
+                const side = random() < 0.5 ? 1 : -1;
+                ox = -(b.y - a.y) * side;
+                oy = (b.x - a.x) * side;
+            }
             const len = Math.hypot(ox, oy) || 1;
             const push = Math.abs(gauss()) * sigma * 0.5;
             points.splice(i + 1, 0, { x: mid.x + (ox / len) * push, y: mid.y + (oy / len) * push });
-        } else if (points.length > (isStart ? 2 : 3)) {
+        } else if (points.length > minPoints) {
             points.splice(Math.floor(random() * points.length), 1);
+        } else {
+            continue;
         }
 
         const cand = tryWaypoints(points, current);
@@ -664,7 +811,8 @@ function* solveLoop(network, params) {
     return buildResult(g, final, params, startNode, targetXY, true);
 }
 
-// Converts a candidate to plain data: coordinates and measurements.
+// Converts a candidate to plain data: coordinates and measurements. For a
+// refine search, `coords` is the new stretch only (A → B).
 function buildResult(g, cand, params, startNode, targetXY, exact) {
     const { loop } = cand;
     const coords = [];
@@ -673,27 +821,33 @@ function buildResult(g, cand, params, startNode, targetXY, exact) {
         const ordered = loop.dirs[i] === 1 ? geometry : [...geometry].reverse();
         for (let k = coords.length ? 1 : 0; k < ordered.length; k++) coords.push(ordered[k]);
     }
+    if (coords.length === 0) {
+        const n = startNode;
+        const p = g.unproject(g.x[n], g.y[n]);
+        coords.push([p.lat, p.lng]);
+    }
 
+    const m = loop.metrics;
     const result = {
         mode: params.mode,
-        coords,                       // closed: first point === last point
-        lengthM: loop.length,
-        areaM2: loop.area,
-        iq: 4 * Math.PI * loop.area / loop.length ** 2,
+        coords,                       // loops: closed, first point === last point
+        lengthM: m.length,
+        areaM2: m.area,
+        iq: 4 * Math.PI * m.area / m.length ** 2,
         repeats: loop.repeats,
+        score: cand.score,
         feasible: cand.feasible,
         waypoints: cand.points.map(p => g.unproject(p.x, p.y))
     };
 
-    if (targetXY) {
+    if (targetXY && params.mode !== "refine") {
         // Recompute coverage on the full road geometry for the final answer.
         const xy = exact ? coords.map(([lat, lng]) => g.project(lat, lng)) : loop.nodes.map(n => ({ x: g.x[n], y: g.y[n] }));
         result.coverage = createCoverageMeter(targetXY).measure(xy.map(p => p.x), xy.map(p => p.y));
+    } else if (m.coverage !== undefined) {
+        result.coverage = m.coverage;
     }
-    if (startNode >= 0) {
-        const s = g.unproject(g.x[startNode], g.y[startNode]);
-        result.start = s;
-    }
+    if (startNode >= 0 && params.mode === "start") result.start = g.unproject(g.x[startNode], g.y[startNode]);
     return result;
 }
 
@@ -730,6 +884,22 @@ function centroid(points) {
     return { x: cx / (3 * area), y: cy / (3 * area) };
 }
 
+// Convex hull (monotone chain), counter-clockwise.
+function convexHull(points) {
+    const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+    const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+    const half = (list) => {
+        const out = [];
+        for (const p of list) {
+            while (out.length >= 2 && cross(out[out.length - 2], out[out.length - 1], p) <= 0) out.pop();
+            out.push(p);
+        }
+        out.pop();
+        return out;
+    };
+    return half(sorted).concat(half(sorted.reverse()));
+}
+
 function polygonPerimeter(points) {
     let total = 0;
     for (let i = 0; i < points.length; i++) {
@@ -741,22 +911,29 @@ function polygonPerimeter(points) {
 
 // `count` points evenly spaced along a closed polygon.
 function resample(points, count) {
-    const step = polygonPerimeter(points) / count;
+    return resampleAlong([...points, points[0]], count, false);
+}
+
+// `count` points evenly spaced along an open line, including both ends.
+function resampleLine(points, count) {
+    return resampleAlong(points, count, true);
+}
+
+function resampleAlong(points, count, includeEnd) {
+    const cum = [0];
+    for (let i = 1; i < points.length; i++) {
+        cum.push(cum[i - 1] + Math.hypot(points[i].x - points[i - 1].x, points[i].y - points[i - 1].y));
+    }
+    const total = cum[cum.length - 1];
+    const step = total / (includeEnd ? Math.max(1, count - 1) : count);
     const out = [];
-    let i = 0, carried = 0;
-    let a = points[0], b = points[1 % points.length];
-    let segment = Math.hypot(b.x - a.x, b.y - a.y);
+    let i = 0;
     for (let k = 0; k < count; k++) {
-        let want = k * step;
-        while (want > carried + segment && i < points.length) {
-            carried += segment;
-            i++;
-            a = points[i % points.length];
-            b = points[(i + 1) % points.length];
-            segment = Math.hypot(b.x - a.x, b.y - a.y);
-        }
-        const f = segment > 0 ? (want - carried) / segment : 0;
-        out.push({ x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f });
+        const want = Math.min(total, k * step);
+        while (i < points.length - 2 && cum[i + 1] < want) i++;
+        const span = cum[i + 1] - cum[i];
+        const f = span > 0 ? (want - cum[i]) / span : 0;
+        out.push({ x: points[i].x + (points[i + 1].x - points[i].x) * f, y: points[i].y + (points[i + 1].y - points[i].y) * f });
     }
     return out;
 }
@@ -773,5 +950,5 @@ function mulberry32(seed) {
 }
 
 if (typeof module !== "undefined") {
-    module.exports = { solveLoop, compileGraph, createCoverageMeter, resample };
+    module.exports = { solveLoop, compileGraph, createCoverageMeter, measureCoordsLoop, scoreLoop };
 }

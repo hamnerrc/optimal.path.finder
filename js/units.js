@@ -7,16 +7,12 @@ const UNIT_SYSTEMS = {
     mi: {
         distance: { meters: 1609.344, label: "mi" },
         elevation: { meters: 0.3048, label: "ft" },
-        area: { sqMeters: 2589988.11, label: "sq mi" },
-        speedLabel: "mph",
-        paceLabel: "/mi"
+        area: { sqMeters: 2589988.11, label: "sq mi" }
     },
     km: {
         distance: { meters: 1000, label: "km" },
         elevation: { meters: 1, label: "m" },
-        area: { sqMeters: 1e6, label: "km²" },
-        speedLabel: "km/h",
-        paceLabel: "/km"
+        area: { sqMeters: 1e6, label: "km²" }
     }
 };
 
@@ -70,3 +66,27 @@ function formatPace(seconds) {
 
 // Rounds to a tidy number of display units (used when converting inputs).
 const roundForInput = (v) => Math.round(v * 100) / 100;
+
+// Pace input formats: minutes per distance unit, or speed per hour.
+const PACE_FORMATS = {
+    "min/mi": { kind: "pace", meters: 1609.344 },
+    "min/km": { kind: "pace", meters: 1000 },
+    "mph": { kind: "speed", meters: 1609.344 },
+    "km/h": { kind: "speed", meters: 1000 }
+};
+
+// Text in a pace format -> speed in m/s (NaN if unreadable).
+function parsePaceInput(text, format) {
+    const f = PACE_FORMATS[format];
+    if (f.kind === "pace") {
+        const seconds = parsePace(text);
+        return seconds > 0 ? f.meters / seconds : NaN;
+    }
+    const perHour = parseFloat(text);
+    return perHour > 0 ? (perHour * f.meters) / 3600 : NaN;
+}
+
+function formatPaceInput(speedMps, format) {
+    const f = PACE_FORMATS[format];
+    return f.kind === "pace" ? formatPace(f.meters / speedMps) : String(roundForInput((speedMps * 3600) / f.meters));
+}

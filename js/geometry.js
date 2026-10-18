@@ -169,59 +169,206 @@ function solve3x3(M, rhs) {
 }
 
 // --------------------------------------------------------------------------
-// Rectangle (north-up, from two opposite corners)
+// Local flat projection (meters) around a reference latitude. Accurate enough
+// for shapes up to a few hundred miles across.
 // --------------------------------------------------------------------------
 
-function createRectangleRegion([a, b]) {
-    const bbox = {
-        minLat: Math.min(a.lat, b.lat), maxLat: Math.max(a.lat, b.lat),
-        minLng: Math.min(a.lng, b.lng), maxLng: Math.max(a.lng, b.lng)
-    };
-    const midLat = (bbox.minLat + bbox.maxLat) / 2;
-    const widthM = haversine(midLat, bbox.minLng, midLat, bbox.maxLng);
-    const heightM = haversine(bbox.minLat, a.lng, bbox.maxLat, a.lng);
-
+function localProjection(refLat, refLng = 0) {
+    const ky = DEG * EARTH_RADIUS_M;
+    const kx = ky * Math.cos(refLat * DEG);
     return {
-        type: "rectangle",
-        outline: [
-            { lat: bbox.minLat, lng: bbox.minLng }, { lat: bbox.minLat, lng: bbox.maxLng },
-            { lat: bbox.maxLat, lng: bbox.maxLng }, { lat: bbox.maxLat, lng: bbox.minLng }
-        ],
-        sizeMeters: [widthM, heightM],
-        areaSqKm: widthM * heightM / 1e6,
-        bbox,
-        contains: (lat, lng) => lat >= bbox.minLat && lat <= bbox.maxLat && lng >= bbox.minLng && lng <= bbox.maxLng,
-        overpassFilter: `(${bbox.minLat.toFixed(6)},${bbox.minLng.toFixed(6)},${bbox.maxLat.toFixed(6)},${bbox.maxLng.toFixed(6)})`
+        toXY: (p) => ({ x: (p.lng - refLng) * kx, y: (p.lat - refLat) * ky }),
+        toLatLng: (x, y) => ({ lat: y / ky + refLat, lng: x / kx + refLng })
     };
 }
+
+function boundsOf(points) {
+    return points.reduce((box, p) => ({
+        minLat: Math.min(box.minLat, p.lat), maxLat: Math.max(box.maxLat, p.lat),
+        minLng: Math.min(box.minLng, p.lng), maxLng: Math.max(box.maxLng, p.lng)
+    }), { minLat: Infinity, maxLat: -Infinity, minLng: Infinity, maxLng: -Infinity });
+}
+
+// --------------------------------------------------------------------------
+// Polygon (any simple polygon: freehand shapes, rectangles, place boundaries)
+// --------------------------------------------------------------------------
+
+// Overpass "poly" filters get slow with many vertices; larger outlines are
+// simplified for the query only (the polygon itself stays exact).
+const OVERPASS_POLY_MAX_POINTS = 200;
+
+function createPolygonRegion(points, type = "polygon") {
+    const bbox = boundsOf(points);
+    const { toXY } = localProjection((bbox.minLat + bbox.maxLat) / 2, (bbox.minLng + bbox.maxLng) / 2);
+    const xy = points.map(toXY);
+    let twiceArea = 0;
+    for (let i = 0; i < xy.length; i++) {
+        const a = xy[i], b = xy[(i + 1) % xy.length];
+        twiceArea += a.x * b.y - b.x * a.y;
+    }
+    const lats = points.map(p => p.lat);
+    const lngs = points.map(p => p.lng);
+    const queryPoints = points.length > OVERPASS_POLY_MAX_POINTS
+        ? simplifyRing(points, OVERPASS_POLY_MAX_POINTS) : points;
+
+    return {
+        type,
+        outline: points,
+        areaSqKm: Math.abs(twiceArea) / 2 / 1e6,
+        bbox,
+        contains(lat, lng) {
+            if (lat < bbox.minLat || lat > bbox.maxLat || lng < bbox.minLng || lng > bbox.maxLng) return false;
+            let inside = false;
+            for (let i = 0, j = lats.length - 1; i < lats.length; j = i++) {
+                if ((lats[i] > lat) !== (lats[j] > lat) &&
+                    lng < lngs[i] + (lat - lats[i]) * (lngs[j] - lngs[i]) / (lats[j] - lats[i])) inside = !inside;
+            }
+            return inside;
+        },
+        overpassFilter: `(poly:"${queryPoints.map(p => `${p.lat.toFixed(5)} ${p.lng.toFixed(5)}`).join(" ")}")`
+    };
+}
+
+// Rectangle from three clicks: two corners along one side, then any point
+// on the opposite side (sets the width). Works at any rotation.
+function createRectangleRegion([a, b, c]) {
+    const { toXY, toLatLng } = localProjection(a.lat, a.lng);
+    const pa = toXY(a), pb = toXY(b), pc = toXY(c);
+    const dx = pb.x - pa.x, dy = pb.y - pa.y;
+    const length = Math.hypot(dx, dy) || 1;
+    const nx = -dy / length, ny = dx / length;
+    const width = (pc.x - pa.x) * nx + (pc.y - pa.y) * ny;
+    const corners = [
+        pa, pb,
+        { x: pb.x + nx * width, y: pb.y + ny * width },
+        { x: pa.x + nx * width, y: pa.y + ny * width }
+    ].map(p => toLatLng(p.x, p.y));
+
+    const region = createPolygonRegion(corners, "rectangle");
+    region.sizeMeters = [length, Math.abs(width)];
+    return region;
+}
+
+// Corridor: everything within radiusMeters of a polyline. Used to load all
+// roads along a rough loop when refining a very long one.
+function createCorridorRegion(points, radiusMeters) {
+    const bbox0 = boundsOf(points);
+    const { toXY } = localProjection((bbox0.minLat + bbox0.maxLat) / 2, (bbox0.minLng + bbox0.maxLng) / 2);
+    const xy = points.map(toXY);
+    const dLat = radiusMeters / (EARTH_RADIUS_M * DEG);
+    const dLng = dLat / Math.max(Math.cos(((bbox0.minLat + bbox0.maxLat) / 2) * DEG), 1e-6);
+    const bbox = { minLat: bbox0.minLat - dLat, maxLat: bbox0.maxLat + dLat, minLng: bbox0.minLng - dLng, maxLng: bbox0.maxLng + dLng };
+    const r2 = radiusMeters * radiusMeters;
+    let length = 0;
+    for (let i = 1; i < xy.length; i++) length += Math.hypot(xy[i].x - xy[i - 1].x, xy[i].y - xy[i - 1].y);
+
+    return {
+        type: "corridor",
+        points,
+        radiusMeters,
+        areaSqKm: (2 * radiusMeters * length + Math.PI * r2) / 1e6,
+        bbox,
+        contains(lat, lng) {
+            if (lat < bbox.minLat || lat > bbox.maxLat || lng < bbox.minLng || lng > bbox.maxLng) return false;
+            const p = toXY({ lat, lng });
+            for (let i = 1; i < xy.length; i++) {
+                if (distanceToSegmentSq(p, xy[i - 1], xy[i]) <= r2) return true;
+            }
+            return xy.length === 1 && (p.x - xy[0].x) ** 2 + (p.y - xy[0].y) ** 2 <= r2;
+        },
+        // Overpass accepts a polyline for "around".
+        overpassFilter: `(around:${radiusMeters.toFixed(0)},${points.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(",")})`
+    };
+}
+
+function distanceToSegmentSq(p, a, b) {
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 > 0 ? Math.max(0, Math.min(1, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2)) : 0;
+    return (a.x + t * dx - p.x) ** 2 + (a.y + t * dy - p.y) ** 2;
+}
+
+// Douglas–Peucker on lat/lng (scaled for latitude), down to about maxPoints.
+function simplifyLine(points, maxPoints) {
+    if (points.length <= maxPoints) return points;
+    const k = Math.cos(points[0].lat * DEG);
+    const xy = points.map(p => ({ x: p.lng * k, y: p.lat }));
+    const keepWith = (tolerance) => {
+        const keep = new Uint8Array(points.length);
+        keep[0] = keep[points.length - 1] = 1;
+        const stack = [[0, points.length - 1]];
+        const tol2 = tolerance * tolerance;
+        while (stack.length) {
+            const [lo, hi] = stack.pop();
+            let worst = -1, worstD = tol2;
+            for (let i = lo + 1; i < hi; i++) {
+                const d = distanceToSegmentSq(xy[i], xy[lo], xy[hi]);
+                if (d > worstD) {
+                    worstD = d;
+                    worst = i;
+                }
+            }
+            if (worst >= 0) {
+                keep[worst] = 1;
+                stack.push([lo, worst], [worst, hi]);
+            }
+        }
+        return points.filter((_, i) => keep[i]);
+    };
+    // Grow the tolerance until the result is small enough.
+    const box = boundsOf(points);
+    let tolerance = Math.max(box.maxLat - box.minLat, (box.maxLng - box.minLng) * k) / 2000;
+    let out = keepWith(tolerance);
+    while (out.length > maxPoints) {
+        tolerance *= 1.6;
+        out = keepWith(tolerance);
+    }
+    return out;
+}
+
+// Closed ring version: simplified as a line that returns to its start.
+const simplifyRing = (points, maxPoints) => simplifyLine([...points, points[0]], maxPoints + 1).slice(0, -1);
 
 // --------------------------------------------------------------------------
 
 function createShapeRegion(shape) {
     if (shape.type === "circle") return createCircleFromDiameter(shape.points);
+    if (shape.type === "ellipse") return createEllipseRegion(shape.points);
     if (shape.type === "rectangle") return createRectangleRegion(shape.points);
-    return createEllipseRegion(shape.points);
+    return createPolygonRegion(shape.points, shape.type);
 }
 
-// The same shape grown (factor > 1) or shrunk around its center. Every shape
-// type is defined by points placed symmetrically around its center, so
-// scaling the points scales the shape.
-function scaleShape(shape, factor) {
-    const n = shape.points.length;
-    const c = {
-        lat: shape.points.reduce((s, p) => s + p.lat, 0) / n,
-        lng: shape.points.reduce((s, p) => s + p.lng, 0) / n
-    };
-    return {
-        type: shape.type,
-        points: shape.points.map(p => ({ lat: c.lat + (p.lat - c.lat) * factor, lng: c.lng + (p.lng - c.lng) * factor }))
-    };
+// The region roads are loaded from for an area search: the shape grown by
+// `factor` around its center, so the loop can use roads just outside it.
+function marginRegion(region, factor) {
+    if (region.type === "circle") return createCircleRegion(region.center, region.radiusMeters * factor);
+    const bbox = region.bbox;
+    const { toXY, toLatLng } = localProjection((bbox.minLat + bbox.maxLat) / 2, (bbox.minLng + bbox.maxLng) / 2);
+    const xy = region.outline.map(toXY);
+    const c = polygonCentroidXY(xy);
+    return createPolygonRegion(xy.map(p => toLatLng(c.x + (p.x - c.x) * factor, c.y + (p.y - c.y) * factor)));
+}
+
+function polygonCentroidXY(points) {
+    let area = 0, cx = 0, cy = 0;
+    for (let i = 0; i < points.length; i++) {
+        const a = points[i], b = points[(i + 1) % points.length];
+        const c = a.x * b.y - b.x * a.y;
+        area += c;
+        cx += (a.x + b.x) * c;
+        cy += (a.y + b.y) * c;
+    }
+    if (Math.abs(area) < 1e-9) {
+        return { x: points.reduce((s, p) => s + p.x, 0) / points.length, y: points.reduce((s, p) => s + p.y, 0) / points.length };
+    }
+    return { x: cx / (3 * area), y: cy / (3 * area) };
 }
 
 if (typeof module !== "undefined") {
     module.exports = {
-        haversine, metersToMiles, milesToMeters, sqKmToSqMiles,
+        haversine, metersToMiles, milesToMeters, sqKmToSqMiles, localProjection, boundsOf,
         createCircleRegion, createCircleFromDiameter, createEllipseRegion, createRectangleRegion,
-        createShapeRegion, scaleShape
+        createPolygonRegion, createCorridorRegion, simplifyLine, simplifyRing,
+        createShapeRegion, marginRegion, polygonCentroidXY
     };
 }

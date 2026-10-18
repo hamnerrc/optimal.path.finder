@@ -327,7 +327,8 @@ h1 {
 
 .segmented {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-auto-columns: 1fr;
+    grid-auto-flow: column;
     padding: 3px;
     background: var(--surface-muted);
     border-radius: 10px;
@@ -653,7 +654,7 @@ h1 {
 
 .shape-choices {
     display: grid;
-    grid-template-columns: repeat(3, 1fr);
+    grid-template-columns: repeat(2, 1fr);
     gap: 8px;
 }
 
@@ -883,27 +884,75 @@ h1 {
     flex: 1;
 }
 
-.segmented-small {
+.pace-row .field-label {
     flex: 1;
 }
 
-.segmented-small button {
-    height: 28px;
-    font-size: 13px;
-}
-
-.segmented-small button[aria-pressed="true"] {
+.pace-input {
+    width: 72px;
+    height: 32px;
+    padding: 0 8px;
+    font: inherit;
     color: var(--text);
     background: var(--surface-solid);
-    box-shadow: var(--shadow-sm);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
 }
 
-.pace-input {
-    flex: 0 0 auto;
+.pace-row select,
+.field-inline select {
+    height: 32px;
+    padding: 0 8px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--surface-solid);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
 }
 
-.pace-input input {
-    width: 64px;
+.pace-input:focus,
+.pace-row select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Coverage target */
+.coverage-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+}
+
+.coverage-row input {
+    flex: 1;
+    accent-color: var(--accent);
+}
+
+.coverage-row output {
+    min-width: 48px;
+    padding: 4px 8px;
+    text-align: center;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--accent);
+    background: var(--accent-soft);
+    border-radius: 8px;
+}
+
+/* Place search results */
+.result-kind {
+    display: block;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--accent);
+}
+
+.result-name {
+    display: block;
 }
 
 .btn-small {
@@ -1118,16 +1167,6 @@ h1 {
     justify-content: space-between;
 }
 
-.field-inline select {
-    height: 32px;
-    padding: 0 8px;
-    font: inherit;
-    font-size: 13px;
-    color: var(--text);
-    background: var(--surface-solid);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-sm);
-}
 
 .dialog .field {
     margin-bottom: 8px;

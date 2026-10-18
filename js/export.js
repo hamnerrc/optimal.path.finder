@@ -1,5 +1,5 @@
 // ==========================================================================
-// Export: KML for Google Earth / Google My Maps.
+// Export: KML for Google Earth / Google My Maps, GPX for Garmin, Strava etc.
 // ==========================================================================
 
 const escapeXml = (s) => String(s).replace(/[<>&'"]/g, c => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", "'": "&apos;", '"': "&quot;" })[c]);
@@ -40,6 +40,24 @@ function routeToKml(route, name) {
   </Placemark>
 </Document>
 </kml>
+`;
+}
+
+// A GPX track, from the chosen start in the chosen direction.
+function routeToGpx(route, name) {
+    const points = orderedCoords(route)
+        .map(([lat, lng]) => `      <trkpt lat="${lat.toFixed(6)}" lon="${lng.toFixed(6)}"></trkpt>`)
+        .join("\n");
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Interval Route Finder" xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata><name>${escapeXml(name)}</name></metadata>
+  <trk>
+    <name>${escapeXml(name)}</name>
+    <trkseg>
+${points}
+    </trkseg>
+  </trk>
+</gpx>
 `;
 }
 

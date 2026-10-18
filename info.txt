@@ -1,156 +1,3 @@
-INTERVAL ROUTE FINDER: QUESTIONS FOR YOU
-=========================================
-
-So far the site lets you pick an area and loads the road network inside it as a
-routing graph. It does not draw a route yet. Your answers below will tell me
-how to build that part and finish the site.
-
-How to answer: write below each question. Where I've put "Current
-assumption", you can just write "ok" if it's right. Skip anything you don't
-care about and I'll go with the assumption.
-
-
---- A. WHAT THE ROUTE IS FOR -----------------------------------------------
-
-1. What does "interval" mean for this site?
-   (a) Interval training: alternating hard and easy segments, e.g. 6 x 800m fast
-       with 400m recovery
-   (b) Points spaced at fixed intervals along a route, e.g. a marker every mile
-   (c) Something else
-   Current assumption: (a)
-   Answer: the interval app, which ranks people by how much territory they have surrounded (both biking and running modes)
-
-2. What activity is it for? Running, cycling, walking, or something else?
-   This decides which roads are allowed. Right now motorways and trunk roads
-   are included, which is wrong for running.
-   Answer: keep all roads, because over-pruning is too easy and should be done manually once a route is found
-
-3. What route shape do you want?
-   (a) A loop that ends where it started
-   (b) Out and back
-   (c) Point to point (start to a chosen finish)
-   (d) Let the user choose
-   Current assumption: (a) loop
-   Answer: loop
-
-4. If it's interval training, how should the workout be entered?
-   For example: "warm-up 1 mi, then 6 x (800 m hard / 400 m easy), cool-down 1 mi".
-   Should fast segments go on straight roads with few intersections or stops?
-   Should the map mark where each interval starts and ends?
-   Answer: once a loop is created, the starting point could theoretically be anywhere on the loop, so that should be asked to the user at the end of picking the route.
-
-5. In Start point mode, what does "Maximum distance" mean?
-   (a) How far the route may go from the start (a radius). This is what the
-       code does now.
-   (b) The total length of the route.
-   Do you also want a separate "target route length", e.g. "about 5 miles"?
-   Answer: the maximum distance they are willing to run for the loop, given a constrained point on that loop. Radius (maybe it should be half of that) is just set temporarily as an upper bound, but routes would be pruned if the closest path back to start is greater than max distance.
-
-6. You can place several start points, but right now only the selected one
-   (highlighted in blue) is used. What should multiple start points do?
-   (a) Pick one; the others are just saved options (current behavior)
-   (b) Make a route that passes through all of them
-   (c) Make a separate route from each one
-   (d) Only one start point should be allowed
-   Answer: c
-
-7. Area mode (circle or ellipse) has no start point. Where should the route
-   start? Should the user also place a start inside the area, or should any
-   point inside it be fine?
-   Answer: there are no constraints except finding the run with the greatest isoperimetric quotient that covers at least n% of the area of that bounding shape. This is so that the user could pick say a city, and find the best route to capture the area of it and be efficient.
-
-8. Units: miles only, or a miles/kilometers switch?
-   Current assumption: miles only
-   Answer: both togglable, default miles for now
-
-
---- B. ROUTE PREFERENCES ---------------------------------------------------
-
-9. Which kinds of path should be allowed, and which preferred?
-   Currently included: motorway, trunk, primary, secondary, tertiary,
-   unclassified, residential and living streets (plus their ramps).
-   Could add: footways and sidewalks, paths, cycleways, park trails, tracks,
-   service roads, pedestrian streets.
-   Should any be avoided, such as busy roads or unpaved surfaces?
-   Answer: any for now, manual review is better once route is found and exported to google earth (a good feature to add btw)
-
-10. Does elevation matter, e.g. flat routes for intervals or adding hills?
-    This would need an elevation data service.
-    Answer: you should add an elevation profile viewable for any route, and see how it changes from start to finish if/when start point is moved.
-
-11. Should the route avoid running the same street twice?
-    Answer: yes, because that would never be optimal for isoperimetric quotient
-
-12. How many route options should be shown: just the best one, or 2-3 to
-    choose from?
-    Answer: only the best route, unless specifically requested by user
-
-
---- C. WHAT THE USER SEES AND CAN DO ---------------------------------------
-
-13. After a route is made, what should appear? Tick any:
-    [-] Route line on the map
-    [-] Total distance
-    [ ] Interval markers / color-coded hard and easy segments
-    [ ] Turn-by-turn directions
-    [-] Elevation profile
-    [-] Estimated time (from a pace the user enters)
-
-14. Exports and sharing? Tick any:
-    [ ] GPX file download (for Garmin, Strava, etc.)
-    [ ] Shareable link
-    [ ] Print view
-    [-] Google maps KML path file
-
-15. Should routes be saved?
-    (a) No saving
-    (b) Saved in the browser only (no accounts)
-    (c) User accounts (needs a backend server and database)
-    Answer: b
-
-16. Is there anything the old version did, or that you'd planned, that I
-    should keep or add?
-    Answer: idk if this was there before, but add a rectangle shape choice along with the two round ones
-
-
---- D. LOOK, HOSTING, TECHNICAL --------------------------------------------
-
-17. Where will the site be hosted (GitHub Pages, Netlify, your own server)?
-    About how many users do you expect?
-    The free OpenStreetMap services it uses (map tiles, Overpass road data,
-    Nominatim search) have usage limits. Real traffic would need our own
-    servers or a paid provider. Is a small backend acceptable, or must it stay
-    a static site?
-    Answer: github pages when finished, dont do it now. just add to git
-
-18. Map style: the default is now Esri "Streets". The standard OpenStreetMap
-    tile server blocked the site (the "Access blocked" screen you saw), and
-    CARTO now requires an API key. The layer button (bottom right) also offers
-    "Paths & trails" (CyclOSM, which shows bike paths and trails) and
-    "OpenStreetMap France". Which should be the default? Is a free API key
-    from a provider like MapTiler or Stadia OK, for a more polished look and
-    reliable service?
-    Answer: this is good for now
-
-19. Branding: is "Interval Route Finder" the final name? Any colors, logo or
-    fonts to use?
-    Answer: dont worry about it for now
-
-20. Will people mostly use it on a phone (e.g. checking the route mid-run) or
-    on a computer while planning?
-    Answer: computer or ipad
-
-21. I changed the default distance from 50 mi to 5 mi. 50 mi made every
-    request a huge download (around 7,800 sq mi) that also set off the
-    "large area" warning. What default should it use? Should there be a hard
-    upper limit?
-    Answer: there should be a way that the solver can do massive searches, an idea earlier for long routes was to do some sort of chunking, and then optimal paths within chunks. This is because it should be possible to plan things as big as a loop around kansas.
-
-22. The project isn't under version control. Should I set up git (and a
-    GitHub repo, if you have one)?
-    Answer: yes set up git
-
-
 =============================================================================
 ROUND 2 (2026-10-18): WHAT'S DONE, AND NEW QUESTIONS
 =============================================================================
@@ -184,42 +31,42 @@ assumption.
     alternative is maximizing roundness (isoperimetric quotient), as area
     mode does, which would favor shorter, rounder loops over bigger ones.
     Current assumption: maximize area.
-    Answer:
+    Answer: ok
 
 24. Area mode: when two loops are about equally round and both meet the
     coverage target, should the shorter one win (less running), or doesn't
     it matter?
     Current assumption: roundness only.
-    Answer:
+    Answer: if the iso-quotient is equal, the one with the greater total area is the better one
 
 25. Area mode: may the loop go outside the drawn shape? Right now roads up
     to 30% beyond the shape are allowed, and area outside the shape neither
     helps nor hurts. Should outside area be penalized, or should the loop
     stay strictly inside?
     Current assumption: up to 30% outside is fine.
-    Answer:
+    Answer: change to 20% outside
 
 26. Default coverage target for area mode?
     Current assumption: 90%.
-    Answer:
+    Answer: default 90% good, but configurable (make it easy to understand for the user)
 
 27. How does the INTVL app count territory when a loop crosses or touches
     itself (a figure 8, or two parts meeting at one intersection)? The
     solver currently avoids that entirely. If you know how INTVL computes
     the area (GPS track polygon, a grid of cells, something else), tell me
     and I'll match it exactly.
-    Answer:
+    Answer: i believe it is just GPS track polygon, but I am not sure the full implications of that. to be honest just keep it how it is.
 
 28. Start points: a loop can only begin at a road intersection, so it
     starts at the point on the loop closest to your pin. A warning appears
     if that's more than about 500 ft away. OK?
-    Answer:
+    Answer: ok, just let user know that it will start on an intersection
 
 29. If no loop meets the requirements (e.g. the coverage target is too high
     for the roads available), the app shows the best loop it found with a
     warning. Would you rather get no loop at all in that case?
     Current assumption: show it with a warning.
-    Answer:
+    Answer: ok
 
 --- F. RUN VS BIKE ---------------------------------------------------------
 
@@ -227,7 +74,7 @@ assumption.
     vs speed). Should Bike mode also change which roads are used, e.g. skip
     footways and steps, or respect one-way streets? One-way streets are
     currently ignored in both modes.
-    Answer:
+    Answer: no changes, just make sure user could put mile/k pace, or mph/kph pace as input
 
 --- G. VERY LARGE AREAS (e.g. a loop around Kansas) ------------------------
 
@@ -240,16 +87,16 @@ assumption.
           loop, in chunks, and refine each stretch locally.
     Is that the "chunking" you had in mind? Above what size should it switch
     to this mode (say, loops longer than 30 mi)?
-    Answer:
+    Answer: ok, use testing to figure out the max distance feasible without chunking, rest will work as you described.
 
 32. For huge loops, is it OK if the coarse stage only uses major roads, so a
     loop around Kansas would mostly follow highways and county roads?
-    Answer:
+    Answer: yes, however there should be local optimization happening after the coarse one is made, whether thats universal, or just on spots that are calculated to be inefficient.
 
 33. Should very long searches be allowed to run for minutes (with a
     progress bar and the best loop so far drawn live)? The search time
     options are now 3 s, 8 s and 25 s per loop.
-    Answer:
+    Answer: yes, progress bar, and dynamically update. The user would then be able to export a loop even if its not done searching all the optimizations. it would just give them a slightly outdated file but thats fine for UX
 
 --- H. SHAPES --------------------------------------------------------------
 
@@ -257,28 +104,28 @@ assumption.
     real boundary, e.g. search "Lawrence, KS" and use its city limits as
     the shape? (Doable with OpenStreetMap boundary data. Odd-shaped
     boundaries need a bit more work in the coverage calculation.)
-    Answer:
+    Answer: this is a cool idea, not what i meant. You might as well add it as a tab called "capture city" or maybe other things like states, lakes, counties. You could do this well by precompting borders for all cities, counties, lakes, anything else cool.
 
 35. Rectangles are north-up (2 corners). Do you also want rotated
     rectangles (3 points), or a freehand polygon tool?
-    Answer:
+    Answer: 3 point rectangle, and add freehand polygon too
 
 --- I. SMALLER THINGS ------------------------------------------------------
 
 36. Exports: KML only, as you ticked. GPX is the usual format for Garmin
     and Strava routes and is easy to add. Want it?
-    Answer:
+    Answer: great, add those if quick and easy
 
 37. "Find loops" with several start points recomputes every start's loop
     each time. Should it skip starts whose loop is already up to date and
     only recompute the ones you changed?
-    Answer:
+    Answer: of course, no need to recompute one that is already done and optimal
 
 38. Elevation comes from the free Open-Meteo service. It's free for
     non-commercial use and rate-limits bursts. Is this a non-commercial
     project?
-    Answer:
+    Answer: this will be used by only 3 people for now, once its on pages. so no
 
 39. When you're ready for GitHub Pages: what's the GitHub repo (or should I
     create one with `gh`, and under what name)?
-    Answer:
+    Answer: I have created an empty repo at https://github.com/hamnerrc/optimal.path.finder for you to deploy to
