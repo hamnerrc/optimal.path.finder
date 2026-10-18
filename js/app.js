@@ -68,6 +68,7 @@ const ui = {
     statTime: $("statTime"),
     statClimb: $("statClimb"),
     routeWarning: $("routeWarning"),
+    routeNote: $("routeNote"),
     paceInput: $("paceInput"),
     paceFormatSelect: $("paceFormatSelect"),
     reverseButton: $("reverseButton"),
@@ -91,7 +92,6 @@ const ui = {
     progressFill: $("progressFill"),
     progressText: $("progressText"),
     routeHint: $("routeHint"),
-    effortSelect: $("effortSelect"),
     getRouteButton: $("getRouteButton"),
     getRouteLabel: $("getRouteLabel"),
     cancelLoadButton: $("cancelLoadButton"),
@@ -120,7 +120,6 @@ const prefs = {
     units: storedPrefs.units === "km" ? "km" : "mi",
     defaultDistanceM: storedPrefs.defaultDistanceM > 0 ? storedPrefs.defaultDistanceM : milesToMeters(CONFIG.defaultDistanceMiles),
     coveragePercent: storedPrefs.coveragePercent > 0 ? storedPrefs.coveragePercent : CONFIG.defaultCoveragePercent,
-    effort: CONFIG.searchEffort[storedPrefs.effort] ? storedPrefs.effort : CONFIG.defaultEffort,
     // Pace is stored as a speed (m/s) and shown in the chosen format.
     paceFormat: PACE_FORMATS[storedPrefs.paceFormat] ? storedPrefs.paceFormat : (storedPrefs.units === "km" ? "min/km" : "min/mi"),
     speedMps: storedPrefs.speedMps > 0 ? storedPrefs.speedMps : METERS_PER_MILE / CONFIG.defaultPaceSecPerMile
@@ -146,6 +145,7 @@ const state = {
     placeLayer: null,
 
     network: null,             // most recently loaded road network
+    networkLayers: new Map(),  // "start:<id>" | "area" -> roads drawn for that search
     loading: null,             // { controller, control } while a search runs
 
     routes: [],                // found or loaded loops, see showLoop()
@@ -225,8 +225,8 @@ function routeHintText(ready, blocked, pending) {
     if (blocked) return "Finish the shape first.";
     if (ready && !pending) {
         return state.mode === "distance"
-            ? "Move a pin, change a length or pick a longer search time to search again."
-            : "Change the area, the coverage or the search time to search again.";
+            ? "Move a pin or change a length to search again."
+            : "Change the area or the coverage to search again.";
     }
     if (ready) return "";
     if (state.mode === "distance") return "Add a start point to continue.";
@@ -296,6 +296,7 @@ function setMode(mode) {
     toggleLayer(layers.starts, mode === "distance");
     toggleLayer(layers.shape, mode === "shape");
     toggleLayer(layers.place, mode === "place");
+    refreshNetworkLayers();
     render();
 }
 
@@ -355,10 +356,13 @@ function addStart(latlng) {
     renderStartList();
 }
 
+// The start's roads disappear from the map, but the download stays cached
+// (see fetchRoads), so a new start point nearby loads instantly.
 function removeStart(id) {
     const entry = state.starts.find(s => s.id === id);
     if (!entry) return;
     layers.starts.removeLayer(entry.marker).removeLayer(entry.circle);
+    removeNetworkLayer(`start:${id}`);
     state.starts = state.starts.filter(s => s.id !== id);
     if (state.activeStartId === id) state.activeStartId = state.starts[0]?.id ?? null;
     refreshStartMarkers();
@@ -602,7 +606,6 @@ updateCoords();
 
 // One job per loop to find: each start point, or the drawn area / place.
 function searchJobs() {
-    const timeBudgetMs = CONFIG.searchEffort[prefs.effort].ms;
     if (state.mode === "distance") {
         return state.starts.map(start => {
             const { lat, lng } = start.latlng;
@@ -610,10 +613,10 @@ function searchJobs() {
                 kind: "start",
                 start,
                 label: `Start ${startNumber(start.id)}`,
-                key: `start:${start.id}:${lat.toFixed(6)},${lng.toFixed(6)}:${Math.round(start.maxDistanceM)}:${prefs.effort}`,
+                key: `start:${start.id}:${lat.toFixed(6)},${lng.toFixed(6)}:${Math.round(start.maxDistanceM)}`,
+                networkKey: `start:${start.id}`,
                 region: startRegion(start),
-                objective: { mode: "start", start: { lat, lng }, maxLengthM: start.maxDistanceM },
-                timeBudgetMs
+                objective: { mode: "start", start: { lat, lng }, maxLengthM: start.maxDistanceM }
             };
         });
     }
@@ -633,15 +636,15 @@ function searchJobs() {
     return [{
         kind: "area",
         label,
-        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${prefs.coveragePercent}:${prefs.effort}`,
+        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${prefs.coveragePercent}`,
+        networkKey: "area",
         region: marginRegion(target, CONFIG.areaMargin),
-        objective: { mode: "area", target: outline, coverage: prefs.coveragePercent / 100 },
-        timeBudgetMs
+        objective: { mode: "area", target: outline, coverage: prefs.coveragePercent / 100 }
     }];
 }
 
 // A finished loop already exists for exactly this job (same pin, length,
-// shape, coverage and search time), so there's nothing to recompute.
+// shape and coverage), so there's nothing to recompute.
 const isUpToDate = (job) => state.routes.some(r => r.jobKey === job.key && !r.searching);
 
 async function findLoops() {
@@ -654,6 +657,7 @@ async function findLoops() {
             "Large search",
             `This search covers about ${formatArea(sqKm * 1e6)}. It runs in stages: first a rough loop on ` +
             `major roads, then each stretch is improved using all roads. It can take several minutes. ` +
+            `The loop on the map updates as better ones are found. ` +
             `You can stop it at any time and keep (or export) the best loop found so far.`
         );
         if (!ok) return;
@@ -662,7 +666,6 @@ async function findLoops() {
     const controller = new AbortController();
     const control = { stop: false };
     state.loading = { controller, control };
-    layers.network.clearLayers();
     render();
 
     const found = [];
@@ -686,12 +689,15 @@ async function findLoops() {
         try {
             const result = await searchLoop(job, {
                 signal: controller.signal,
-                control,
                 onStatus: (text, fraction) => showProgress(fraction, `${prefix}${text}${route ? ` Best so far: ${formatDistance(route.lengthM)}, ${formatArea(route.areaM2)}.` : ""}`),
                 onLoop: show,
                 onNetwork: (network) => {
                     state.network = network;
-                    drawNetwork(network);
+                    removeNetworkLayer(job.networkKey);
+                    const group = L.layerGroup();
+                    drawNetwork(network, group);
+                    state.networkLayers.set(job.networkKey, group);
+                    refreshNetworkLayers();
                     console.log("[Network]", network);
                 }
             });
@@ -729,10 +735,12 @@ async function findLoops() {
     else toast(found.length > 1 ? `Found ${found.length} loops.` : "Loop found.", "success");
 }
 
+// While searching, the bar shows how settled the search is: it fills as
+// rounds go by without a better loop, and drops back when one is found.
 function showProgress(fraction, text) {
     ui.progressFill.style.width = `${Math.round(fraction * 100)}%`;
     ui.progressText.textContent = text;
-    ui.getRouteLabel.textContent = fraction > 0 ? "Searching…" : "Loading…";
+    ui.getRouteLabel.textContent = "Searching…";
 }
 
 // Stopping keeps every loop found so far, including the one being improved.
@@ -747,15 +755,22 @@ ui.cancelLoadButton.addEventListener("click", stopSearch);
 
 ui.showNetworkInput.addEventListener("change", () => toggleLayer(layers.network, ui.showNetworkInput.checked));
 
-const formatSeconds = (ms) => ms < 60000 ? `${ms / 1000} s` : `${ms / 60000} min`;
-for (const [key, { label, ms }] of Object.entries(CONFIG.searchEffort)) {
-    ui.effortSelect.add(new Option(`${label} (${formatSeconds(ms)} per loop)`, key, false, key === prefs.effort));
+// Shows the roads of the current mode's searches: each start point's in
+// start point mode, the area's in area and place mode.
+function refreshNetworkLayers() {
+    for (const [key, group] of state.networkLayers) {
+        const visible = key.startsWith("start:") ? state.mode === "distance" : state.mode !== "distance";
+        if (visible) group.addTo(layers.network);
+        else layers.network.removeLayer(group);
+    }
 }
-ui.effortSelect.addEventListener("change", () => {
-    prefs.effort = ui.effortSelect.value;
-    rememberPrefs();
-    render();
-});
+
+function removeNetworkLayer(key) {
+    const group = state.networkLayers.get(key);
+    if (!group) return;
+    layers.network.removeLayer(group);
+    state.networkLayers.delete(key);
+}
 
 // ==========================================================================
 // Loops on the map and in the panel
@@ -799,6 +814,7 @@ function showLoop(route, loop, job) {
     // Start where the loop passes closest to the pin.
     if (job.kind === "start") route.startOffsetM = nearestOffset(route, job.start.latlng);
     route.warning = routeWarning(route, loop, job);
+    route.note = routeNote(loop);
 
     if (route.id === state.activeRouteId) {
         drawRouteDecor();
@@ -818,6 +834,12 @@ function createRoute(fields) {
     return route;
 }
 
+function routeNote(result) {
+    return result.stemM > 30
+        ? `The loop starts with ${formatDistance(result.stemM)} out to it, and ends with the same stretch back.`
+        : "";
+}
+
 function routeWarning(route, result, job) {
     const notes = [];
     if (result.repeats > 0) notes.push("It runs part of a street twice.");
@@ -833,7 +855,7 @@ function routeWarning(route, result, job) {
     // small difference from the exact figure.
     if (job.kind === "area" && result.coverage < job.objective.coverage - 0.005) {
         notes.push(`It only encloses ${Math.round(result.coverage * 100)}% of the area (target ${Math.round(job.objective.coverage * 100)}%). ` +
-            `Try a lower target or a longer search.`);
+            `Try a lower target.`);
     }
     return notes.join(" ");
 }
@@ -920,6 +942,8 @@ function renderRouteDetail() {
     ui.statTime.textContent = formatDuration(estimatedSeconds(route));
     ui.routeWarning.textContent = route.warning || "";
     ui.routeWarning.hidden = !route.warning;
+    ui.routeNote.textContent = route.note || "";
+    ui.routeNote.hidden = !route.note;
     renderElevation(route);
 }
 
@@ -1229,6 +1253,9 @@ const PLACE_MAX_POINTS = 400;
 
 let placeController = null;
 
+// Searching asks only for names (fast, even when the results include whole
+// states or lakes); the boundary is downloaded for the one place picked, and
+// simplified on the server to about the detail its size needs.
 ui.placeForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     const query = ui.placeInput.value.trim();
@@ -1236,15 +1263,52 @@ ui.placeForm.addEventListener("submit", async (e) => {
 
     placeController?.abort();
     placeController = new AbortController();
+    showPlaceMessage("Searching…");
     try {
-        const url = `${CONFIG.geocoder.url}?format=jsonv2&limit=10&polygon_geojson=1&polygon_threshold=0.0005&q=${encodeURIComponent(query)}`;
+        const url = `${CONFIG.geocoder.url}?format=jsonv2&limit=10&q=${encodeURIComponent(query)}`;
         const response = await fetch(url, { signal: placeController.signal, headers: { "Accept-Language": navigator.language } });
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        showPlaceResults((await response.json()).filter(p => /Polygon/.test(p.geojson?.type || "")));
+        // Points (nodes) have no boundary.
+        showPlaceResults((await response.json()).filter(p => p.osm_type === "relation" || p.osm_type === "way"));
     } catch (err) {
-        if (err.name !== "AbortError") toast("Place search failed. Please try again.", "error");
+        if (err.name !== "AbortError") {
+            ui.placeResults.hidden = true;
+            toast("Place search failed. Please try again.", "error");
+        }
     }
 });
+
+function showPlaceMessage(text) {
+    ui.placeResults.innerHTML = `<li class="empty"></li>`;
+    ui.placeResults.firstChild.textContent = text;
+    ui.placeResults.hidden = false;
+}
+
+async function choosePlace(place) {
+    placeController?.abort();
+    placeController = new AbortController();
+    showPlaceMessage(`Loading the boundary of ${place.name || place.display_name.split(",")[0]}…`);
+    try {
+        const [south, north, west, east] = place.boundingbox.map(Number);
+        const tolerance = Math.hypot(north - south, east - west) / 2000;
+        const id = `${place.osm_type[0].toUpperCase()}${place.osm_id}`;
+        const url = `${CONFIG.geocoder.lookupUrl}?format=jsonv2&polygon_geojson=1&polygon_threshold=${tolerance.toPrecision(2)}&osm_ids=${id}`;
+        const response = await fetch(url, { signal: placeController.signal, headers: { "Accept-Language": navigator.language } });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const [detail] = await response.json();
+        ui.placeResults.hidden = true;
+        if (!/Polygon/.test(detail?.geojson?.type || "")) {
+            toast("That place has no boundary. Try another result.", "warning");
+            return;
+        }
+        setPlace({ ...place, geojson: detail.geojson });
+    } catch (err) {
+        if (err.name !== "AbortError") {
+            ui.placeResults.hidden = true;
+            toast("Couldn't load that boundary. Please try again.", "error");
+        }
+    }
+}
 
 function showPlaceResults(places) {
     if (places.length === 0) {
@@ -1259,10 +1323,7 @@ function showPlaceResults(places) {
         button.innerHTML = `<span class="result-kind"></span><span class="result-name"></span>`;
         button.querySelector(".result-kind").textContent = placeKind(place);
         button.querySelector(".result-name").textContent = place.display_name;
-        button.addEventListener("click", () => {
-            ui.placeResults.hidden = true;
-            setPlace(place);
-        });
+        button.addEventListener("click", () => choosePlace(place));
         item.appendChild(button);
         return item;
     }));
@@ -1322,7 +1383,8 @@ ui.clearPlaceButton.addEventListener("click", () => {
 });
 
 document.addEventListener("click", (e) => {
-    if (!ui.placeForm.contains(e.target)) ui.placeResults.hidden = true;
+    // A result that was clicked is already replaced by the loading message.
+    if (e.target.isConnected && !ui.placeForm.contains(e.target)) ui.placeResults.hidden = true;
 });
 
 // ==========================================================================

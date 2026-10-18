@@ -9,16 +9,17 @@
 //      to improve the whole loop's score (the rest of the loop stays fixed).
 //      A change is only kept if the loop gets better.
 //
-// The best loop so far is reported through onLoop() as the search goes, so
-// it can be shown, exported or kept if the search is stopped.
+// There's no time limit: every search runs until it stops finding better
+// loops (see SearchTracker in js/solver.js). The best loop so far is
+// reported through onLoop() as the search goes, so it can be shown,
+// exported or kept if the search is stopped.
 // ==========================================================================
 
 // job:
 //   objective  { mode: "start", start: {lat,lng}, maxLengthM }
 //            | { mode: "area", target: [{lat,lng}], coverage }
 //   region     full-detail download region
-//   timeBudgetMs
-// options: { signal, control, onStatus(text, fraction), onLoop(loop, final), onNetwork(network) }
+// options: { signal, onStatus(text, fraction), onLoop(loop, final), onNetwork(network) }
 // Resolves with the final loop: { coords, lengthM, areaM2, iq, coverage, feasible, repeats, chunked }.
 async function searchLoop(job, options) {
     const sqMiles = sqKmToSqMiles(job.region.areaSqKm);
@@ -34,7 +35,7 @@ async function searchLoop(job, options) {
     return searchChunked(job, options);
 }
 
-async function searchFullDetail(job, { signal, control, onStatus, onLoop, onNetwork }) {
+async function searchFullDetail(job, { signal, onStatus, onLoop, onNetwork }) {
     onStatus("Downloading roads…", 0);
     const osm = await fetchRoads(job.region, signal);
     onStatus("Building road network…", 0);
@@ -43,21 +44,21 @@ async function searchFullDetail(job, { signal, control, onStatus, onLoop, onNetw
     if (network.edges.length === 0) throw new Error("No roads found here.");
     onNetwork(network);
 
-    const result = await runSolver(network, { ...solverParams(job.objective), timeBudgetMs: job.timeBudgetMs }, {
+    onStatus("Searching…", 0);
+    await nextFrame();
+    const result = await runSolver(network, solverParams(job.objective), {
         signal,
-        control,
-        onProgress: ({ fraction, best }) => {
+        onProgress: ({ fraction, rounds, best }) => {
             if (best) onLoop(best, false);
-            onStatus("Searching…", fraction);
+            onStatus(searchingText(rounds), fraction);
         }
     });
     return { ...result, chunked: false };
 }
 
-async function searchChunked(job, { signal, control, onStatus, onLoop, onNetwork }) {
+async function searchChunked(job, { signal, onStatus, onLoop, onNetwork }) {
     const { objective } = job;
     const settings = CONFIG.chunked;
-    const startTime = Date.now();
 
     // Stage 1: rough loop on major roads ------------------------------------
     const coarseRegion = objective.mode === "start"
@@ -76,18 +77,15 @@ async function searchChunked(job, { signal, control, onStatus, onLoop, onNetwork
     if (network.edges.length === 0) throw new Error("No major roads found here.");
     onNetwork(network);
 
-    const coarseMs = Math.max(5000, job.timeBudgetMs * settings.coarseShare);
-    let loop = await runSolver(network, { ...solverParams(objective), timeBudgetMs: coarseMs }, {
+    let loop = await runSolver(network, solverParams(objective), {
         signal,
-        control,
-        onProgress: ({ fraction, best }) => {
+        onProgress: ({ fraction, rounds, best }) => {
             if (best) onLoop({ ...best, chunked: true }, false);
-            onStatus("Finding a rough loop on major roads…", 0.1 + fraction * 0.25);
+            onStatus(`Finding a rough loop on major roads (round ${rounds})…`, 0.1 + fraction * 0.25);
         }
     });
     loop = { ...loop, chunked: true };
     onLoop(loop, false);
-    if (control.stop) return loop;
 
     // Stage 2: refine stretch by stretch with all roads ---------------------
     const targetOutline = objective.mode === "area" ? objective.target : null;
@@ -96,12 +94,10 @@ async function searchChunked(job, { signal, control, onStatus, onLoop, onNetwork
     let current = measureCoordsLoop(closeRing(coords), scoringObjective(objective), targetOutline);
 
     const stretches = Math.max(1, Math.ceil(current.length / settings.segmentLengthM));
-    const remainingMs = Math.max(0, job.timeBudgetMs - (Date.now() - startTime));
-    const perStretchMs = Math.max(settings.minRefineMs, remainingMs / stretches);
     const stretchLength = current.length / stretches;
 
     let passStart = null;   // where the pass began; the last stretch ends there
-    for (let i = 0; i < stretches && !control.stop; i++) {
+    for (let i = 0; i < stretches; i++) {
         const label = `Improving stretch ${i + 1} of ${stretches} with all roads…`;
         const base = 0.35 + 0.65 * (i / stretches);
         // The first stretchLength meters of the ring.
@@ -125,11 +121,9 @@ async function searchChunked(job, { signal, control, onStatus, onLoop, onNetwork
                     mode: "refine",
                     objective: objective.mode,
                     segment,
-                    fixed,
-                    timeBudgetMs: perStretchMs
+                    fixed
                 }, {
                     signal,
-                    control,
                     onProgress: ({ fraction }) => onStatus(label, base + 0.65 * fraction / stretches)
                 });
                 const candidate = result.coords.concat(fixed.slice(1, -1));
@@ -202,6 +196,8 @@ function rotateToNearest(coords, latlng) {
     });
     return coords.slice(best).concat(coords.slice(0, best));
 }
+
+const searchingText = (rounds) => `Searching, round ${rounds}. Finishes by itself once better loops stop turning up.`;
 
 // Yields so the browser can paint before heavy work.
 const nextFrame = () => new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));

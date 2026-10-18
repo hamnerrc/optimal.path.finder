@@ -102,9 +102,9 @@ function updateRegionLayer(layer, region) {
 // Road network
 // --------------------------------------------------------------------------
 
-// Two multi-polylines (major / minor roads) instead of one layer per segment.
-// Draws on top of any networks already shown; clear layers.network first to replace.
-function drawNetwork(network) {
+// Two multi-polylines (major / minor roads) instead of one layer per segment,
+// added to `group`.
+function drawNetwork(network, group) {
     const major = new Set(CONFIG.majorRoadTypes);
     const majorLines = [];
     const minorLines = [];
@@ -114,10 +114,10 @@ function drawNetwork(network) {
     }
 
     const style = { color: CONFIG.colors.network, interactive: false, smoothFactor: 1.5 };
-    if (minorLines.length) L.polyline(minorLines, { ...style, weight: 1.5, opacity: 0.45 }).addTo(layers.network);
-    if (majorLines.length) L.polyline(majorLines, { ...style, weight: 3, opacity: 0.6 }).addTo(layers.network);
+    if (minorLines.length) L.polyline(minorLines, { ...style, weight: 1.5, opacity: 0.45 }).addTo(group);
+    if (majorLines.length) L.polyline(majorLines, { ...style, weight: 3, opacity: 0.6 }).addTo(group);
 
-    createRegionLayer(network.region, "muted").addTo(layers.network);
+    createRegionLayer(network.region, "muted").addTo(group);
 }
 
 // --------------------------------------------------------------------------

@@ -38,21 +38,11 @@ const CONFIG = {
     defaultDistanceMiles: 5,
 
     // Area mode: default share of the drawn area the loop must enclose, and
-    // how far beyond the drawn area roads are loaded (1.3 = 30% larger), so
-    // the loop can use roads just outside its edge.
+    // how far beyond the drawn area roads are loaded (1.05 = 5% larger, as a
+    // scale factor on the area's convex hull), so the loop can use roads
+    // just outside its edge.
     defaultCoveragePercent: 90,
-    areaMargin: 1.2,
-
-    // How long the solver searches for each loop. You can stop a search
-    // early and keep the best loop found so far.
-    searchEffort: {
-        quick: { label: "Quick", ms: 3000 },
-        normal: { label: "Normal", ms: 8000 },
-        long: { label: "Long", ms: 30000 },
-        extended: { label: "Extended", ms: 120000 },
-        max: { label: "Very long", ms: 600000 }
-    },
-    defaultEffort: "normal",
+    areaMargin: 1.05,
 
     // Default pace for time estimates, in seconds per mile.
     defaultPaceSecPerMile: 540,
@@ -78,10 +68,6 @@ const CONFIG = {
         // the start, but the roundest loops stay within about L/π. The rough
         // stage loads roads within this fraction of L.
         startRadiusFraction: 0.4,
-        // Share of the search time spent on the rough loop (the rest goes to
-        // refining), and the minimum per refined stretch.
-        coarseShare: 0.35,
-        minRefineMs: 1500,
         segmentLengthM: 16000,
         corridorRadiusM: 800
     },
@@ -113,7 +99,10 @@ const CONFIG = {
             "https://maps.mail.ru/osm/tools/overpass/api/interpreter"
         ],
         timeoutSeconds: 90,
-        cacheSize: 6
+        // Downloads kept in memory for reuse (also limited by their total
+        // number of ways; a 10 mi loop in central Chicago is ~115k).
+        cacheSize: 8,
+        cacheMaxWays: 400000
     },
 
     elevation: {
@@ -126,6 +115,7 @@ const CONFIG = {
 
     geocoder: {
         url: "https://nominatim.openstreetmap.org/search",
+        lookupUrl: "https://nominatim.openstreetmap.org/lookup",
         limit: 5
     },
 

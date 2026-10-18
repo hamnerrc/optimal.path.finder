@@ -22,115 +22,6 @@ Built from your answers above:
   roads, tracks, steps added).
 - Git repository set up with two commits. Nothing pushed anywhere.
 
-Same format as before: answer below each question. "ok" accepts the current
-assumption.
-
---- E. HOW LOOPS ARE SCORED ------------------------------------------------
-
-23. Start point mode maximizes enclosed AREA within the length limit. The
-    alternative is maximizing roundness (isoperimetric quotient), as area
-    mode does, which would favor shorter, rounder loops over bigger ones.
-    Current assumption: maximize area.
-    Answer: ok
-
-24. Area mode: when two loops are about equally round and both meet the
-    coverage target, should the shorter one win (less running), or doesn't
-    it matter?
-    Current assumption: roundness only.
-    Answer: if the iso-quotient is equal, the one with the greater total area is the better one
-
-25. Area mode: may the loop go outside the drawn shape? Right now roads up
-    to 30% beyond the shape are allowed, and area outside the shape neither
-    helps nor hurts. Should outside area be penalized, or should the loop
-    stay strictly inside?
-    Current assumption: up to 30% outside is fine.
-    Answer: change to 20% outside
-
-26. Default coverage target for area mode?
-    Current assumption: 90%.
-    Answer: default 90% good, but configurable (make it easy to understand for the user)
-
-27. How does the INTVL app count territory when a loop crosses or touches
-    itself (a figure 8, or two parts meeting at one intersection)? The
-    solver currently avoids that entirely. If you know how INTVL computes
-    the area (GPS track polygon, a grid of cells, something else), tell me
-    and I'll match it exactly.
-    Answer: i believe it is just GPS track polygon, but I am not sure the full implications of that. to be honest just keep it how it is.
-
-28. Start points: a loop can only begin at a road intersection, so it
-    starts at the point on the loop closest to your pin. A warning appears
-    if that's more than about 500 ft away. OK?
-    Answer: ok, just let user know that it will start on an intersection
-
-29. If no loop meets the requirements (e.g. the coverage target is too high
-    for the roads available), the app shows the best loop it found with a
-    warning. Would you rather get no loop at all in that case?
-    Current assumption: show it with a warning.
-    Answer: ok
-
---- F. RUN VS BIKE ---------------------------------------------------------
-
-30. There's a Run/Bike switch, but it only changes the time estimate (pace
-    vs speed). Should Bike mode also change which roads are used, e.g. skip
-    footways and steps, or respect one-way streets? One-way streets are
-    currently ignored in both modes.
-    Answer: no changes, just make sure user could put mile/k pace, or mph/kph pace as input
-
---- G. VERY LARGE AREAS (e.g. a loop around Kansas) ------------------------
-
-31. Downloading every road and footpath in a state isn't feasible in a
-    browser: Overpass would refuse it, and the graph would have tens of
-    millions of points. My proposed plan:
-      (1) For big searches, first download only major roads (e.g. primary
-          through tertiary) and find a coarse loop on those.
-      (2) Then download all roads in a narrow corridor along that coarse
-          loop, in chunks, and refine each stretch locally.
-    Is that the "chunking" you had in mind? Above what size should it switch
-    to this mode (say, loops longer than 30 mi)?
-    Answer: ok, use testing to figure out the max distance feasible without chunking, rest will work as you described.
-
-32. For huge loops, is it OK if the coarse stage only uses major roads, so a
-    loop around Kansas would mostly follow highways and county roads?
-    Answer: yes, however there should be local optimization happening after the coarse one is made, whether thats universal, or just on spots that are calculated to be inefficient.
-
-33. Should very long searches be allowed to run for minutes (with a
-    progress bar and the best loop so far drawn live)? The search time
-    options are now 3 s, 8 s and 25 s per loop.
-    Answer: yes, progress bar, and dynamically update. The user would then be able to export a loop even if its not done searching all the optimizations. it would just give them a slightly outdated file but thats fine for UX
-
---- H. SHAPES --------------------------------------------------------------
-
-34. You mentioned picking a city. Should the area be able to come from a
-    real boundary, e.g. search "Lawrence, KS" and use its city limits as
-    the shape? (Doable with OpenStreetMap boundary data. Odd-shaped
-    boundaries need a bit more work in the coverage calculation.)
-    Answer: this is a cool idea, not what i meant. You might as well add it as a tab called "capture city" or maybe other things like states, lakes, counties. You could do this well by precompting borders for all cities, counties, lakes, anything else cool.
-
-35. Rectangles are north-up (2 corners). Do you also want rotated
-    rectangles (3 points), or a freehand polygon tool?
-    Answer: 3 point rectangle, and add freehand polygon too
-
---- I. SMALLER THINGS ------------------------------------------------------
-
-36. Exports: KML only, as you ticked. GPX is the usual format for Garmin
-    and Strava routes and is easy to add. Want it?
-    Answer: great, add those if quick and easy
-
-37. "Find loops" with several start points recomputes every start's loop
-    each time. Should it skip starts whose loop is already up to date and
-    only recompute the ones you changed?
-    Answer: of course, no need to recompute one that is already done and optimal
-
-38. Elevation comes from the free Open-Meteo service. It's free for
-    non-commercial use and rate-limits bursts. Is this a non-commercial
-    project?
-    Answer: this will be used by only 3 people for now, once its on pages. so no
-
-39. When you're ready for GitHub Pages: what's the GitHub repo (or should I
-    create one with `gh`, and under what name)?
-    Answer: I have created an empty repo at https://github.com/hamnerrc/optimal.path.finder for you to deploy to
-
-
 =============================================================================
 ROUND 3 (2026-10-18): DONE FROM YOUR ROUND 2 ANSWERS, AND OPEN POINTS
 =============================================================================
@@ -164,18 +55,125 @@ Done:
     branch "main", folder "/ (root)". The site will be at
     https://hamnerrc.github.io/optimal.path.finder/
     Or allow pushes for me and I'll do it.
-    Answer:
+    Answer: you are pre-authorized to push changes, and pages is deployed
 
 41. Q34 said "precompute borders for all cities, counties, lakes". Instead,
     boundaries are looked up when you search (OpenStreetMap via Nominatim);
     precomputing them all would be gigabytes. Is search-by-name enough, or
     do you also want to browse, e.g. click the map to pick the county or city
     you clicked in?
-    Answer:
+    Answer: just search by name is good
 
 42. Jagged boundaries (city limits with annexed lobes) give low-roundness
     loops: Lawrence, KS at 80% coverage comes out around IQ 0.2-0.3, and
     results vary quite a bit between runs. Longer search times help. Is it
     worth running several independent searches and keeping the best (more
     consistent, but proportionally slower), or is the current behavior OK?
+    Answer: we need it to be finding the best route, and really fast. Prioritize lightning fast search time, trying many random start seeds if needed. There must be a way to use the graph representation of the network and pruning to make it insanely fast.
+
+43. Additional notes
+    - if i delete a start point the loaded roads should stay saved in case they make another loop there, but be invisible
+    - the places search seems to be very slow
+    - there shouln't be a time limit. It should search until it finds a good route, without cutting off. There is not reason for the user to set some arbitrary limit, in just keeps searching.
+    - cut the outer bound to be 5% greater than the original boundary
+    - allow a path to cross a road twice. This is sometimes optimal when the start is in an awkward spot so those possibilities must be searched.
+
+=============================================================================
+ROUND 4 (2026-10-18): DONE FROM YOUR ROUND 3 ANSWERS, AND OPEN POINTS
+=============================================================================
+
+Done:
+- Q40: pushed to main, so the site updates on GitHub Pages
+  (https://hamnerrc.github.io/optimal.path.finder/).
+- Q41: place search stays search-by-name.
+- Q42 + "no time limit": new loop search.
+    * The road graph is shrunk before searching. Dead-end streets, and
+      whole trees of streets hanging off them, can never be part of a ring,
+      so they are pruned. Chains of road between junctions are merged into
+      single edges. That removes about 40% of the nodes in Lawrence.
+    * Waypoints snap to junctions with a k-d tree (it used to be a grid
+      scan that was very slow for points far from roads; that alone made
+      big Place searches about 5x faster). Routing uses a slightly greedy
+      A* that explores far fewer nodes.
+    * One search per spare CPU core runs in parallel, each with its own
+      random seed. Each keeps a small pool of good loops from different
+      starting shapes and keeps improving them, with a hill climb over
+      neighbouring junctions at the end of each round.
+    * The "Search time" menu is gone. A search ends by itself once enough
+      rounds in a row (12 + 4 per CPU worker, and at least half the rounds
+      it took to find the best loop) haven't improved the loop by more than
+      0.2%. The progress bar shows how settled the search is: it fills as
+      rounds go by without a better loop and drops back when one turns up.
+      Stop still keeps the best loop so far.
+    Measured on saved Lawrence road data (3 searches in parallel, the old
+    solver at its "Normal" 8 s):
+                              old (8 s)        new
+      5 mi start loop         1.27 sq mi       1.33-1.35 sq mi in 1-2 s
+      10 mi start loop        5.85 sq mi       5.2-6.0 sq mi in 9-12 s
+      rectangle at 90%        roundness 0.49   0.54 in 6-12 s
+      Lawrence city at 80%    roundness 0.2-0.3 (20% margin, 30 s);
+                              now 0.53 with a 20% margin, but see Q44
+- Deleting a start point hides its roads, but the download is kept in
+  memory. A new start point whose area lies inside an earlier download
+  needs no new download. Up to 8 downloads (about 400k roads in total) are
+  kept, and they're lost when the page is reloaded.
+- Place search: the search now asks Nominatim for names only. The
+  boundary is downloaded only for the place you pick, already simplified
+  by the server to the detail its size needs. Lake Michigan went from
+  200 KB to under 1 KB for the result list.
+- Area/Place margin cut from 20% to 5% (CONFIG.areaMargin = 1.05).
+- "Cross a road twice" (start point mode): the loop no longer has to pass
+  through the start. If a better loop is a short way off (or the pin is on
+  a dead-end street), the run goes out to it and back the same way. That
+  stretch counts twice toward the max length, and the loop's panel says
+  how long it is. The pin now snaps to the nearest road node of any kind,
+  including the end of a dead-end street, not only to intersections.
+
+Open points. Same format as before: answer below each question.
+
+44. The 5% margin often makes the coverage target unreachable, because
+    the loop can't use roads just outside the edge. Examples:
+      - A 2.2 x 1.7 mi rectangle in SW Lawrence at 90%: the best loop now
+        reaches 71% of the area. With the old 20% margin it reached 90%.
+      - Lawrence city limits at 80%: the best loop reaches 77-78%
+        (warning shown). With a 20% margin it reaches 80% with roundness
+        0.53. Here the hull already covers the northern lobes, so part of
+        the shortfall may be the search rather than the margin.
+    The margin also scales the area's convex hull, not the outline itself,
+    so for a jagged city it adds more than 5% around the notches. Which do
+    you want?
+      (a) keep 5%,
+      (b) 5% by default, widened automatically when the target can't be
+          reached,
+      (c) a margin setting in the panel,
+      (d) 5% around the outline itself (follows the jagged edge), not
+          around its hull.
+    Answer:
+
+45. "Allow a path to cross a road twice": I took this to mean the
+    out-and-back stretch from an awkward start point (above). The loop
+    itself still never runs a street twice or crosses itself, and in
+    Area/Place mode nothing changed. Did you also mean loops that touch or
+    cross themselves (figure 8s, or two lobes meeting at one
+    intersection)? Those are risky for INTVL scoring: if it uses the GPS
+    track polygon, a figure 8's two halves can cancel each other out.
+    Answer:
+
+46. "The places search seems to be very slow": Nominatim answered in about
+    1 second in my tests, so I made the lookup lighter (above). If you meant
+    finding the loop for a place: a Lawrence city-limits loop (~30 mi) now
+    takes 25-55 s on a 4-core laptop. Is anything
+    still slow, and at which step (search, boundary, downloading roads,
+    searching)?
+    Answer:
+
+47. Results still vary between runs for long loops (a 10 mi start loop in
+    Lawrence: 5.2 to 6.0 sq mi over 3 runs). "Find loop" doesn't search again once a
+    loop is up to date. Do you want a "Keep searching" button that
+    continues from the current best loop?
+    Answer:
+
+48. Kept road downloads are lost on reload. Should they be saved in the
+    browser (IndexedDB, can be tens of MB) so a reload doesn't download
+    again?
     Answer:

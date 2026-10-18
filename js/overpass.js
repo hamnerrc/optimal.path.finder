@@ -1,10 +1,12 @@
 // ==========================================================================
 // Overpass API road loader
-// Downloads OSM ways inside a region. Recent responses are cached in memory,
-// and a fallback server is tried if the primary one is busy or down.
+// Downloads OSM ways inside a region. Recent downloads are kept in memory
+// and reused for any later search that lies inside one of them (e.g. a new
+// start point near a removed one), and a fallback server is tried if the
+// primary one is busy or down.
 // ==========================================================================
 
-const overpassCache = new Map();
+const roadStore = [];   // [{ query, region, typesKey, data }], oldest first
 
 function buildRoadQuery(region, roadTypes) {
     return `[out:json][timeout:${CONFIG.overpass.timeoutSeconds}];` +
@@ -12,11 +14,16 @@ function buildRoadQuery(region, roadTypes) {
         `out geom qt;`;
 }
 
-// Only region.overpassFilter is used, so any object with one works (e.g. a
-// bounding-box tile). roadTypes defaults to every routable type.
+// Any object with region.overpassFilter works (e.g. a bounding-box tile);
+// regions with an outline and contains() can also be served from a larger
+// earlier download. The network builder clips to the region, so extra roads
+// don't matter. roadTypes defaults to every routable type.
 async function fetchRoads(region, signal, roadTypes = CONFIG.roadTypes) {
     const query = buildRoadQuery(region, roadTypes);
-    if (overpassCache.has(query)) return overpassCache.get(query);
+    const typesKey = roadTypes.join("|");
+    const stored = roadStore.find(entry => entry.query === query ||
+        entry.typesKey === typesKey && region.outline && entry.region.contains && regionInside(region, entry.region));
+    if (stored) return stored.data;
 
     let lastError = null;
     for (const endpoint of CONFIG.overpass.endpoints) {
@@ -38,7 +45,7 @@ async function fetchRoads(region, signal, roadTypes = CONFIG.roadTypes) {
             const data = await response.json();
             // Overpass reports timeouts and memory limits inside a 200 reply.
             if (/runtime error/i.test(data.remark || "")) throw new OverpassError("too-big");
-            rememberResponse(query, data);
+            rememberResponse(query, region, typesKey, data);
             return data;
         } catch (err) {
             if (err.name === "AbortError" || err instanceof OverpassError && !isRetryable(err)) throw err;
@@ -48,11 +55,23 @@ async function fetchRoads(region, signal, roadTypes = CONFIG.roadTypes) {
     throw lastError || new Error("No Overpass endpoint available");
 }
 
-function rememberResponse(query, data) {
-    overpassCache.set(query, data);
-    if (overpassCache.size > CONFIG.overpass.cacheSize) {
-        overpassCache.delete(overpassCache.keys().next().value);
+function rememberResponse(query, region, typesKey, data) {
+    roadStore.push({ query, region, typesKey, data });
+    // Keep a bounded number of downloads, and drop the oldest ones once
+    // they add up to a lot of roads.
+    let ways = roadStore.reduce((sum, entry) => sum + entry.data.elements.length, 0);
+    while (roadStore.length > 1 && (roadStore.length > CONFIG.overpass.cacheSize || ways > CONFIG.overpass.cacheMaxWays)) {
+        ways -= roadStore.shift().data.elements.length;
     }
+}
+
+// True if every point of the inner region's outline is inside the outer
+// region, and (for circles) the whole inner circle is.
+function regionInside(inner, outer) {
+    if (inner.type === "circle" && outer.type === "circle") {
+        return haversine(inner.center.lat, inner.center.lng, outer.center.lat, outer.center.lng) + inner.radiusMeters <= outer.radiusMeters;
+    }
+    return inner.outline.every(p => outer.contains(p.lat, p.lng));
 }
 
 class OverpassError extends Error {
