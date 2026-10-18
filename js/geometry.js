@@ -5,7 +5,8 @@
 // region exposes the same interface, so the loader and network builder never
 // need to know which shape they are dealing with:
 //
-//   type       "circle" | "ellipse"
+//   type       "circle" | "ellipse" | "rectangle"
+//   outline    [{ lat, lng }] polygon around the edge
 //   bbox       { minLat, maxLat, minLng, maxLng }
 //   areaSqKm   approximate area
 //   contains(lat, lng)  -> boolean
@@ -22,6 +23,8 @@ const DEG = Math.PI / 180;
 const metersToMiles = (m) => m / METERS_PER_MILE;
 const milesToMeters = (mi) => mi * METERS_PER_MILE;
 const sqKmToSqMiles = (km2) => km2 / SQ_KM_PER_SQ_MILE;
+
+const CIRCLE_SEGMENTS = 72;
 
 // Great-circle distance in meters.
 function haversine(lat1, lng1, lat2, lng2) {
@@ -42,10 +45,17 @@ function createCircleRegion(center, radiusMeters) {
     const dLat = radiusMeters / (EARTH_RADIUS_M * DEG);
     const dLng = dLat / Math.max(Math.cos(center.lat * DEG), 1e-6);
 
+    const outline = [];
+    for (let i = 0; i < CIRCLE_SEGMENTS; i++) {
+        const t = (i / CIRCLE_SEGMENTS) * 2 * Math.PI;
+        outline.push({ lat: center.lat + dLat * Math.sin(t), lng: center.lng + dLng * Math.cos(t) });
+    }
+
     return {
         type: "circle",
         center,
         radiusMeters,
+        outline,
         areaSqKm: Math.PI * (radiusMeters / 1000) ** 2,
         bbox: {
             minLat: Math.max(-90, center.lat - dLat),
@@ -159,14 +169,59 @@ function solve3x3(M, rhs) {
 }
 
 // --------------------------------------------------------------------------
+// Rectangle (north-up, from two opposite corners)
+// --------------------------------------------------------------------------
+
+function createRectangleRegion([a, b]) {
+    const bbox = {
+        minLat: Math.min(a.lat, b.lat), maxLat: Math.max(a.lat, b.lat),
+        minLng: Math.min(a.lng, b.lng), maxLng: Math.max(a.lng, b.lng)
+    };
+    const midLat = (bbox.minLat + bbox.maxLat) / 2;
+    const widthM = haversine(midLat, bbox.minLng, midLat, bbox.maxLng);
+    const heightM = haversine(bbox.minLat, a.lng, bbox.maxLat, a.lng);
+
+    return {
+        type: "rectangle",
+        outline: [
+            { lat: bbox.minLat, lng: bbox.minLng }, { lat: bbox.minLat, lng: bbox.maxLng },
+            { lat: bbox.maxLat, lng: bbox.maxLng }, { lat: bbox.maxLat, lng: bbox.minLng }
+        ],
+        sizeMeters: [widthM, heightM],
+        areaSqKm: widthM * heightM / 1e6,
+        bbox,
+        contains: (lat, lng) => lat >= bbox.minLat && lat <= bbox.maxLat && lng >= bbox.minLng && lng <= bbox.maxLng,
+        overpassFilter: `(${bbox.minLat.toFixed(6)},${bbox.minLng.toFixed(6)},${bbox.maxLat.toFixed(6)},${bbox.maxLng.toFixed(6)})`
+    };
+}
+
+// --------------------------------------------------------------------------
 
 function createShapeRegion(shape) {
-    return shape.type === "circle" ? createCircleFromDiameter(shape.points) : createEllipseRegion(shape.points);
+    if (shape.type === "circle") return createCircleFromDiameter(shape.points);
+    if (shape.type === "rectangle") return createRectangleRegion(shape.points);
+    return createEllipseRegion(shape.points);
+}
+
+// The same shape grown (factor > 1) or shrunk around its center. Every shape
+// type is defined by points placed symmetrically around its center, so
+// scaling the points scales the shape.
+function scaleShape(shape, factor) {
+    const n = shape.points.length;
+    const c = {
+        lat: shape.points.reduce((s, p) => s + p.lat, 0) / n,
+        lng: shape.points.reduce((s, p) => s + p.lng, 0) / n
+    };
+    return {
+        type: shape.type,
+        points: shape.points.map(p => ({ lat: c.lat + (p.lat - c.lat) * factor, lng: c.lng + (p.lng - c.lng) * factor }))
+    };
 }
 
 if (typeof module !== "undefined") {
     module.exports = {
         haversine, metersToMiles, milesToMeters, sqKmToSqMiles,
-        createCircleRegion, createCircleFromDiameter, createEllipseRegion, createShapeRegion
+        createCircleRegion, createCircleFromDiameter, createEllipseRegion, createRectangleRegion,
+        createShapeRegion, scaleShape
     };
 }

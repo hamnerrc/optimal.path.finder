@@ -9,7 +9,12 @@ const map = L.map("map", {
 }).setView(CONFIG.map.initialCenter, CONFIG.map.initialZoom);
 
 L.control.zoom({ position: "bottomright" }).addTo(map);
-L.control.scale({ position: "bottomright", imperial: true, metric: false }).addTo(map);
+
+let scaleControl = null;
+function setScaleUnits(name) {
+    scaleControl?.remove();
+    scaleControl = L.control.scale({ position: "bottomright", imperial: name === "mi", metric: name === "km" }).addTo(map);
+}
 
 const basemaps = Object.fromEntries(CONFIG.map.basemaps.map(({ name, url, ...options }) =>
     [name, L.tileLayer(url, options)]
@@ -18,9 +23,11 @@ Object.values(basemaps)[0].addTo(map);
 L.control.layers(basemaps, null, { position: "bottomright" }).addTo(map);
 
 const layers = {
+    network: L.layerGroup().addTo(map),
     starts: L.layerGroup().addTo(map),
     shape: L.layerGroup().addTo(map),
-    network: L.layerGroup().addTo(map)
+    routes: L.layerGroup().addTo(map),
+    routeDecor: L.layerGroup().addTo(map)
 };
 
 // --------------------------------------------------------------------------
@@ -40,6 +47,23 @@ const handleIcon = (pending) => L.divIcon({
     iconSize: [18, 18],
     iconAnchor: [9, 9]
 });
+
+// Start/finish flag; dragged along the loop to choose where the run starts.
+const startFlagIcon = () => L.divIcon({
+    className: "",
+    html: `<div class="start-flag"><svg viewBox="0 0 24 24"><path d="M6 21V4h11l-2 4 2 4H6" /></svg></div>`,
+    iconSize: [30, 30],
+    iconAnchor: [15, 15]
+});
+
+const arrowIcon = (degrees) => L.divIcon({
+    className: "",
+    html: `<div class="direction-arrow" style="transform: rotate(${degrees.toFixed(0)}deg)"><svg viewBox="0 0 16 16"><path d="M4 11l4-6 4 6" /></svg></div>`,
+    iconSize: [16, 16],
+    iconAnchor: [8, 8]
+});
+
+const hoverIcon = () => L.divIcon({ className: "", html: `<div class="hover-dot"></div>`, iconSize: [14, 14], iconAnchor: [7, 7] });
 
 // --------------------------------------------------------------------------
 // Region outlines
@@ -66,7 +90,7 @@ function updateRegionLayer(layer, region) {
         layer.setLatLng([region.center.lat, region.center.lng]).setRadius(region.radiusMeters);
         return layer;
     }
-    if (region.type === "ellipse" && layer instanceof L.Polygon) {
+    if (region.type !== "circle" && layer instanceof L.Polygon) {
         layer.setLatLngs(region.outline.map(p => [p.lat, p.lng]));
         return layer;
     }
@@ -78,8 +102,8 @@ function updateRegionLayer(layer, region) {
 // --------------------------------------------------------------------------
 
 // Two multi-polylines (major / minor roads) instead of one layer per segment.
+// Draws on top of any networks already shown; clear layers.network first to replace.
 function drawNetwork(network) {
-    layers.network.clearLayers();
     const major = new Set(CONFIG.majorRoadTypes);
     const majorLines = [];
     const minorLines = [];
@@ -89,21 +113,42 @@ function drawNetwork(network) {
     }
 
     const style = { color: CONFIG.colors.network, interactive: false, smoothFactor: 1.5 };
-    if (minorLines.length) L.polyline(minorLines, { ...style, weight: 2.5, opacity: 0.75 }).addTo(layers.network);
-    if (majorLines.length) L.polyline(majorLines, { ...style, weight: 4, opacity: 0.9 }).addTo(layers.network);
+    if (minorLines.length) L.polyline(minorLines, { ...style, weight: 1.5, opacity: 0.45 }).addTo(layers.network);
+    if (majorLines.length) L.polyline(majorLines, { ...style, weight: 3, opacity: 0.6 }).addTo(layers.network);
 
     createRegionLayer(network.region, "muted").addTo(layers.network);
 }
 
+// --------------------------------------------------------------------------
+// Loops
+// --------------------------------------------------------------------------
+
+const routeStyle = (active) => ({
+    color: active ? CONFIG.colors.route : CONFIG.colors.routeMuted,
+    weight: active ? 5 : 4,
+    opacity: active ? 0.95 : 0.75,
+    dashArray: active ? null : "10 6",
+    fillColor: active ? CONFIG.colors.route : CONFIG.colors.routeMuted,
+    fillOpacity: active ? 0.1 : 0.05,
+    lineJoin: "round"
+});
+
+// The search's best-so-far loop, drawn dashed while it runs.
+const previewStyle = { color: CONFIG.colors.pending, weight: 4, opacity: 0.9, dashArray: "8 8", fill: false, interactive: false };
+
 // Fits the region into the part of the map not covered by the side panel.
 function fitRegion(region) {
     const { minLat, maxLat, minLng, maxLng } = region.bbox;
+    fitBounds([[minLat, minLng], [maxLat, maxLng]]);
+}
+
+function fitBounds(bounds) {
     const panel = document.getElementById("panel");
     const sideBySide = window.innerWidth > 720;
     const offset = sideBySide ? panel.offsetWidth + 24 : 0;
     const bottom = sideBySide ? 0 : panel.offsetHeight;
 
-    map.fitBounds([[minLat, minLng], [maxLat, maxLng]], {
+    map.fitBounds(bounds, {
         paddingTopLeft: [offset + 40, 40],
         paddingBottomRight: [40, bottom + 40]
     });
