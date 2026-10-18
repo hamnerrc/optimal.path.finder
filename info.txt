@@ -1,0 +1,151 @@
+INTERVAL ROUTE FINDER: QUESTIONS FOR YOU
+=========================================
+
+So far the site lets you pick an area and loads the road network inside it as a
+routing graph. It does not draw a route yet. Your answers below will tell me
+how to build that part and finish the site.
+
+How to answer: write below each question. Where I've put "Current
+assumption", you can just write "ok" if it's right. Skip anything you don't
+care about and I'll go with the assumption.
+
+
+--- A. WHAT THE ROUTE IS FOR -----------------------------------------------
+
+1. What does "interval" mean for this site?
+   (a) Interval training: alternating hard and easy segments, e.g. 6 x 800m fast
+       with 400m recovery
+   (b) Points spaced at fixed intervals along a route, e.g. a marker every mile
+   (c) Something else
+   Current assumption: (a)
+   Answer: the interval app, which ranks people by how much territory they have surrounded (both biking and running modes)
+
+2. What activity is it for? Running, cycling, walking, or something else?
+   This decides which roads are allowed. Right now motorways and trunk roads
+   are included, which is wrong for running.
+   Answer: keep all roads, because over-pruning is too easy and should be done manually once a route is found
+
+3. What route shape do you want?
+   (a) A loop that ends where it started
+   (b) Out and back
+   (c) Point to point (start to a chosen finish)
+   (d) Let the user choose
+   Current assumption: (a) loop
+   Answer: loop
+
+4. If it's interval training, how should the workout be entered?
+   For example: "warm-up 1 mi, then 6 x (800 m hard / 400 m easy), cool-down 1 mi".
+   Should fast segments go on straight roads with few intersections or stops?
+   Should the map mark where each interval starts and ends?
+   Answer: once a loop is created, the starting point could theoretically be anywhere on the loop, so that should be asked to the user at the end of picking the route.
+
+5. In Start point mode, what does "Maximum distance" mean?
+   (a) How far the route may go from the start (a radius). This is what the
+       code does now.
+   (b) The total length of the route.
+   Do you also want a separate "target route length", e.g. "about 5 miles"?
+   Answer: the maximum distance they are willing to run for the loop, given a constrained point on that loop. Radius (maybe it should be half of that) is just set temporarily as an upper bound, but routes would be pruned if the closest path back to start is greater than max distance.
+
+6. You can place several start points, but right now only the selected one
+   (highlighted in blue) is used. What should multiple start points do?
+   (a) Pick one; the others are just saved options (current behavior)
+   (b) Make a route that passes through all of them
+   (c) Make a separate route from each one
+   (d) Only one start point should be allowed
+   Answer: c
+
+7. Area mode (circle or ellipse) has no start point. Where should the route
+   start? Should the user also place a start inside the area, or should any
+   point inside it be fine?
+   Answer: there are no constraints except finding the run with the greatest isoperimetric quotient that covers at least n% of the area of that bounding shape. This is so that the user could pick say a city, and find the best route to capture the area of it and be efficient.
+
+8. Units: miles only, or a miles/kilometers switch?
+   Current assumption: miles only
+   Answer: both togglable, default miles for now
+
+
+--- B. ROUTE PREFERENCES ---------------------------------------------------
+
+9. Which kinds of path should be allowed, and which preferred?
+   Currently included: motorway, trunk, primary, secondary, tertiary,
+   unclassified, residential and living streets (plus their ramps).
+   Could add: footways and sidewalks, paths, cycleways, park trails, tracks,
+   service roads, pedestrian streets.
+   Should any be avoided, such as busy roads or unpaved surfaces?
+   Answer: any for now, manual review is better once route is found and exported to google earth (a good feature to add btw)
+
+10. Does elevation matter, e.g. flat routes for intervals or adding hills?
+    This would need an elevation data service.
+    Answer: you should add an elevation profile viewable for any route, and see how it changes from start to finish if/when start point is moved.
+
+11. Should the route avoid running the same street twice?
+    Answer: yes, because that would never be optimal for isoperimetric quotient
+
+12. How many route options should be shown: just the best one, or 2-3 to
+    choose from?
+    Answer: only the best route, unless specifically requested by user
+
+
+--- C. WHAT THE USER SEES AND CAN DO ---------------------------------------
+
+13. After a route is made, what should appear? Tick any:
+    [-] Route line on the map
+    [-] Total distance
+    [ ] Interval markers / color-coded hard and easy segments
+    [ ] Turn-by-turn directions
+    [-] Elevation profile
+    [-] Estimated time (from a pace the user enters)
+
+14. Exports and sharing? Tick any:
+    [ ] GPX file download (for Garmin, Strava, etc.)
+    [ ] Shareable link
+    [ ] Print view
+    [-] Google maps KML path file
+
+15. Should routes be saved?
+    (a) No saving
+    (b) Saved in the browser only (no accounts)
+    (c) User accounts (needs a backend server and database)
+    Answer: b
+
+16. Is there anything the old version did, or that you'd planned, that I
+    should keep or add?
+    Answer: idk if this was there before, but add a rectangle shape choice along with the two round ones
+
+
+--- D. LOOK, HOSTING, TECHNICAL --------------------------------------------
+
+17. Where will the site be hosted (GitHub Pages, Netlify, your own server)?
+    About how many users do you expect?
+    The free OpenStreetMap services it uses (map tiles, Overpass road data,
+    Nominatim search) have usage limits. Real traffic would need our own
+    servers or a paid provider. Is a small backend acceptable, or must it stay
+    a static site?
+    Answer: github pages when finished, dont do it now. just add to git
+
+18. Map style: the default is now Esri "Streets". The standard OpenStreetMap
+    tile server blocked the site (the "Access blocked" screen you saw), and
+    CARTO now requires an API key. The layer button (bottom right) also offers
+    "Paths & trails" (CyclOSM, which shows bike paths and trails) and
+    "OpenStreetMap France". Which should be the default? Is a free API key
+    from a provider like MapTiler or Stadia OK, for a more polished look and
+    reliable service?
+    Answer: this is good for now
+
+19. Branding: is "Interval Route Finder" the final name? Any colors, logo or
+    fonts to use?
+    Answer: dont worry about it for now
+
+20. Will people mostly use it on a phone (e.g. checking the route mid-run) or
+    on a computer while planning?
+    Answer: computer or ipad
+
+21. I changed the default distance from 50 mi to 5 mi. 50 mi made every
+    request a huge download (around 7,800 sq mi) that also set off the
+    "large area" warning. What default should it use? Should there be a hard
+    upper limit?
+    Answer: there should be a way that the solver can do massive searches, an idea earlier for long routes was to do some sort of chunking, and then optimal paths within chunks. This is because it should be possible to plan things as big as a loop around kansas.
+
+22. The project isn't under version control. Should I set up git (and a
+    GitHub repo, if you have one)?
+    Answer: yes set up git

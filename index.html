@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="description" content="Plan interval routes on real roads.">
+    <meta name="theme-color" content="#2563eb">
+    <title>Interval Route Finder</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232563eb'/%3E%3Cpath d='M8 22c4 0 4-12 8-12s4 12 8 12' stroke='white' stroke-width='3' fill='none' stroke-linecap='round'/%3E%3C/svg%3E">
+
+    <link rel="preconnect" href="https://server.arcgisonline.com">
+    <link rel="preconnect" href="https://overpass-api.de" crossorigin>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+    <link rel="stylesheet" href="css/style.css">
+
+    <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+    <script defer src="js/config.js"></script>
+    <script defer src="js/geometry.js"></script>
+    <script defer src="js/overpass.js"></script>
+    <script defer src="js/network.js"></script>
+    <script defer src="js/map.js"></script>
+    <script defer src="js/app.js"></script>
+</head>
+
+<body>
+    <div id="map" aria-label="Map"></div>
+
+    <aside id="panel" class="panel">
+        <header class="panel-header">
+            <div class="brand-mark" aria-hidden="true">
+                <svg viewBox="0 0 32 32"><path d="M6 22c5 0 5-12 10-12s5 12 10 12" /></svg>
+            </div>
+            <div>
+                <h1>Interval Route Finder</h1>
+                <p class="subtitle">Plan routes on real roads</p>
+            </div>
+        </header>
+
+        <form id="searchForm" class="search" role="search" autocomplete="off">
+            <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" /></svg>
+            <input id="searchInput" type="search" placeholder="Search for a place…" aria-label="Search for a place">
+            <button id="locateButton" type="button" class="icon-button" title="Go to my location" aria-label="Go to my location">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v3M12 19v3M2 12h3M19 12h3" /></svg>
+            </button>
+            <ul id="searchResults" class="search-results" hidden></ul>
+        </form>
+
+        <div class="segmented" role="tablist" aria-label="Planning mode">
+            <button type="button" role="tab" data-mode="distance" aria-selected="true">Start point</button>
+            <button type="button" role="tab" data-mode="shape" aria-selected="false">Area</button>
+        </div>
+
+        <!-- Mode 1: start point + maximum distance -->
+        <section id="distanceSection" class="section">
+            <label class="field">
+                <span class="field-label">Default max distance</span>
+                <span class="input-unit">
+                    <input id="distanceInput" type="number" min="0.5" step="0.5" inputmode="decimal">
+                    <span>mi</span>
+                </span>
+            </label>
+
+            <button id="pickButton" type="button" class="btn btn-secondary">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+                <span>Add start point</span>
+            </button>
+            <p id="pickHint" class="hint">Click the button, then click the map. Drag pins to move them.</p>
+
+            <ol id="startList" class="start-list"></ol>
+        </section>
+
+        <!-- Mode 2: bounding shape -->
+        <section id="shapeSection" class="section" hidden>
+            <div id="shapeChoose">
+                <p class="hint">Draw the area your route must stay inside.</p>
+                <div class="shape-choices">
+                    <button id="chooseCircleButton" type="button" class="shape-choice">
+                        <svg viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="16" /><circle class="dot" cx="8" cy="24" r="3" /><circle class="dot" cx="40" cy="24" r="3" /></svg>
+                        <strong>Circle</strong>
+                        <span>2 points across</span>
+                    </button>
+                    <button id="chooseEllipseButton" type="button" class="shape-choice">
+                        <svg viewBox="0 0 48 48" aria-hidden="true"><ellipse cx="24" cy="24" rx="20" ry="12" /><circle class="dot" cx="4" cy="24" r="3" /><circle class="dot" cx="24" cy="12" r="3" /><circle class="dot" cx="38" cy="31" r="3" /></svg>
+                        <strong>Ellipse</strong>
+                        <span>3 points on edge</span>
+                    </button>
+                </div>
+            </div>
+
+            <div id="shapeDraw" hidden>
+                <h2 id="shapeDrawTitle" class="section-title">Draw circle</h2>
+                <p id="shapeDrawInstructions" class="hint"></p>
+                <div id="shapeDrawProgress" class="progress-dots" aria-live="polite"></div>
+                <div class="button-row">
+                    <button id="cancelDrawButton" type="button" class="btn btn-ghost">Cancel</button>
+                    <button id="finalizeShapeButton" type="button" class="btn btn-primary" disabled>Use this shape</button>
+                </div>
+            </div>
+
+            <div id="shapeEdit" hidden>
+                <h2 class="section-title">Edit shape</h2>
+                <p class="hint">Drag the points on the map to adjust the shape.</p>
+                <div class="button-row">
+                    <button id="cancelEditButton" type="button" class="btn btn-ghost">Cancel</button>
+                    <button id="doneEditButton" type="button" class="btn btn-primary">Done</button>
+                </div>
+            </div>
+
+            <div id="shapeSaved" hidden>
+                <div class="summary-card">
+                    <div id="shapeSummaryType" class="summary-title"></div>
+                    <div id="shapeSummaryDetail" class="summary-detail"></div>
+                </div>
+                <div class="button-row">
+                    <button id="editShapeButton" type="button" class="btn btn-secondary">Edit</button>
+                    <button id="redrawShapeButton" type="button" class="btn btn-secondary">Redraw</button>
+                    <button id="deleteShapeButton" type="button" class="btn btn-danger">Delete</button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Results of the last network load -->
+        <section id="results" class="section results" hidden>
+            <div class="results-header">
+                <h2 class="section-title">Road network</h2>
+                <button id="clearNetworkButton" type="button" class="link-button">Clear</button>
+            </div>
+            <dl class="stats">
+                <div><dt>Intersections</dt><dd id="statIntersections">–</dd></div>
+                <div><dt>Segments</dt><dd id="statSegments">–</dd></div>
+                <div><dt>Road miles</dt><dd id="statMiles">–</dd></div>
+            </dl>
+        </section>
+
+        <footer class="panel-footer">
+            <p id="routeHint" class="hint" aria-live="polite"></p>
+            <div class="button-row">
+                <button id="getRouteButton" type="button" class="btn btn-primary btn-large">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span id="getRouteLabel">Get Route</span>
+                </button>
+                <button id="cancelLoadButton" type="button" class="btn btn-ghost" hidden>Cancel</button>
+            </div>
+        </footer>
+    </aside>
+
+    <div id="coords" class="coords" aria-hidden="true"></div>
+    <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+
+    <dialog id="confirmDialog" class="dialog">
+        <form method="dialog">
+            <h2 id="confirmTitle">Large area</h2>
+            <p id="confirmMessage"></p>
+            <div class="button-row">
+                <button value="cancel" class="btn btn-ghost">Cancel</button>
+                <button value="ok" class="btn btn-primary" autofocus>Continue</button>
+            </div>
+        </form>
+    </dialog>
+</body>
+
+</html>
