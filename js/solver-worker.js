@@ -1,14 +1,15 @@
-// Runs one LoopSearch off the main thread. See runSolver() in js/solve.js.
-// Posts { type: "round", best } after every search round (`best` is this
-// search's best loop when it improved, otherwise null) until terminated.
+// Runs one SweepSearch off the main thread. See runSolver() in js/solve.js.
+// Posts { type: "round", best, index } after every sweep (`best` is this
+// search's best loop when it improved, otherwise null; `index` the sweep's
+// number in the shared sequence) until terminated.
 importScripts("geometry.js", "solver.js");
 
 const SLICE_MS = 50;
-let search = null;
 
 self.onmessage = ({ data }) => {
+    let search;
     try {
-        search = new LoopSearch(data.graph, data.params, data.seed);
+        search = new SweepSearch(data.graph, data.params, data.worker, data.workers);
     } catch (err) {
         self.postMessage({ type: "error", message: err.message });
         return;
@@ -19,10 +20,8 @@ self.onmessage = ({ data }) => {
             const sliceEnd = Date.now() + SLICE_MS;
             while (Date.now() < sliceEnd) {
                 const step = steps.next().value;
-                if (step?.roundDone) {
-                    if (!search.leader() && search.rounds >= 3) throw new Error(noLoopMessage(data.params));
-                    self.postMessage({ type: "round", best: step.improved ? search.result() : null });
-                }
+                if (!search.leader() && search.rounds >= MAX_EMPTY_SWEEPS) throw new Error(noLoopMessage(data.params));
+                self.postMessage({ type: "round", best: step.improved ? search.result() : null, index: step.index });
             }
             setTimeout(slice, 0);
         } catch (err) {

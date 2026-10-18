@@ -1,9 +1,9 @@
 // ==========================================================================
-// Overpass API road loader
-// Downloads OSM ways inside a region. Recent downloads are kept in memory
-// and reused for any later search that lies inside one of them (e.g. a new
-// start point near a removed one), and a fallback server is tried if the
-// primary one is busy or down.
+// Overpass API road loader, used when the road tiles (js/roadtiles.js)
+// can't be reached. Downloads OSM ways inside a region. Recent downloads
+// are kept in memory and reused for any later search that lies inside one
+// of them (e.g. a new start point near a removed one), and a fallback
+// server is tried if the primary one is busy or down.
 // ==========================================================================
 
 const roadStore = [];   // [{ query, region, typesKey, data }], oldest first
@@ -17,8 +17,9 @@ function buildRoadQuery(region, roadTypes) {
 // Any object with region.overpassFilter works (e.g. a bounding-box tile);
 // regions with an outline and contains() can also be served from a larger
 // earlier download. The network builder clips to the region, so extra roads
-// don't matter. roadTypes defaults to every routable type.
-async function fetchRoads(region, signal, roadTypes = CONFIG.roadTypes) {
+// don't matter. roadTypes defaults to every routable type; firstServer picks
+// the server tried first (to spread parallel requests).
+async function fetchRoads(region, signal, roadTypes = CONFIG.roadTypes, firstServer = 0) {
     const query = buildRoadQuery(region, roadTypes);
     const typesKey = roadTypes.join("|");
     const stored = roadStore.find(entry => entry.query === query ||
@@ -26,7 +27,9 @@ async function fetchRoads(region, signal, roadTypes = CONFIG.roadTypes) {
     if (stored) return stored.data;
 
     let lastError = null;
-    for (const endpoint of CONFIG.overpass.endpoints) {
+    const servers = CONFIG.overpass.endpoints;
+    for (let k = 0; k < servers.length; k++) {
+        const endpoint = servers[(firstServer + k) % servers.length];
         try {
             const response = await fetch(endpoint, {
                 method: "POST",
@@ -96,25 +99,28 @@ const isRetryable = (err) => err.status === 429 || err.status >= 500;
 // unavailable". A smaller, chunked request may still succeed.
 const isTooBig = (err) => err instanceof OverpassError && (err.status === "too-big" || err.status === 504);
 
-// Downloads a large region as a grid of bounding-box tiles (one request each)
-// and merges the results. onTile(done, total) reports progress.
+// Downloads a large region as a grid of bounding-box tiles (one request each,
+// a few at a time, spread over the servers) and merges the results.
+// onTile(done, total) reports progress.
 async function fetchRoadsTiled(bbox, tileDegrees, roadTypes, signal, onTile) {
     const rows = Math.max(1, Math.ceil((bbox.maxLat - bbox.minLat) / tileDegrees));
     const cols = Math.max(1, Math.ceil((bbox.maxLng - bbox.minLng) / tileDegrees));
     const dLat = (bbox.maxLat - bbox.minLat) / rows;
     const dLng = (bbox.maxLng - bbox.minLng) / cols;
-    const ways = new Map();
-    let done = 0;
+    const tiles = [];
     for (let r = 0; r < rows; r++) {
         for (let c = 0; c < cols; c++) {
-            onTile?.(done, rows * cols);
             const s = bbox.minLat + r * dLat, w = bbox.minLng + c * dLng;
-            const tile = { overpassFilter: `(${s.toFixed(5)},${w.toFixed(5)},${(s + dLat).toFixed(5)},${(w + dLng).toFixed(5)})` };
-            const data = await fetchRoads(tile, signal, roadTypes);
-            for (const el of data.elements || []) if (el.type === "way") ways.set(el.id, el);
-            done++;
+            tiles.push({ index: tiles.length, overpassFilter: `(${s.toFixed(5)},${w.toFixed(5)},${(s + dLat).toFixed(5)},${(w + dLng).toFixed(5)})` });
         }
     }
-    onTile?.(done, rows * cols);
+    const ways = new Map();
+    let done = 0;
+    onTile?.(0, tiles.length);
+    await forEachLimited(tiles, 2 * CONFIG.overpass.endpoints.length, async (tile) => {
+        const data = await fetchRoads(tile, signal, roadTypes, tile.index);
+        for (const el of data.elements || []) if (el.type === "way") ways.set(el.id, el);
+        onTile?.(++done, tiles.length);
+    });
     return { elements: [...ways.values()] };
 }

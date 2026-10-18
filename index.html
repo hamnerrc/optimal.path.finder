@@ -22,6 +22,8 @@
     <script defer src="js/units.js"></script>
     <script defer src="js/storage.js"></script>
     <script defer src="js/overpass.js"></script>
+    <script defer src="js/vectortiles.js"></script>
+    <script defer src="js/roadtiles.js"></script>
     <script defer src="js/network.js"></script>
     <script defer src="js/solver.js"></script>
     <script defer src="js/solve.js"></script>
@@ -154,6 +156,7 @@
             <form id="placeForm" class="search" autocomplete="off">
                 <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 19 9.5C19 14.8 12 21 12 21z" /><circle cx="12" cy="9.5" r="2.5" /></svg>
                 <input id="placeInput" type="search" placeholder="e.g. Lawrence, Kansas" aria-label="Search for a place boundary">
+                <button id="placeSearchButton" type="submit" class="btn btn-primary search-submit">Search</button>
                 <ul id="placeResults" class="search-results" hidden></ul>
             </form>
             <div id="placeSaved" hidden>
@@ -174,7 +177,7 @@
                 <input id="coverageInput" type="range" min="10" max="100" step="5">
                 <output id="coverageOutput" for="coverageInput">90%</output>
             </div>
-            <p class="hint">The app finds the roundest loop that surrounds at least this much of the area. Lower values allow smaller loops inside the area; 100% means the loop goes around all of it. Roads up to 5% beyond the area can be used.</p>
+            <p class="hint">The app finds the roundest loop that surrounds at least this much of the area. Lower values allow smaller loops inside the area; 100% means the loop goes around all of it. Roads up to 5% beyond the area are used, or further if that isn't enough to reach the target.</p>
         </section>
 
         <!-- Found loops -->

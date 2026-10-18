@@ -1,13 +1,16 @@
 // ==========================================================================
-// Search pipeline: download roads, build the network, run the solver.
+// Search pipeline: load roads, build the network, run the solver.
 //
-// Small searches load every road at once. Big ones (see CONFIG.chunked) go
-// in two stages:
-//   1. A rough loop on major roads only, downloaded as a grid of tiles.
-//   2. One pass around that loop, a stretch at a time: all roads in a
-//      corridor around the stretch are loaded, and the stretch is re-routed
-//      to improve the whole loop's score (the rest of the loop stays fixed).
-//      A change is only kept if the loop gets better.
+// Roads come from precomputed vector tiles (js/roadtiles.js), with Overpass
+// as the fallback if the tile server can't be reached. Small searches load
+// every road at once. Big ones (see CONFIG.chunked) go in two stages:
+//   1. A rough loop on major roads only, from coarser tiles.
+//   2. All roads in a corridor along the rough loop, and a search around
+//      the rough loop's centre that improves it with them.
+//
+// Area searches load roads a little beyond the area (CONFIG.areaMargins);
+// if the coverage target can't be met with those, the margin is widened and
+// the search repeated.
 //
 // There's no time limit: every search runs until it stops finding better
 // loops (see SearchTracker in js/solver.js). The best loop so far is
@@ -18,26 +21,45 @@
 // job:
 //   objective  { mode: "start", start: {lat,lng}, maxLengthM }
 //            | { mode: "area", target: [{lat,lng}], coverage }
-//   region     full-detail download region
+//   region     full-detail road region
+//   target     area mode: the area's region (for wider margins)
 // options: { signal, onStatus(text, fraction), onLoop(loop, final), onNetwork(network) }
-// Resolves with the final loop: { coords, lengthM, areaM2, iq, coverage, feasible, repeats, chunked }.
+// Resolves with the final loop: { coords, lengthM, areaM2, iq, coverage, feasible, score, chunked }.
 async function searchLoop(job, options) {
+    if (job.objective.mode !== "area" || !job.target) return searchRegion(job, options);
+
+    let best = null;
+    const margins = CONFIG.areaMargins;
+    for (let i = 0; i < margins.length; i++) {
+        const region = i === 0 ? job.region : marginRegion(job.target, margins[i]);
+        const result = await searchRegion({ ...job, region }, options);
+        if (!best || isBetterResult(result, best)) best = result;
+        if (best.feasible || i === margins.length - 1) break;
+        const reached = Math.floor((best.coverage ?? 0) * 100);
+        options.onLoop(best, false);
+        options.onStatus(`Roads near the area only reach ${reached}% coverage. ` +
+            `Widening the search to ${Math.round((margins[i + 1] - 1) * 100)}% around it…`, 0);
+    }
+    return best;
+}
+
+async function searchRegion(job, options) {
     const sqMiles = sqKmToSqMiles(job.region.areaSqKm);
     if (sqMiles <= CONFIG.chunked.fullDetailMaxSqMiles) {
         try {
             return await searchFullDetail(job, options);
         } catch (err) {
-            // Too many roads for one request after all: fall back to stages.
+            // Too many roads for one Overpass download: fall back to stages.
             if (!isTooBig(err)) throw err;
             options.onStatus("Too many roads for one download. Switching to a staged search…", 0);
         }
     }
-    return searchChunked(job, options);
+    return searchStaged(job, options);
 }
 
 async function searchFullDetail(job, { signal, onStatus, onLoop, onNetwork }) {
-    onStatus("Downloading roads…", 0);
-    const osm = await fetchRoads(job.region, signal);
+    const osm = await loadRoads(job.region, signal, (done, total) =>
+        onStatus(total > 1 ? `Loading roads (${done} of ${total} tiles)…` : "Loading roads…", 0));
     onStatus("Building road network…", 0);
     await nextFrame();
     const network = buildRoadNetwork(osm, job.region);
@@ -56,7 +78,7 @@ async function searchFullDetail(job, { signal, onStatus, onLoop, onNetwork }) {
     return { ...result, chunked: false };
 }
 
-async function searchChunked(job, { signal, onStatus, onLoop, onNetwork }) {
+async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
     const { objective } = job;
     const settings = CONFIG.chunked;
 
@@ -64,137 +86,101 @@ async function searchChunked(job, { signal, onStatus, onLoop, onNetwork }) {
     const coarseRegion = objective.mode === "start"
         ? createCircleRegion(objective.start, objective.maxLengthM * settings.startRadiusFraction)
         : job.region;
-    const sqMiles = sqKmToSqMiles(coarseRegion.areaSqKm);
-    const dropTertiary = sqMiles > settings.tertiaryMaxSqMiles;
-    const roadTypes = settings.coarseRoadTypes.filter(t => !dropTertiary || !t.startsWith("tertiary"));
-    const tileDegrees = dropTertiary ? settings.largeTileDegrees : settings.tileDegrees;
-
-    const osm = await fetchRoadsTiled(coarseRegion.bbox, tileDegrees, roadTypes, signal, (done, total) =>
-        onStatus(`Large area: downloading major roads (tile ${Math.min(done + 1, total)} of ${total})…`, done / total * 0.1));
-    onStatus("Building major road network…", 0.1);
+    const osm = await loadMajorRoads(coarseRegion, signal, (done, total) =>
+        onStatus(`Large area: loading major roads (${done} of ${total})…`, 0));
+    onStatus("Building major road network…", 0);
     await nextFrame();
-    const network = buildRoadNetwork(osm, coarseRegion);
-    if (network.edges.length === 0) throw new Error("No major roads found here.");
-    onNetwork(network);
+    const coarse = buildRoadNetwork(osm, coarseRegion);
+    if (coarse.edges.length === 0) throw new Error("No major roads found here.");
+    onNetwork(coarse);
 
-    let loop = await runSolver(network, solverParams(objective), {
+    const rough = { ...await runSolver(coarse, solverParams(objective), {
         signal,
         onProgress: ({ fraction, rounds, best }) => {
             if (best) onLoop({ ...best, chunked: true }, false);
-            onStatus(`Finding a rough loop on major roads (round ${rounds})…`, 0.1 + fraction * 0.25);
+            onStatus(`Finding a rough loop on major roads (round ${rounds})…`, 0.4 * fraction);
         }
-    });
-    loop = { ...loop, chunked: true };
-    onLoop(loop, false);
+    }), chunked: true };
+    onLoop(rough, false);
 
-    // Stage 2: refine stretch by stretch with all roads ---------------------
-    const targetOutline = objective.mode === "area" ? objective.target : null;
-    let coords = loop.coords.slice(0, -1);   // open ring; the loop closes back to coords[0]
-    if (objective.mode === "start") coords = rotateToNearest(coords, objective.start);
-    let current = measureCoordsLoop(closeRing(coords), scoringObjective(objective), targetOutline);
-
-    const stretches = Math.max(1, Math.ceil(current.length / settings.segmentLengthM));
-    const stretchLength = current.length / stretches;
-
-    let passStart = null;   // where the pass began; the last stretch ends there
-    for (let i = 0; i < stretches; i++) {
-        const label = `Improving stretch ${i + 1} of ${stretches} with all roads…`;
-        const base = 0.35 + 0.65 * (i / stretches);
-        // The first stretchLength meters of the ring.
-        let cut = indexAtDistance(coords, stretchLength);
-        if (i === stretches - 1 && passStart) {
-            const index = coords.indexOf(passStart);
-            if (index > 0) cut = index;
-        }
-        const segment = coords.slice(0, cut + 1);
-        const fixed = coords.slice(cut).concat([coords[0]]);
-        if (segment.length < 2) continue;
-
-        try {
-            onStatus(`${label} (downloading)`, base);
-            const corridor = createCorridorRegion(
-                simplifyLine(segment.map(([lat, lng]) => ({ lat, lng })), 60), settings.corridorRadiusM);
-            const local = buildRoadNetwork(await fetchRoads(corridor, signal), corridor);
-            if (local.edges.length > 0) {
-                const result = await runSolver(local, {
-                    ...solverParams(objective),
-                    mode: "refine",
-                    objective: objective.mode,
-                    segment,
-                    fixed
-                }, {
-                    signal,
-                    onProgress: ({ fraction }) => onStatus(label, base + 0.65 * fraction / stretches)
-                });
-                const candidate = result.coords.concat(fixed.slice(1, -1));
-                const measured = measureCoordsLoop(closeRing(candidate), scoringObjective(objective), targetOutline);
-                if (measured.score > current.score) {
-                    coords = candidate;
-                    current = measured;
-                    onLoop(loopFromCoords(coords, current), false);
-                }
+    // Stage 2: all roads along the rough loop -------------------------------
+    try {
+        let line = rough.coords.map(([lat, lng]) => ({ lat, lng }));
+        if (objective.mode === "start") line = [objective.start, ...line];
+        const corridor = createCorridorRegion(simplifyLine(line, 400), settings.corridorRadiusM);
+        const local = buildRoadNetwork(await loadRoads(corridor, signal, (done, total) =>
+            onStatus(`Loading all roads along the rough loop (${done} of ${total} tiles)…`, 0.4)), corridor);
+        if (local.edges.length === 0) return rough;
+        onNetwork(local);
+        await nextFrame();
+        const reference = simplifyLine(loopPart(rough), 400);
+        const fine = await runSolver(local, { ...solverParams(objective), center: rough.center, anchor: rough.anchor, reference }, {
+            signal,
+            onProgress: ({ fraction, rounds, best }) => {
+                if (best) onLoop({ ...best, chunked: true }, false);
+                onStatus(`Improving the loop with all roads (round ${rounds})…`, 0.4 + 0.6 * fraction);
             }
-        } catch (err) {
-            // One stretch failing (e.g. a busy server) shouldn't lose the loop.
-            if (err.name === "AbortError") throw err;
-            console.warn(`[Search] Stretch ${i + 1} not refined:`, err);
-        }
-
-        // Rotate so the next stretch starts where this one ended.
-        if (i === 0) passStart = coords[0];
-        const nextStart = coords.length - (fixed.length - 2) - 1;
-        coords = coords.slice(nextStart).concat(coords.slice(0, nextStart));
+        });
+        // The rough loop's major roads come from simplified tiles, so its
+        // length and area are only approximate: the loop on all roads (with
+        // the real road shapes) wins.
+        return { ...fine, chunked: true };
+    } catch (err) {
+        // A failed second stage (e.g. a busy server) shouldn't lose the loop.
+        if (err.name === "AbortError") throw err;
+        console.warn("[Search] Loop not improved with all roads:", err);
+        return rough;
     }
-
-    if (objective.mode === "start") coords = rotateToNearest(coords, objective.start);
-    return loopFromCoords(coords, current);
 }
 
-// Solver params for an objective (everything except mode-specific extras).
+// All roads in a region: vector tiles, or Overpass if the tile server
+// can't be reached. onProgress(done, total) counts tiles.
+async function loadRoads(region, signal, onProgress) {
+    try {
+        return await fetchRoadsFromTiles(region, signal, { onProgress });
+    } catch (err) {
+        if (err.name === "AbortError") throw err;
+        console.warn("[Roads] Tiles unavailable, using Overpass:", err);
+        onProgress(0, 1);
+        return fetchRoads(region, signal);
+    }
+}
+
+// Major roads only, from tiles coarse enough to cover the region quickly.
+async function loadMajorRoads(region, signal, onProgress) {
+    const settings = CONFIG.chunked;
+    const sqMiles = sqKmToSqMiles(region.areaSqKm);
+    const dropTertiary = sqMiles > settings.tertiaryMaxSqMiles;
+    const roadTypes = settings.coarseRoadTypes.filter(t => !dropTertiary || !t.startsWith("tertiary"));
+    try {
+        const zoom = roadTileZoom(region.bbox, settings.maxCoarseTiles);
+        return await fetchRoadsFromTiles(region, signal, { roadTypes, zoom, onProgress });
+    } catch (err) {
+        if (err.name === "AbortError") throw err;
+        console.warn("[Roads] Tiles unavailable, using Overpass:", err);
+        const tileDegrees = dropTertiary ? settings.largeTileDegrees : settings.tileDegrees;
+        return fetchRoadsTiled(region.bbox, tileDegrees, roadTypes, signal, onProgress);
+    }
+}
+
+// The loop itself, without the stretch out from the start and back.
+function loopPart(loop) {
+    const points = loop.coords.map(([lat, lng]) => ({ lat, lng }));
+    if (!loop.stemM) return points.slice(0, -1);
+    let along = 0;
+    const kept = [];
+    points.forEach((p, i) => {
+        if (i > 0) along += haversine(points[i - 1].lat, points[i - 1].lng, p.lat, p.lng);
+        if (along >= loop.stemM && along <= loop.lengthM - loop.stemM) kept.push(p);
+    });
+    return kept.length >= 3 ? kept : points.slice(0, -1);
+}
+
+// Solver params for an objective.
 function solverParams(objective) {
     return objective.mode === "start"
         ? { mode: "start", start: objective.start, maxLengthM: objective.maxLengthM }
         : { mode: "area", target: objective.target, coverage: objective.coverage };
-}
-
-const scoringObjective = (objective) => ({ mode: objective.mode, maxLengthM: objective.maxLengthM, coverage: objective.coverage });
-
-const closeRing = (coords) => coords.concat([coords[0]]);
-
-function loopFromCoords(coords, metrics) {
-    return {
-        coords: closeRing(coords),
-        lengthM: metrics.length,
-        areaM2: metrics.area,
-        iq: metrics.iq,
-        coverage: metrics.coverage,
-        feasible: metrics.feasible,
-        repeats: 0,
-        chunked: true
-    };
-}
-
-// Index of the first point at least `distance` meters along the line.
-function indexAtDistance(coords, distance) {
-    let total = 0;
-    for (let i = 1; i < coords.length; i++) {
-        total += haversine(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]);
-        if (total >= distance) return i;
-    }
-    return coords.length - 1;
-}
-
-// The open ring rotated to begin at the point closest to `latlng`.
-function rotateToNearest(coords, latlng) {
-    let best = 0, bestD = Infinity;
-    coords.forEach(([lat, lng], i) => {
-        const d = haversine(lat, lng, latlng.lat, latlng.lng);
-        if (d < bestD) {
-            bestD = d;
-            best = i;
-        }
-    });
-    return coords.slice(best).concat(coords.slice(0, best));
 }
 
 const searchingText = (rounds) => `Searching, round ${rounds}. Finishes by itself once better loops stop turning up.`;

@@ -21,6 +21,7 @@ const basemaps = Object.fromEntries(CONFIG.map.basemaps.map(({ name, url, ...opt
 ));
 Object.values(basemaps)[0].addTo(map);
 L.control.layers(basemaps, null, { position: "bottomright" }).addTo(map);
+map.attributionControl.addAttribution(CONFIG.roadTiles.attribution);
 
 const layers = {
     network: L.layerGroup().addTo(map),
@@ -117,7 +118,8 @@ function drawNetwork(network, group) {
     if (minorLines.length) L.polyline(minorLines, { ...style, weight: 1.5, opacity: 0.45 }).addTo(group);
     if (majorLines.length) L.polyline(majorLines, { ...style, weight: 3, opacity: 0.6 }).addTo(group);
 
-    createRegionLayer(network.region, "muted").addTo(group);
+    // (A corridor along a rough loop has no outline to draw.)
+    if (network.region.type === "circle" || network.region.outline) createRegionLayer(network.region, "muted").addTo(group);
 }
 
 // --------------------------------------------------------------------------

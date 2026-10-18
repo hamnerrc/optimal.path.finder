@@ -1,8 +1,8 @@
 // ==========================================================================
 // Runs the loop search. The road graph is prepared once on the main thread,
-// then several independent searches (each with its own random seed, so they
-// explore different loops) run in parallel Web Workers, one per spare CPU
-// core, until SearchTracker decides the result has settled.
+// then several searches run in parallel Web Workers, one per spare CPU core,
+// each sweeping its own share of the centres (see SweepSearch), until
+// SearchTracker decides the result has settled.
 // Workers can't start from file:// pages in some browsers; then a single
 // search runs on the main thread in short slices instead.
 // ==========================================================================
@@ -17,11 +17,10 @@ const workerCount = () => Math.max(1, Math.min(MAX_WORKERS, (navigator.hardwareC
 async function runSolver(network, params, { signal, onProgress }) {
     const prep = prepareGraph(network, params);
     console.log("[Solver] Graph:", prep.stats);
-    const seedBase = (Date.now() % 1e6) * 16;
 
     let engines = null;
     try {
-        engines = startWorkers(prep.data, params, seedBase);
+        engines = startWorkers(prep.data, params);
     } catch {
         // No workers here: search on the main thread.
     }
@@ -33,7 +32,7 @@ async function runSolver(network, params, { signal, onProgress }) {
             console.warn("[Solver] Workers unavailable, searching on the main thread:", err.message);
         }
     }
-    return coordinate(prep, params, [inlineEngine(prep.data, params, seedBase)], { signal, onProgress });
+    return coordinate(prep, params, [inlineEngine(prep.data, params)], { signal, onProgress });
 }
 
 // Collects round reports from the engines and stops them once the search
@@ -61,11 +60,11 @@ function coordinate(prep, params, engines, { signal, onProgress }) {
             if (finished) return;
             if (message.type === "round") {
                 reported = true;
-                const improved = tracker.report(message.best);
+                const improved = tracker.report(message.best, message.index);
                 onProgress?.({
                     fraction: tracker.fraction,
                     rounds: tracker.rounds,
-                    best: improved && params.mode !== "refine" ? expandLoop(prep, tracker.best, params, false) : null
+                    best: improved ? expandLoop(prep, tracker.best, params, false) : null
                 });
                 if (tracker.done) {
                     finish();
@@ -87,8 +86,9 @@ function coordinate(prep, params, engines, { signal, onProgress }) {
     });
 }
 
-function startWorkers(data, params, seedBase) {
-    return Array.from({ length: workerCount() }, (_, k) => {
+function startWorkers(data, params) {
+    const workers = workerCount();
+    return Array.from({ length: workers }, (_, k) => {
         const worker = new Worker("js/solver-worker.js");
         return {
             start(onMessage) {
@@ -98,7 +98,7 @@ function startWorkers(data, params, seedBase) {
                     event.preventDefault();
                     onMessage({ type: "error", message: event.message || "Worker failed", workerFailed: true });
                 };
-                worker.postMessage({ type: "run", graph: data, params, seed: seedBase + k });
+                worker.postMessage({ type: "run", graph: data, params, worker: k, workers });
             },
             stop() {
                 worker.terminate();
@@ -108,13 +108,13 @@ function startWorkers(data, params, seedBase) {
 }
 
 // The same search on the main thread, in slices that leave the page responsive.
-function inlineEngine(data, params, seed) {
+function inlineEngine(data, params) {
     let stopped = false;
     let search = null;
     return {
         start(onMessage) {
             try {
-                search = new LoopSearch(data, params, seed);
+                search = new SweepSearch(data, params);
             } catch (err) {
                 onMessage({ type: "error", message: err.message });
                 return;
@@ -126,10 +126,8 @@ function inlineEngine(data, params, seed) {
                     const sliceEnd = Date.now() + 30;
                     while (Date.now() < sliceEnd && !stopped) {
                         const step = steps.next().value;
-                        if (step?.roundDone) {
-                            if (!search.leader() && search.rounds >= 3) throw new Error(noLoopMessage(params));
-                            onMessage({ type: "round", best: step.improved ? search.result() : null });
-                        }
+                        if (!search.leader() && search.rounds >= MAX_EMPTY_SWEEPS) throw new Error(noLoopMessage(params));
+                        onMessage({ type: "round", best: step.improved ? search.result() : null, index: step.index });
                     }
                 } catch (err) {
                     onMessage({ type: "error", message: err.message });

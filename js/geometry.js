@@ -262,6 +262,23 @@ function createCorridorRegion(points, radiusMeters) {
     let length = 0;
     for (let i = 1; i < xy.length; i++) length += Math.hypot(xy[i].x - xy[i - 1].x, xy[i].y - xy[i - 1].y);
 
+    // Segments by grid cell (cells one radius wide, each segment listed in
+    // every cell within a radius of it), so a point is only tested against
+    // the few segments near it.
+    const cell = radiusMeters;
+    const grid = new Map();
+    const key = (cx, cy) => cx * 1e6 + cy;
+    for (let i = 1; i < xy.length; i++) {
+        const a = xy[i - 1], b = xy[i];
+        for (let cx = Math.floor((Math.min(a.x, b.x) - cell) / cell); cx <= Math.floor((Math.max(a.x, b.x) + cell) / cell); cx++) {
+            for (let cy = Math.floor((Math.min(a.y, b.y) - cell) / cell); cy <= Math.floor((Math.max(a.y, b.y) + cell) / cell); cy++) {
+                const k = key(cx, cy);
+                if (!grid.has(k)) grid.set(k, []);
+                grid.get(k).push(i);
+            }
+        }
+    }
+
     return {
         type: "corridor",
         points,
@@ -271,10 +288,9 @@ function createCorridorRegion(points, radiusMeters) {
         contains(lat, lng) {
             if (lat < bbox.minLat || lat > bbox.maxLat || lng < bbox.minLng || lng > bbox.maxLng) return false;
             const p = toXY({ lat, lng });
-            for (let i = 1; i < xy.length; i++) {
-                if (distanceToSegmentSq(p, xy[i - 1], xy[i]) <= r2) return true;
-            }
-            return xy.length === 1 && (p.x - xy[0].x) ** 2 + (p.y - xy[0].y) ** 2 <= r2;
+            if (xy.length === 1) return (p.x - xy[0].x) ** 2 + (p.y - xy[0].y) ** 2 <= r2;
+            const near = grid.get(key(Math.floor(p.x / cell), Math.floor(p.y / cell)));
+            return Boolean(near) && near.some(i => distanceToSegmentSq(p, xy[i - 1], xy[i]) <= r2);
         },
         // Overpass accepts a polyline for "around".
         overpassFilter: `(around:${radiusMeters.toFixed(0)},${points.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(",")})`

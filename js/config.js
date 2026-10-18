@@ -40,21 +40,22 @@ const CONFIG = {
     // Area mode: default share of the drawn area the loop must enclose, and
     // how far beyond the drawn area roads are loaded (1.05 = 5% larger, as a
     // scale factor on the area's convex hull), so the loop can use roads
-    // just outside its edge.
+    // just outside its edge. If the coverage can't be reached, the search
+    // is repeated with the next margin.
     defaultCoveragePercent: 90,
-    areaMargin: 1.05,
+    areaMargins: [1.05, 1.2, 1.4],
 
     // Default pace for time estimates, in seconds per mile.
     defaultPaceSecPerMile: 540,
 
-    // Big searches. Up to fullDetailMaxSqMiles of download area, every road
-    // is loaded at once (about a 10 mi loop in a dense city: ~200k
-    // intersections, ~70 MB from Overpass). Larger searches go in two stages:
-    // a rough loop on major roads only, downloaded in tiles, then a pass
-    // along that loop that loads all roads in a corridor around each stretch
-    // and improves it locally.
+    // Big searches. Up to fullDetailMaxSqMiles of road area, every road is
+    // loaded at once (a 10 mi loop). Larger searches go in two stages: a
+    // rough loop on major roads only, from coarser tiles (at most
+    // maxCoarseTiles of them), then all roads in a corridor along that loop
+    // to improve it.
     chunked: {
         fullDetailMaxSqMiles: 80,
+        maxCoarseTiles: 150,
         coarseRoadTypes: [
             "motorway", "motorway_link", "trunk", "trunk_link",
             "primary", "primary_link", "secondary", "secondary_link",
@@ -62,14 +63,14 @@ const CONFIG = {
         ],
         // Above this area tertiary roads are dropped from the rough stage.
         tertiaryMaxSqMiles: 5000,
+        // Overpass fallback: download tile sizes, in degrees.
         tileDegrees: 0.5,
         largeTileDegrees: 1,
         // Start mode: no point on a loop of length L is further than L/2 from
         // the start, but the roundest loops stay within about L/π. The rough
         // stage loads roads within this fraction of L.
         startRadiusFraction: 0.4,
-        segmentLengthM: 16000,
-        corridorRadiusM: 800
+        corridorRadiusM: 1000
     },
 
     // Ask for confirmation before downloading areas larger than this.
@@ -90,6 +91,20 @@ const CONFIG = {
 
     // Drawn thicker on the map.
     majorRoadTypes: ["motorway", "trunk", "primary", "secondary"],
+
+    // Road vector tiles (OpenFreeMap: every OpenStreetMap road worldwide,
+    // rebuilt weekly). Zoom 14 tiles hold every road; minZoom is the
+    // coarsest used for major roads. Loaded tiles are kept in memory, up
+    // to about cacheMaxVertices road points.
+    roadTiles: {
+        tileJsonUrl: "https://tiles.openfreemap.org/planet",
+        zoom: 14,
+        minZoom: 8,
+        concurrency: 16,
+        cacheMaxVertices: 4000000,
+        attribution: 'Roads <a href="https://openfreemap.org">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a> ' +
+            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    },
 
     overpass: {
         // Tried in order; the next one is used if a server is busy or down.

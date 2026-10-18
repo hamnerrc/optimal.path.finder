@@ -638,7 +638,8 @@ function searchJobs() {
         label,
         key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${prefs.coveragePercent}`,
         networkKey: "area",
-        region: marginRegion(target, CONFIG.areaMargin),
+        region: marginRegion(target, CONFIG.areaMargins[0]),
+        target,
         objective: { mode: "area", target: outline, coverage: prefs.coveragePercent / 100 }
     }];
 }
@@ -656,7 +657,7 @@ async function findLoops() {
         const ok = await confirmDialog(
             "Large search",
             `This search covers about ${formatArea(sqKm * 1e6)}. It runs in stages: first a rough loop on ` +
-            `major roads, then each stretch is improved using all roads. It can take several minutes. ` +
+            `major roads, then the loop is improved using all roads along it. It can take a while. ` +
             `The loop on the map updates as better ones are found. ` +
             `You can stop it at any time and keep (or export) the best loop found so far.`
         );
@@ -1259,7 +1260,10 @@ let placeController = null;
 ui.placeForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     const query = ui.placeInput.value.trim();
-    if (!query) return;
+    if (!query) {
+        ui.placeInput.focus();
+        return;
+    }
 
     placeController?.abort();
     placeController = new AbortController();
