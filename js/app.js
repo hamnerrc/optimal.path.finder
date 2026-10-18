@@ -733,7 +733,9 @@ function routeWarning(route, result, job) {
         const gap = haversine(lat, lng, job.start.latlng.lat, job.start.latlng.lng);
         if (gap > 150) notes.push(`The closest it passes to your pin is ${formatDistance(gap)}.`);
     }
-    if (job.kind === "area" && result.coverage < prefs.coveragePercent / 100) {
+    // The search measures coverage on a simplified outline; allow for the
+    // small difference from the exact figure.
+    if (job.kind === "area" && result.coverage < prefs.coveragePercent / 100 - 0.005) {
         notes.push(`It only encloses ${Math.round(result.coverage * 100)}% of the area (target ${prefs.coveragePercent}%). ` +
             `Try a lower target or a longer search.`);
     }

@@ -327,26 +327,45 @@ class Router {
 // --------------------------------------------------------------------------
 
 // Routes through the waypoint nodes and back to the first one.
-// Returns { edges, dirs, nodes, length, area, repeats } or null.
-function buildLoop(g, router, waypoints) {
+// `reuse` (optional) maps "a,b" to a leg routed earlier between waypoints a
+// and b; those legs are kept and only the missing ones are routed, which
+// makes moving a single waypoint cheap.
+// Returns { edges, dirs, nodes, length, area, repeats, legs } or null.
+function buildLoop(g, router, waypoints, reuse) {
     router.beginLoop();
     router.usedNode[waypoints[0]] = router.loopStamp;
+
+    const k = waypoints.length;
+    const keys = waypoints.map((a, j) => `${a},${waypoints[(j + 1) % k]}`);
+    const legs = new Array(k);
+    if (reuse) {
+        keys.forEach((key, j) => {
+            const leg = reuse.get(key);
+            if (leg) {
+                legs[j] = leg;
+                router.markUsed(leg);
+            }
+        });
+    }
+    for (let j = 0; j < k; j++) {
+        if (legs[j]) continue;
+        const from = waypoints[j], to = waypoints[(j + 1) % k];
+        const leg = from === to ? [] : router.route(from, to);
+        if (!leg) return null;
+        legs[j] = leg;
+        router.markUsed(leg);
+    }
 
     const edges = [];
     const dirs = [];
     let at = waypoints[0];
-    for (let j = 1; j <= waypoints.length; j++) {
-        const target = waypoints[j % waypoints.length];
-        if (target === at) continue;
-        const leg = router.route(at, target);
-        if (!leg) return null;
+    for (const leg of legs) {
         for (const e of leg) {
             const forward = g.eFrom[e] === at;
             edges.push(e);
             dirs.push(forward ? 1 : -1);
             at = forward ? g.eTo[e] : g.eFrom[e];
         }
-        router.markUsed(leg);
     }
     if (edges.length < 2) return null;
 
@@ -365,7 +384,9 @@ function buildLoop(g, router, waypoints) {
     }
     if (keptEdges.length < 2) return null;
 
-    return measureLoop(g, keptEdges, keptDirs);
+    const loop = measureLoop(g, keptEdges, keptDirs);
+    loop.legs = new Map(keys.map((key, j) => [key, legs[j]]));
+    return loop;
 }
 
 function measureLoop(g, edges, dirs) {
@@ -513,7 +534,7 @@ function* solveLoop(network, params) {
     // Waypoint sets are kept as continuous positions and snapped on evaluation.
     const cache = new Map();
     let evaluations = 0;
-    const tryWaypoints = (points) => {
+    const tryWaypoints = (points, base) => {
         const nodes = [];
         if (isStart) nodes.push(startNode);
         for (const p of points) {
@@ -525,9 +546,9 @@ function* solveLoop(network, params) {
         let entry = cache.get(key);
         if (!entry) {
             evaluations++;
-            const loop = nodes.length >= (isStart ? 2 : 3) ? buildLoop(g, router, nodes) : null;
+            const loop = nodes.length >= (isStart ? 2 : 3) ? buildLoop(g, router, nodes, base?.loop?.legs) : null;
             entry = { loop, ...evaluate(loop) };
-            if (cache.size > 20000) cache.clear();
+            if (cache.size > 5000) cache.clear();
             cache.set(key, entry);
         }
         return { points, ...entry };
@@ -623,7 +644,7 @@ function* solveLoop(network, params) {
             points.splice(Math.floor(random() * points.length), 1);
         }
 
-        const cand = tryWaypoints(points);
+        const cand = tryWaypoints(points, current);
         const improved = consider(cand);
         const ref = Math.max(Math.abs(current.score), 1e-9);
         if (cand.score >= current.score || random() < Math.exp((cand.score - current.score) / (temperature * ref))) {

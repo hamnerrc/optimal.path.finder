@@ -149,3 +149,136 @@ care about and I'll go with the assumption.
 22. The project isn't under version control. Should I set up git (and a
     GitHub repo, if you have one)?
     Answer: yes set up git
+
+
+=============================================================================
+ROUND 2 (2026-10-18): WHAT'S DONE, AND NEW QUESTIONS
+=============================================================================
+
+Built from your answers above:
+- Loop solver. Start point mode: the largest-area loop through each start
+  point that is no longer than its max length (roads are loaded within half
+  that length of the start). Area mode: the roundest loop (highest
+  isoperimetric quotient) that encloses at least n% of the shape. Neither
+  mode runs the same street twice. One loop per start point, best loop only.
+- Rectangle shape (2 opposite corners), next to circle and ellipse.
+- mi/km toggle (top right of the panel), default mi, remembered.
+- Drag the green flag along a finished loop to choose where to start, and
+  a Reverse button. The elevation profile, the arrows and the KML export all
+  follow the chosen start and direction.
+- Elevation profile with hover (shows the point on the map), total climb.
+- Estimated time from a run pace or bike speed.
+- KML export (Google Earth / My Maps): the path, a shaded territory polygon
+  and the start point.
+- Saved loops (this browser only), with their elevation data.
+- All road and path types are loaded (footways, paths, cycleways, service
+  roads, tracks, steps added).
+- Git repository set up with two commits. Nothing pushed anywhere.
+
+Same format as before: answer below each question. "ok" accepts the current
+assumption.
+
+--- E. HOW LOOPS ARE SCORED ------------------------------------------------
+
+23. Start point mode maximizes enclosed AREA within the length limit. The
+    alternative is maximizing roundness (isoperimetric quotient), as area
+    mode does, which would favor shorter, rounder loops over bigger ones.
+    Current assumption: maximize area.
+    Answer:
+
+24. Area mode: when two loops are about equally round and both meet the
+    coverage target, should the shorter one win (less running), or doesn't
+    it matter?
+    Current assumption: roundness only.
+    Answer:
+
+25. Area mode: may the loop go outside the drawn shape? Right now roads up
+    to 30% beyond the shape are allowed, and area outside the shape neither
+    helps nor hurts. Should outside area be penalized, or should the loop
+    stay strictly inside?
+    Current assumption: up to 30% outside is fine.
+    Answer:
+
+26. Default coverage target for area mode?
+    Current assumption: 90%.
+    Answer:
+
+27. How does the INTVL app count territory when a loop crosses or touches
+    itself (a figure 8, or two parts meeting at one intersection)? The
+    solver currently avoids that entirely. If you know how INTVL computes
+    the area (GPS track polygon, a grid of cells, something else), tell me
+    and I'll match it exactly.
+    Answer:
+
+28. Start points: a loop can only begin at a road intersection, so it
+    starts at the point on the loop closest to your pin. A warning appears
+    if that's more than about 500 ft away. OK?
+    Answer:
+
+29. If no loop meets the requirements (e.g. the coverage target is too high
+    for the roads available), the app shows the best loop it found with a
+    warning. Would you rather get no loop at all in that case?
+    Current assumption: show it with a warning.
+    Answer:
+
+--- F. RUN VS BIKE ---------------------------------------------------------
+
+30. There's a Run/Bike switch, but it only changes the time estimate (pace
+    vs speed). Should Bike mode also change which roads are used, e.g. skip
+    footways and steps, or respect one-way streets? One-way streets are
+    currently ignored in both modes.
+    Answer:
+
+--- G. VERY LARGE AREAS (e.g. a loop around Kansas) ------------------------
+
+31. Downloading every road and footpath in a state isn't feasible in a
+    browser: Overpass would refuse it, and the graph would have tens of
+    millions of points. My proposed plan:
+      (1) For big searches, first download only major roads (e.g. primary
+          through tertiary) and find a coarse loop on those.
+      (2) Then download all roads in a narrow corridor along that coarse
+          loop, in chunks, and refine each stretch locally.
+    Is that the "chunking" you had in mind? Above what size should it switch
+    to this mode (say, loops longer than 30 mi)?
+    Answer:
+
+32. For huge loops, is it OK if the coarse stage only uses major roads, so a
+    loop around Kansas would mostly follow highways and county roads?
+    Answer:
+
+33. Should very long searches be allowed to run for minutes (with a
+    progress bar and the best loop so far drawn live)? The search time
+    options are now 3 s, 8 s and 25 s per loop.
+    Answer:
+
+--- H. SHAPES --------------------------------------------------------------
+
+34. You mentioned picking a city. Should the area be able to come from a
+    real boundary, e.g. search "Lawrence, KS" and use its city limits as
+    the shape? (Doable with OpenStreetMap boundary data. Odd-shaped
+    boundaries need a bit more work in the coverage calculation.)
+    Answer:
+
+35. Rectangles are north-up (2 corners). Do you also want rotated
+    rectangles (3 points), or a freehand polygon tool?
+    Answer:
+
+--- I. SMALLER THINGS ------------------------------------------------------
+
+36. Exports: KML only, as you ticked. GPX is the usual format for Garmin
+    and Strava routes and is easy to add. Want it?
+    Answer:
+
+37. "Find loops" with several start points recomputes every start's loop
+    each time. Should it skip starts whose loop is already up to date and
+    only recompute the ones you changed?
+    Answer:
+
+38. Elevation comes from the free Open-Meteo service. It's free for
+    non-commercial use and rate-limits bursts. Is this a non-commercial
+    project?
+    Answer:
+
+39. When you're ready for GitHub Pages: what's the GitHub repo (or should I
+    create one with `gh`, and under what name)?
+    Answer:
