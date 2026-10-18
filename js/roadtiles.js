@@ -18,17 +18,26 @@
 
 const TILE_EXTENT = 4096;   // tile coordinates are rescaled to this
 
-// OpenMapTiles class -> OSM highway type. Classes not listed (rail,
-// ferries, piers, construction…) are not roads.
+// OpenMapTiles class -> OSM highway type. Classes not listed (ferries,
+// piers, construction…) are not roads. Railroad tracks ("railway") are
+// only used when asked for (see roadTypesFor in js/pipeline.js).
 const TILE_CLASSES = {
     motorway: "motorway", trunk: "trunk", primary: "primary",
     secondary: "secondary", tertiary: "tertiary",
-    minor: "residential", service: "service", track: "track", path: "path"
+    minor: "residential", service: "service", track: "track", path: "path",
+    rail: "railway"
 };
 const TILE_PATH_TYPES = new Set(["footway", "cycleway", "bridleway", "steps", "pedestrian", "path"]);
+// Indoor corridors and station platforms aren't paths you can run along.
+const TILE_NOT_PATHS = new Set(["corridor", "platform"]);
+// Railroad tracks that run on their own (not trams in the street, subways
+// or yard tracks).
+const TILE_RAIL_TYPES = new Set(["rail", "narrow_gauge", "preserved"]);
 
 let tileTemplatePromise = null;
-const tileStore = new Map();   // "z/x/y" -> Promise<[{ highway, brunnel, oneway, pts }]>
+// "z/x/y" -> Promise<{ lines: [{ highway, brunnel, oneway, expressway, driveway, pts }],
+//                      barriers: [pts] }>  (see tileContents)
+const tileStore = new Map();
 let tileStoreVertices = 0;
 
 // The most detailed zoom (at most `top`) at which the bbox needs no more
@@ -43,21 +52,47 @@ function roadTileZoom(bbox, maxTiles, top = 12) {
 // Resolves with an Overpass-like { elements } of the roads in the tiles that
 // cover `region` (anything with a bbox, optionally contains() and outline).
 // roadTypes filters highway types; zoom defaults to full detail.
-async function fetchRoadsFromTiles(region, signal, { roadTypes = CONFIG.roadTypes, zoom = CONFIG.roadTiles.zoom, onProgress } = {}) {
+// noExpressways also leaves out other roads tagged as expressways; hops adds
+// fence hops (see hopLines).
+async function fetchRoadsFromTiles(region, signal, { roadTypes = CONFIG.roadTypes, zoom = CONFIG.roadTiles.zoom, noExpressways = false, hops = false, onProgress } = {}) {
     const template = await tileTemplate(signal);
     const tiles = tilesCovering(region, zoom);
     const types = new Set(roadTypes);
 
     let done = 0;
     onProgress?.(0, tiles.length);
-    const lines = [];
-    await forEachLimited(tiles, CONFIG.roadTiles.concurrency, async ({ x, y }) => {
-        const tileLines = await loadTile(template, zoom, x, y, signal);
-        for (const line of tileLines) if (types.has(line.highway)) lines.push(line);
+    const loaded = new Array(tiles.length);
+    await forEachLimited(tiles.map((tile, i) => ({ ...tile, i })), CONFIG.roadTiles.concurrency, async ({ x, y, i }) => {
+        loaded[i] = await loadTile(template, zoom, x, y, signal);
+        // (A tile shared with a prefetch doesn't stop when the search does.)
+        signal?.throwIfAborted();
         onProgress?.(++done, tiles.length);
     });
     trimTileStore();
-    return { elements: linesToWays(nodeLines(lines), zoom) };
+    // In tile order, not the order they arrived in, so that the same search
+    // always gets the same network (and finds the same loop).
+    const lines = [], barriers = [];
+    for (const tile of loaded) {
+        for (const line of tile.lines) {
+            if (types.has(line.highway) && !(noExpressways && line.expressway)) lines.push(line);
+            else if (hops && !line.brunnel) barriers.push(line.pts);
+        }
+        if (hops) for (const pts of tile.barriers) barriers.push(pts);
+    }
+    const noded = nodeLines(lines, zoom);
+    if (hops) for (const hop of hopLines(noded, barriers, zoom)) noded.push(hop);
+    return { elements: linesToWays(noded, zoom) };
+}
+
+// Loads the tiles covering a region into the tile store (no more than
+// CONFIG.roadTiles.prefetchMaxTiles), without a signal, so that a search
+// that needs them meanwhile can share the downloads.
+async function prefetchTiles(region, zoom) {
+    const template = await tileTemplate();
+    const tiles = tilesCovering(region, zoom);
+    if (tiles.length > CONFIG.roadTiles.prefetchMaxTiles) return;
+    await forEachLimited(tiles, CONFIG.roadTiles.concurrency, ({ x, y }) => loadTile(template, zoom, x, y).catch(() => {}));
+    trimTileStore();
 }
 
 async function tileTemplate(signal) {
@@ -89,10 +124,11 @@ function loadTile(template, z, x, y, signal) {
             return response.arrayBuffer();
         })
         .then(buffer => {
-            const lines = tileRoadLines(buffer, z, x, y);
-            entry.vertices = lines.reduce((sum, line) => sum + line.pts.length / 2, 0);
+            const contents = tileContents(buffer, z, x, y);
+            entry.vertices = contents.lines.reduce((sum, line) => sum + line.pts.length / 2, 0) +
+                contents.barriers.reduce((sum, pts) => sum + pts.length / 2, 0);
             tileStoreVertices += entry.vertices;
-            return lines;
+            return contents;
         });
     entry.catch(() => tileStore.delete(key));
     tileStore.set(key, entry);
@@ -138,6 +174,7 @@ const tileYToLat = (y, n) => Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n))) * 1
 // corridor along a diagonal only needs a fraction of its bbox).
 function tilesCovering(region, z) {
     const n = 2 ** z;
+    if (region.type === "corridor") return tilesAlongCorridor(region, z);
     const { x0, x1, y0, y1 } = tileRange(region.bbox, z);
     if (!region.contains || !region.outline) {
         const all = [];
@@ -166,36 +203,90 @@ function tilesCovering(region, z) {
     return tiles;
 }
 
-// Road lines of one tile in world coordinates at zoom z (TILE_EXTENT units
-// per tile), clipped to the tile's own square so neighbouring tiles' buffers
-// don't overlap.
-function tileRoadLines(buffer, z, tx, ty) {
-    const layer = decodeTileLayer(buffer, "transportation");
-    const scale = TILE_EXTENT / layer.extent;
-    const ox = tx * TILE_EXTENT, oy = ty * TILE_EXTENT;
-    const out = [];
-    for (const { props, lines } of layer.features) {
-        const highway = tileHighway(props);
-        if (!highway) continue;
-        const brunnel = props.brunnel === "bridge" || props.brunnel === "tunnel";
-        const oneway = props.oneway === 1 ? 1 : props.oneway === -1 ? -1 : 0;
-        for (const line of lines) {
-            for (const pts of clipLine(line, scale, 0, TILE_EXTENT)) {
-                for (let i = 0; i < pts.length; i += 2) {
-                    pts[i] += ox;
-                    pts[i + 1] += oy;
-                }
-                out.push({ highway, brunnel, oneway, pts });
+// Tiles within a corridor's radius of its line (its bbox can be thousands
+// of times larger, e.g. for a loop around a state).
+function tilesAlongCorridor(region, z) {
+    const n = 2 ** z;
+    const { points, radiusMeters } = region;
+    const keep = new Map();
+    const add = (lat, lng) => {
+        // The radius in tile units here (tiles shrink toward the poles).
+        const tileM = 40075016.7 * Math.cos(lat * Math.PI / 180) / n;
+        const r = radiusMeters / tileM;
+        const tx = lngToTileX(lng, n), ty = latToTileY(lat, n);
+        for (let x = Math.floor(tx - r); x <= Math.floor(tx + r); x++) {
+            for (let y = Math.floor(ty - r); y <= Math.floor(ty + r); y++) {
+                // Distance from the point to the tile's square.
+                const dx = Math.max(x - tx, 0, tx - x - 1), dy = Math.max(y - ty, 0, ty - y - 1);
+                if (dx * dx + dy * dy <= r * r) keep.set(`${x},${y}`, { x, y });
             }
         }
+    };
+    // Points every quarter tile along the line.
+    const step = 360 / n / 4;
+    for (let i = 0; i < points.length; i++) {
+        const a = points[i], b = points[Math.min(i + 1, points.length - 1)];
+        const parts = Math.max(1, Math.ceil(Math.max(Math.abs(b.lat - a.lat), Math.abs(b.lng - a.lng)) / step));
+        for (let k = 0; k < parts; k++) add(a.lat + (b.lat - a.lat) * k / parts, a.lng + (b.lng - a.lng) * k / parts);
     }
-    return out;
+    return [...keep.values()];
+}
+
+// Road lines of one tile in world coordinates at zoom z (TILE_EXTENT units
+// per tile), clipped to the tile's own square so neighbouring tiles' buffers
+// don't overlap, and what a fence hop may not cross (see hopLines): other
+// tracks (trams, subways above ground…), rivers, streams and the shores of
+// lakes and the sea.
+function tileContents(buffer, z, tx, ty) {
+    const layers = decodeTileLayers(buffer, ["transportation", "waterway", "water"], ["water"]);
+    const ox = tx * TILE_EXTENT, oy = ty * TILE_EXTENT;
+    const clipped = (layer, line) => clipLine(line, TILE_EXTENT / layer.extent, 0, TILE_EXTENT).map(pts => {
+        for (let i = 0; i < pts.length; i += 2) {
+            pts[i] += ox;
+            pts[i + 1] += oy;
+        }
+        return pts;
+    });
+    const lines = [], barriers = [];
+    const roads = layers.transportation;
+    for (const { props, lines: geometry } of roads.features) {
+        const highway = tileHighway(props);
+        const tunnel = props.brunnel === "tunnel";
+        if (!highway) {
+            if ((props.class === "rail" || props.class === "transit") && !tunnel) {
+                for (const line of geometry) barriers.push(...clipped(roads, line));
+            }
+            continue;
+        }
+        const brunnel = props.brunnel === "bridge" || tunnel;
+        const oneway = props.oneway === 1 ? 1 : props.oneway === -1 ? -1 : 0;
+        const expressway = props.expressway === 1;
+        const driveway = props.service === "driveway";
+        for (const line of geometry) {
+            for (const pts of clipped(roads, line)) lines.push({ highway, brunnel, oneway, expressway, driveway, pts });
+        }
+    }
+    for (const name of ["waterway", "water"]) {
+        const layer = layers[name];
+        for (const { props, lines: geometry } of layer.features) {
+            if (props.brunnel === "tunnel") continue;
+            for (const line of geometry) barriers.push(...clipped(layer, line));
+        }
+    }
+    return { lines, barriers };
 }
 
 function tileHighway(props) {
     const base = TILE_CLASSES[props.class];
     if (!base) return null;
-    if (base === "path") return TILE_PATH_TYPES.has(props.subclass) ? props.subclass : "path";
+    if (base === "railway") {
+        return TILE_RAIL_TYPES.has(props.subclass) && props.brunnel !== "tunnel" &&
+            props.service !== "yard" && props.service !== "crossover" ? "railway" : null;
+    }
+    if (base === "path") {
+        if (TILE_NOT_PATHS.has(props.subclass)) return null;
+        return TILE_PATH_TYPES.has(props.subclass) ? props.subclass : "path";
+    }
     if (base === "residential") {
         return ["unclassified", "living_street", "road", "residential"].includes(props.subclass) ? props.subclass : "residential";
     }
@@ -248,46 +339,80 @@ function clipLine(line, scale, lo, hi) {
 
 const SNAP_UNITS = 1.5;   // join distance, in tile units (~0.7 m at zoom 14)
 const NODE_CELL = 64;
+// Line ends this close are the same point. A road is often split into
+// several features (at a bridge, or where its tags change), and their ends
+// can be a few units apart instead of equal.
+const END_SNAP_M = 2.5;
 
 // Splits lines wherever they meet another line, so every junction is a
 // shared vertex. Rules: a line end (or tile-edge cut) touching another line
 // joins it; an inner vertex or a crossing joins only if neither line is a
 // bridge or tunnel. Returns new lines with the same properties.
-function nodeLines(lines) {
-    snapCutEnds(lines);
+function nodeLines(lines, z = CONFIG.roadTiles.zoom) {
+    snapEnds(lines, z);
 
     // Segment grid: each segment's box (grown by the join distance) is
-    // listed in every cell it overlaps.
-    const segLine = [], segIndex = [], box = [];
-    const grid = new Map();
+    // listed in every cell it overlaps. The (cell, segment) pairs are packed
+    // into numbers and sorted, which groups them by cell without a Map.
+    let S = 0, minX0 = Infinity, minY0 = Infinity, maxX0 = -Infinity, maxY0 = -Infinity;
+    for (const { pts } of lines) {
+        S += Math.max(0, pts.length / 2 - 1);
+        for (let i = 0; i < pts.length; i += 2) {
+            if (pts[i] < minX0) minX0 = pts[i];
+            if (pts[i] > maxX0) maxX0 = pts[i];
+            if (pts[i + 1] < minY0) minY0 = pts[i + 1];
+            if (pts[i + 1] > maxY0) maxY0 = pts[i + 1];
+        }
+    }
+    const segLine = new Int32Array(S), segIndex = new Int32Array(S), box = new Float64Array(4 * S);
+    // Cells NODE_CELL wide, or wider if the cell numbers wouldn't fit.
+    let cellSize = NODE_CELL;
+    const segBits = 2 ** Math.max(1, Math.ceil(Math.log2(S + 1)));
+    const cellsAcross = () => Math.floor((maxY0 - minY0 + 2 * SNAP_UNITS) / cellSize) + 2;
+    while (((maxX0 - minX0 + 2 * SNAP_UNITS) / cellSize + 2) * cellsAcross() * segBits > 2 ** 52) cellSize *= 2;
+    const H = cellsAcross();
+    const cellOf = (v, lo) => Math.floor((v - lo + SNAP_UNITS) / cellSize);
+    let pairs = new Float64Array(Math.max(16, Math.ceil(S * 1.5)));
+    let np = 0;
+    let s = 0;
     lines.forEach((line, li) => {
         const p = line.pts;
-        for (let i = 0; i + 3 < p.length; i += 2) {
-            const s = segLine.length;
-            segLine.push(li);
-            segIndex.push(i);
+        for (let i = 0; i + 3 < p.length; i += 2, s++) {
+            segLine[s] = li;
+            segIndex[s] = i;
             const minX = Math.min(p[i], p[i + 2]) - SNAP_UNITS, maxX = Math.max(p[i], p[i + 2]) + SNAP_UNITS;
             const minY = Math.min(p[i + 1], p[i + 3]) - SNAP_UNITS, maxY = Math.max(p[i + 1], p[i + 3]) + SNAP_UNITS;
-            box.push(minX, minY, maxX, maxY);
-            for (let cx = Math.floor(minX / NODE_CELL); cx <= Math.floor(maxX / NODE_CELL); cx++) {
-                for (let cy = Math.floor(minY / NODE_CELL); cy <= Math.floor(maxY / NODE_CELL); cy++) {
-                    const key = cx * 2 ** 22 + cy;
-                    let cell = grid.get(key);
-                    if (!cell) grid.set(key, cell = { cx, cy, segs: [] });
-                    cell.segs.push(s);
+            box[4 * s] = minX;
+            box[4 * s + 1] = minY;
+            box[4 * s + 2] = maxX;
+            box[4 * s + 3] = maxY;
+            for (let cx = cellOf(minX, minX0); cx <= cellOf(maxX, minX0); cx++) {
+                for (let cy = cellOf(minY, minY0); cy <= cellOf(maxY, minY0); cy++) {
+                    if (np === pairs.length) {
+                        const grown = new Float64Array(2 * np);
+                        grown.set(pairs);
+                        pairs = grown;
+                    }
+                    pairs[np++] = (cx * H + cy) * segBits + s;
                 }
             }
         }
     });
+    pairs = pairs.subarray(0, np).sort();
 
     // Split points per segment: [t, x, y, …].
     const splits = new Map();
-    const addSplit = (s, t, x, y) => {
-        let list = splits.get(s);
-        if (!list) splits.set(s, list = []);
+    const addSplit = (seg, t, x, y) => {
+        let list = splits.get(seg);
+        if (!list) splits.set(seg, list = []);
         list.push(t, x, y);
     };
-    for (const { cx, cy, segs } of grid.values()) {
+    const segs = [];
+    for (let k = 0; k < np;) {
+        const cell = Math.floor(pairs[k] / segBits);
+        segs.length = 0;
+        for (; k < np && Math.floor(pairs[k] / segBits) === cell; k++) segs.push(pairs[k] - cell * segBits);
+        const cx = Math.floor(cell / H), cy = cell - cx * H;
         for (let i = 0; i < segs.length; i++) {
             const a = segs[i];
             for (let j = i + 1; j < segs.length; j++) {
@@ -297,7 +422,7 @@ function nodeLines(lines) {
                 // holding the corner of their overlap, not in every shared cell.
                 const minX = Math.max(box[4 * a], box[4 * b]), minY = Math.max(box[4 * a + 1], box[4 * b + 1]);
                 if (minX > Math.min(box[4 * a + 2], box[4 * b + 2]) || minY > Math.min(box[4 * a + 3], box[4 * b + 3])) continue;
-                if (Math.floor(minX / NODE_CELL) !== cx || Math.floor(minY / NODE_CELL) !== cy) continue;
+                if (cellOf(minX, minX0) !== cx || cellOf(minY, minY0) !== cy) continue;
                 meetSegments(lines, segLine, segIndex, Math.min(a, b), Math.max(a, b), addSplit);
             }
         }
@@ -305,7 +430,7 @@ function nodeLines(lines) {
 
     // Rebuild lines with their split points.
     const out = [];
-    let s = 0;
+    s = 0;
     lines.forEach((line) => {
         const p = line.pts;
         const pts = [p[0], p[1]];
@@ -328,31 +453,58 @@ function pushPoint(pts, x, y) {
     if (pts[pts.length - 2] !== x || pts[pts.length - 1] !== y) pts.push(x, y);
 }
 
-// Line ends cut at a tile edge: the same road cut by the neighbouring tile
-// ends within a unit or so; give both the same point.
-function snapCutEnds(lines) {
-    const ends = new Map();
-    const snap = (p, i) => {
-        const x = p[i], y = p[i + 1];
-        const onEdge = x % TILE_EXTENT === 0 || y % TILE_EXTENT === 0;
-        if (!onEdge) return;
-        const cx = Math.round(x / 2), cy = Math.round(y / 2);
+// Line ends within END_SNAP_M of another end get the same point (in
+// `lines`, which is changed in place). This also
+// joins a road cut at a tile edge: each tile is simplified on its own, so the
+// two cut ends can be a few units apart.
+function snapEnds(lines, z) {
+    const n = 2 ** z * TILE_EXTENT;
+    const midY = lines.length ? lines[0].pts[1] : n / 2;
+    const unitM = 40075016.7 * Math.cos(tileYToLat(midY, n) * Math.PI / 180) / n;
+    const reach = Math.max(SNAP_UNITS, END_SNAP_M / unitM);
+    const cell = Math.max(2, Math.ceil(reach));
+    // Ends kept so far, chained per cell.
+    const E = 2 * lines.length;
+    const endX = new Float64Array(E), endY = new Float64Array(E), next = new Int32Array(E);
+    const head = new Map();
+    let count = 0;
+    // Returns the point to use for an end: an earlier end close by, or
+    // this one (then kept).
+    const snap = (x, y) => {
+        const cx = Math.floor(x / cell), cy = Math.floor(y / cell);
+        let best = -1, bestD = Infinity;
         for (let dx = -1; dx <= 1; dx++) {
             for (let dy = -1; dy <= 1; dy++) {
-                const other = ends.get((cx + dx) * 2 ** 26 + cy + dy);
-                if (other && Math.abs(other[0] - x) <= SNAP_UNITS && Math.abs(other[1] - y) <= SNAP_UNITS) {
-                    p[i] = other[0];
-                    p[i + 1] = other[1];
-                    return;
+                for (let k = head.get((cx + dx) * 2 ** 26 + cy + dy) ?? -1; k >= 0; k = next[k]) {
+                    const d = Math.max(Math.abs(endX[k] - x), Math.abs(endY[k] - y));
+                    if (d <= reach && d < bestD) {
+                        bestD = d;
+                        best = k;
+                    }
                 }
             }
         }
-        ends.set(cx * 2 ** 26 + cy, [x, y]);
+        if (best >= 0) return best;
+        const key = cx * 2 ** 26 + cy;
+        next[count] = head.get(key) ?? -1;
+        head.set(key, count);
+        endX[count] = x;
+        endY[count] = y;
+        return count++;
     };
-    for (const { pts } of lines) {
-        snap(pts, 0);
-        snap(pts, pts.length - 2);
-    }
+    // Lines whose ends move are replaced by copies: the originals are
+    // shared with the tile store.
+    lines.forEach((line, li) => {
+        const p = line.pts, last = p.length - 2;
+        const a = snap(p[0], p[1]), b = snap(p[last], p[last + 1]);
+        if (endX[a] === p[0] && endY[a] === p[1] && endX[b] === p[last] && endY[b] === p[last + 1]) return;
+        const pts = p.slice();
+        pts[0] = endX[a];
+        pts[1] = endY[a];
+        pts[last] = endX[b];
+        pts[last + 1] = endY[b];
+        lines[li] = { ...line, pts };
+    });
 }
 
 function meetSegments(lines, segLine, segIndex, a, b, addSplit) {
@@ -401,6 +553,146 @@ function meetSegments(lines, segLine, segIndex, a, b, addSplit) {
     addSplit(b, u, x, y);
 }
 
+// --- Fence hops ---------------------------------------------------------
+
+// Longest fence hop, in meters.
+const HOP_M = 10;
+// Roads a hop can't start or end on: you can't get on or off these on foot.
+const NO_HOP_TYPES = new Set(["motorway", "motorway_link", "trunk", "trunk_link", "railway", "steps"]);
+
+// Fence hops: short straight links from a dead end to the nearest road that
+// it doesn't connect to, at most HOP_M away (e.g. a cul-de-sac that ends
+// just short of a path or another street). To stay on the safe side, a hop
+// only starts at a real dead end (not one made by cutting the map into
+// tiles), never starts or ends on a motorway, expressway ramp, railroad,
+// steps, driveway, bridge or tunnel, and never crosses another road, railroad, river,
+// stream or shore. Splits the roads hopped to (in place) and returns the
+// hops as lines of type "hop".
+function hopLines(lines, barriers, z) {
+    if (!lines.length) return [];
+    const n = 2 ** z * TILE_EXTENT;
+    const unitM = 40075016.7 * Math.cos(tileYToLat(lines[0].pts[1], n) * Math.PI / 180) / n;
+    const reach = HOP_M / unitM;
+    const key = (x, y) => x * n + y;
+    // (Not driveways either: a hop from one to the next crosses yards.)
+    const usable = (line) => !line.brunnel && !line.driveway && !NO_HOP_TYPES.has(line.highway);
+
+    // Streets at each point (a line end counts once, an inner point twice).
+    const degree = new Map();
+    for (const { pts } of lines) {
+        for (let i = 0; i < pts.length; i += 2) {
+            const k = key(pts[i], pts[i + 1]);
+            degree.set(k, (degree.get(k) || 0) + (i === 0 || i === pts.length - 2 ? 1 : 2));
+        }
+    }
+
+    // Segment grid: roads (index ≥ 0 into lines) and barriers (−1 − index).
+    const cell = Math.max(16, Math.ceil(2 * reach));
+    const grid = new Map();
+    const addSegments = (pts, id) => {
+        for (let i = 0; i + 3 < pts.length; i += 2) {
+            const x0 = Math.floor(Math.min(pts[i], pts[i + 2]) / cell), x1 = Math.floor(Math.max(pts[i], pts[i + 2]) / cell);
+            const y0 = Math.floor(Math.min(pts[i + 1], pts[i + 3]) / cell), y1 = Math.floor(Math.max(pts[i + 1], pts[i + 3]) / cell);
+            for (let cx = x0; cx <= x1; cx++) {
+                for (let cy = y0; cy <= y1; cy++) {
+                    const k = cx * 2 ** 24 + cy;
+                    let list = grid.get(k);
+                    if (!list) grid.set(k, list = []);
+                    list.push(id, i);
+                }
+            }
+        }
+    };
+    lines.forEach((line, li) => addSegments(line.pts, line.brunnel ? null : li));
+    barriers.forEach((pts, bi) => addSegments(pts, -1 - bi));
+    const segmentsNear = (x, y, fn) => {
+        const cx = Math.floor(x / cell), cy = Math.floor(y / cell);
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
+                const list = grid.get((cx + dx) * 2 ** 24 + cy + dy);
+                if (list) for (let k = 0; k < list.length; k += 2) fn(list[k], list[k + 1]);
+            }
+        }
+    };
+    const ptsOf = (id) => id === null ? null : id >= 0 ? lines[id].pts : barriers[-1 - id];
+
+    const hops = [], splits = new Map(), seen = new Set();
+    lines.forEach((line, li) => {
+        if (!usable(line)) return;
+        const p = line.pts;
+        for (const i of [0, p.length - 2]) {
+            const x = p[i], y = p[i + 1];
+            if (degree.get(key(x, y)) !== 1) continue;
+            // Not an end made by the tile edge (the road may go on).
+            if (x % TILE_EXTENT === 0 || y % TILE_EXTENT === 0) continue;
+
+            // The nearest point on another usable road.
+            let best = null;
+            segmentsNear(x, y, (id, si) => {
+                if (id === null || id < 0 || id === li || !usable(lines[id])) return;
+                const q = lines[id].pts;
+                const ax = q[si], ay = q[si + 1], ex = q[si + 2] - ax, ey = q[si + 3] - ay;
+                const len2 = ex * ex + ey * ey;
+                const t = len2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * ex + (y - ay) * ey) / len2)) : 0;
+                const px = Math.round(ax + t * ex), py = Math.round(ay + t * ey);
+                const d = Math.hypot(px - x, py - y);
+                if (d <= reach && d > SNAP_UNITS && (!best || d < best.d)) best = { d, id, si, t, px, py };
+            });
+            if (!best) continue;
+            const pairKey = `${Math.min(key(x, y), key(best.px, best.py))},${Math.max(key(x, y), key(best.px, best.py))}`;
+            if (seen.has(pairKey)) continue;
+
+            // Nothing in the way: no other road, track or water crossed.
+            let blocked = false;
+            const hx = best.px - x, hy = best.py - y;
+            segmentsNear(x, y, (id, si) => {
+                if (blocked || id === null) return;
+                const q = ptsOf(id);
+                const ax = q[si], ay = q[si + 1], bx = q[si + 2], by = q[si + 3];
+                // The hop's own ends touch its two roads.
+                if (id === li || (id === best.id && si === best.si)) return;
+                const sx = bx - ax, sy = by - ay;
+                const den = hx * sy - hy * sx;
+                if (den === 0) return;
+                const t = ((ax - x) * sy - (ay - y) * sx) / den;
+                const u = ((ax - x) * hy - (ay - y) * hx) / den;
+                if (t > 0 && t < 1 && u >= 0 && u <= 1) blocked = true;
+            });
+            if (blocked) continue;
+            seen.add(pairKey);
+
+            // Split the road hopped to at the hop's end (unless that's
+            // already one of its points).
+            const q = lines[best.id].pts;
+            const atVertex = (best.px === q[best.si] && best.py === q[best.si + 1]) || (best.px === q[best.si + 2] && best.py === q[best.si + 3]);
+            if (!atVertex) {
+                let list = splits.get(best.id);
+                if (!list) splits.set(best.id, list = []);
+                list.push(best.si, best.t, best.px, best.py);
+            }
+            hops.push({ highway: "hop", brunnel: false, oneway: 0, expressway: false, driveway: false, pts: [x, y, best.px, best.py] });
+        }
+    });
+
+    for (const [li, list] of splits) {
+        const p = lines[li].pts;
+        const order = [];
+        for (let k = 0; k < list.length; k += 4) order.push(k);
+        order.sort((a, b) => list[a] - list[b] || list[a + 1] - list[b + 1]);
+        const pts = [p[0], p[1]];
+        let at = 0;
+        for (let i = 0; i + 3 < p.length; i += 2) {
+            while (at < order.length && list[order[at]] === i) {
+                pushPoint(pts, list[order[at] + 2], list[order[at] + 3]);
+                at++;
+            }
+            pushPoint(pts, p[i + 2], p[i + 3]);
+        }
+        lines[li].pts = pts;
+    }
+    return hops;
+}
+
 // Overpass-style ways: node IDs from the (whole-unit) coordinates, so lines
 // sharing a point share a node.
 function linesToWays(lines, z) {
@@ -422,5 +714,5 @@ function linesToWays(lines, z) {
 }
 
 if (typeof module !== "undefined") {
-    module.exports = { fetchRoadsFromTiles, tileRoadLines, nodeLines, linesToWays, clipLine, tilesCovering, roadTileZoom };
+    module.exports = { fetchRoadsFromTiles, tileContents, hopLines, nodeLines, linesToWays, clipLine, tilesCovering, roadTileZoom };
 }

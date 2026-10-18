@@ -89,6 +89,9 @@ const CONFIG = {
         "footway", "path", "cycleway", "bridleway", "steps"
     ],
 
+    // Left out with "Avoid motorways" (with roads tagged as expressways).
+    motorwayTypes: ["motorway", "motorway_link", "trunk", "trunk_link"],
+
     // Drawn thicker on the map.
     majorRoadTypes: ["motorway", "trunk", "primary", "secondary"],
 
@@ -100,8 +103,11 @@ const CONFIG = {
         tileJsonUrl: "https://tiles.openfreemap.org/planet",
         zoom: 14,
         minZoom: 8,
-        concurrency: 16,
+        concurrency: 64,
         cacheMaxVertices: 4000000,
+        // Tiles loaded ahead of a search, as soon as its pin, shape or
+        // place is set.
+        prefetchMaxTiles: 400,
         attribution: 'Roads <a href="https://openfreemap.org">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a> ' +
             '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
     },

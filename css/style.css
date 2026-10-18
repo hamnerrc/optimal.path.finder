@@ -1147,6 +1147,14 @@ h1 {
     accent-color: var(--accent);
 }
 
+.road-options .checkbox {
+    align-items: flex-start;
+}
+
+.road-options .checkbox input {
+    margin-top: 2px;
+}
+
 /* Search progress */
 .search-progress {
     display: flex;

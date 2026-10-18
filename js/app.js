@@ -56,6 +56,11 @@ const ui = {
     coverageInput: $("coverageInput"),
     coverageOutput: $("coverageOutput"),
 
+    roadOptionsCount: $("roadOptionsCount"),
+    noMotorwaysInput: $("noMotorwaysInput"),
+    hopsInput: $("hopsInput"),
+    railwaysInput: $("railwaysInput"),
+
     routesSection: $("routesSection"),
     routeList: $("routeList"),
     clearRoutesButton: $("clearRoutesButton"),
@@ -122,7 +127,13 @@ const prefs = {
     coveragePercent: storedPrefs.coveragePercent > 0 ? storedPrefs.coveragePercent : CONFIG.defaultCoveragePercent,
     // Pace is stored as a speed (m/s) and shown in the chosen format.
     paceFormat: PACE_FORMATS[storedPrefs.paceFormat] ? storedPrefs.paceFormat : (storedPrefs.units === "km" ? "min/km" : "min/mi"),
-    speedMps: storedPrefs.speedMps > 0 ? storedPrefs.speedMps : METERS_PER_MILE / CONFIG.defaultPaceSecPerMile
+    speedMps: storedPrefs.speedMps > 0 ? storedPrefs.speedMps : METERS_PER_MILE / CONFIG.defaultPaceSecPerMile,
+    // Road options (see roadTypesFor in js/pipeline.js), all off by default.
+    roads: {
+        noMotorways: storedPrefs.roads?.noMotorways === true,
+        hops: storedPrefs.roads?.hops === true,
+        railways: storedPrefs.roads?.railways === true
+    }
 };
 const rememberPrefs = () => savePrefs(prefs);
 setUnits(prefs.units);
@@ -207,6 +218,7 @@ function render() {
     }
     ui.routeHint.textContent = loading ? "" : routeHintText(ready, blocked, pending);
     ui.routeHint.hidden = !ui.routeHint.textContent;
+    if (!loading && !blocked) schedulePrefetch(jobs.filter(job => !isUpToDate(job)));
 
     // Network
     ui.networkSection.hidden = !state.network;
@@ -219,6 +231,16 @@ function render() {
 
     renderRoutes();
     renderSaved();
+}
+
+// Road tiles for the searches on screen start downloading as soon as a pin,
+// shape or place is set (after a short pause, so dragging a pin doesn't
+// download every place it passes), so "Find loop" rarely has to wait.
+let prefetchTimer = null;
+function schedulePrefetch(jobs) {
+    clearTimeout(prefetchTimer);
+    if (!jobs.length) return;
+    prefetchTimer = setTimeout(() => jobs.forEach(prefetchRoads), 400);
 }
 
 function routeHintText(ready, blocked, pending) {
@@ -546,6 +568,24 @@ ui.deleteShapeButton.addEventListener("click", deleteShape);
 ui.cancelEditButton.addEventListener("click", cancelEditing);
 ui.doneEditButton.addEventListener("click", finishEditing);
 
+const ROAD_OPTION_INPUTS = { noMotorways: ui.noMotorwaysInput, hops: ui.hopsInput, railways: ui.railwaysInput };
+const showRoadOptionsCount = () => {
+    const on = Object.values(prefs.roads).filter(Boolean).length;
+    ui.roadOptionsCount.textContent = `${on} on`;
+    ui.roadOptionsCount.hidden = on === 0;
+};
+for (const [name, input] of Object.entries(ROAD_OPTION_INPUTS)) {
+    input.checked = prefs.roads[name];
+    input.addEventListener("change", () => {
+        prefs.roads[name] = input.checked;
+        rememberPrefs();
+        showRoadOptionsCount();
+        render();
+    });
+}
+showRoadOptionsCount();
+const roadsKey = () => Object.keys(ROAD_OPTION_INPUTS).filter(name => prefs.roads[name]).join("+");
+
 ui.coverageInput.value = prefs.coveragePercent;
 ui.coverageOutput.textContent = `${prefs.coveragePercent}%`;
 ui.coverageInput.addEventListener("input", () => {
@@ -613,9 +653,10 @@ function searchJobs() {
                 kind: "start",
                 start,
                 label: `Start ${startNumber(start.id)}`,
-                key: `start:${start.id}:${lat.toFixed(6)},${lng.toFixed(6)}:${Math.round(start.maxDistanceM)}`,
+                key: `start:${start.id}:${lat.toFixed(6)},${lng.toFixed(6)}:${Math.round(start.maxDistanceM)}:${roadsKey()}`,
                 networkKey: `start:${start.id}`,
                 region: startRegion(start),
+                roads: { ...prefs.roads },
                 objective: { mode: "start", start: { lat, lng }, maxLengthM: start.maxDistanceM }
             };
         });
@@ -636,10 +677,11 @@ function searchJobs() {
     return [{
         kind: "area",
         label,
-        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${prefs.coveragePercent}`,
+        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${prefs.coveragePercent}:${roadsKey()}`,
         networkKey: "area",
         region: marginRegion(target, CONFIG.areaMargins[0]),
         target,
+        roads: { ...prefs.roads },
         objective: { mode: "area", target: outline, coverage: prefs.coveragePercent / 100 }
     }];
 }
@@ -836,9 +878,11 @@ function createRoute(fields) {
 }
 
 function routeNote(result) {
-    return result.stemM > 30
-        ? `The loop starts with ${formatDistance(result.stemM)} out to it, and ends with the same stretch back.`
-        : "";
+    const notes = [];
+    if (result.stemM > 30) notes.push(`The loop starts with ${formatDistance(result.stemM)} out to it, and ends with the same stretch back.`);
+    if (result.hops > 0) notes.push(`It uses ${result.hops} fence hop${result.hops > 1 ? "s" : ""} (a gap under 10 m between roads that don't connect).`);
+    if (result.railM > 30) notes.push(`${formatDistance(result.railM)} of it runs along railroad tracks.`);
+    return notes.join(" ");
 }
 
 function routeWarning(route, result, job) {

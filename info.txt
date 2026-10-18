@@ -1,238 +1,170 @@
 =============================================================================
-ROUND 2 (2026-10-18): WHAT'S DONE, AND NEW QUESTIONS
+INTERVAL ROUTE FINDER: STATUS NOTES
+Live site: https://hamnerrc.github.io/optimal.path.finder/ (updates on push)
 =============================================================================
 
-Built from your answers above:
-- Loop solver. Start point mode: the largest-area loop through each start
-  point that is no longer than its max length (roads are loaded within half
-  that length of the start). Area mode: the roundest loop (highest
-  isoperimetric quotient) that encloses at least n% of the shape. Neither
-  mode runs the same street twice. One loop per start point, best loop only.
-- Rectangle shape (2 opposite corners), next to circle and ellipse.
-- mi/km toggle (top right of the panel), default mi, remembered.
-- Drag the green flag along a finished loop to choose where to start, and
-  a Reverse button. The elevation profile, the arrows and the KML export all
-  follow the chosen start and direction.
-- Elevation profile with hover (shows the point on the map), total climb.
-- Estimated time from a run pace or bike speed.
-- KML export (Google Earth / My Maps): the path, a shaded territory polygon
-  and the start point.
-- Saved loops (this browser only), with their elevation data.
-- All road and path types are loaded (footways, paths, cycleways, service
-  roads, tracks, steps added).
-- Git repository set up with two commits. Nothing pushed anywhere.
+-----------------------------------------------------------------------------
+ROUNDS 2-5 (2026-10-18), IN SHORT
+-----------------------------------------------------------------------------
+Modes
+- Start point: the largest-area loop no longer than each pin's max length.
+  If a better loop is a short way off (or the pin is on a dead end), the run
+  goes out to it and back; that stretch counts twice.
+- Area (circle, ellipse, rotatable rectangle, freehand) and Place (a real
+  boundary, searched by name with a Search button): the roundest loop
+  (isoperimetric quotient) covering at least n% of the shape (slider,
+  default 90%). Ties go to the bigger loop. Roads are loaded 5% beyond the
+  shape, widened to 20% and then 40% if the target can't be reached.
+- Loops never run a street twice and never cross or touch themselves.
 
-=============================================================================
-ROUND 3 (2026-10-18): DONE FROM YOUR ROUND 2 ANSWERS, AND OPEN POINTS
-=============================================================================
+Loop panel and exports
+- Distance, area, roundness, coverage, time from pace (min/mi, min/km, mph,
+  km/h), elevation profile with climb. mi/km toggle.
+- Drag the green flag to choose the start; Reverse. Save in the browser;
+  KML and GPX export.
 
-Done:
-- Area mode: equal roundness -> the loop enclosing more area wins (Q24).
-  Roads are loaded up to 20% beyond the area (Q25). The coverage target is
-  now a slider with a plain-language explanation, default 90% (Q26).
-- Start point mode explains that loops start at an intersection (Q28).
-- Pace can be typed as min/mi, min/km, mph or km/h (Q30). The Run/Bike
-  switch is gone, since it only changed the time estimate.
-- Big searches (Q31-33). Measured limit for loading every road at once: a
-  10 mi loop in central Chicago is ~80 sq mi, a 73 MB download (~50 s),
-  ~200k intersections, ~650 MB of browser memory. So searches over 80 sq mi
-  run in stages: a rough loop on major roads (downloaded in tiles), then
-  every ~10 mi stretch is re-optimized with all roads within half a mile of
-  it. Tested on a 15 mi start loop and an area loop. The loop updates live,
-  Stop keeps the best so far, and it can be exported at any time. Search
-  times now go up to 10 minutes.
-- New "Place" tab (Q34): search a city, county, state, lake or park and its
-  real boundary becomes the area.
-- 3-point (rotatable) rectangle and freehand polygon (Q35). GPX export (Q36).
-- "Find loops" skips start points whose loop is already up to date (Q37).
+Roads
+- Every OpenStreetMap road and path, from OpenFreeMap vector tiles
+  (precomputed, worldwide, from a CDN), with Overpass as the fallback.
+  Junctions are rebuilt from the tile geometry (bridges and tunnels kept
+  apart). Tiles stay in memory for later searches.
 
-=============================================================================
-ROUND 4 (2026-10-18): DONE FROM YOUR ROUND 3 ANSWERS, AND OPEN POINTS
-=============================================================================
+Search
+- No time limit and no settings: it runs until better loops stop turning
+  up; the best loop so far is shown live and Stop keeps it.
+- Engine: an exact angular sweep (dynamic program over junctions sorted by
+  angle) from many centres, then block-by-block polish, in parallel Web
+  Workers. The same search gives the same loop every time.
+- Big searches (over ~80 sq mi): a rough loop on major roads first, then
+  all roads along it.
 
-Done:
-- Q40: pushed to main, so the site updates on GitHub Pages
-  (https://hamnerrc.github.io/optimal.path.finder/).
-- Q41: place search stays search-by-name.
-- Q42 + "no time limit": new loop search.
-    * The road graph is shrunk before searching. Dead-end streets, and
-      whole trees of streets hanging off them, can never be part of a ring,
-      so they are pruned. Chains of road between junctions are merged into
-      single edges. That removes about 40% of the nodes in Lawrence.
-    * Waypoints snap to junctions with a k-d tree (it used to be a grid
-      scan that was very slow for points far from roads; that alone made
-      big Place searches about 5x faster). Routing uses a slightly greedy
-      A* that explores far fewer nodes.
-    * One search per spare CPU core runs in parallel, each with its own
-      random seed. Each keeps a small pool of good loops from different
-      starting shapes and keeps improving them, with a hill climb over
-      neighbouring junctions at the end of each round.
-    * The "Search time" menu is gone. A search ends by itself once enough
-      rounds in a row (12 + 4 per CPU worker, and at least half the rounds
-      it took to find the best loop) haven't improved the loop by more than
-      0.2%. The progress bar shows how settled the search is: it fills as
-      rounds go by without a better loop and drops back when one turns up.
-      Stop still keeps the best loop so far.
-    Measured on saved Lawrence road data (3 searches in parallel, the old
-    solver at its "Normal" 8 s):
-                              old (8 s)        new
-      5 mi start loop         1.27 sq mi       1.33-1.35 sq mi in 1-2 s
-      10 mi start loop        5.85 sq mi       5.2-6.0 sq mi in 9-12 s
-      rectangle at 90%        roundness 0.49   0.54 in 6-12 s
-      Lawrence city at 80%    roundness 0.2-0.3 (20% margin, 30 s);
-                              now 0.53 with a 20% margin, but see Q44
-- Deleting a start point hides its roads, but the download is kept in
-  memory. A new start point whose area lies inside an earlier download
-  needs no new download. Up to 8 downloads (about 400k roads in total) are
-  kept, and they're lost when the page is reloaded.
-- Place search: the search now asks Nominatim for names only. The
-  boundary is downloaded only for the place you pick, already simplified
-  by the server to the detail its size needs. Lake Michigan went from
-  200 KB to under 1 KB for the result list.
-- Area/Place margin cut from 20% to 5% (CONFIG.areaMargin = 1.05).
-- "Cross a road twice" (start point mode): the loop no longer has to pass
-  through the start. If a better loop is a short way off (or the pin is on
-  a dead-end street), the run goes out to it and back the same way. That
-  stretch counts twice toward the max length, and the loop's panel says
-  how long it is. The pin now snaps to the nearest road node of any kind,
-  including the end of a dead-end street, not only to intersections.
+Answers kept as they are: no figure-8s or self-touching loops (Q45); the
+search stops by itself (Q50); area mode may trade a little roundness for
+speed (Q51); road downloads are not stored between page loads (Q48).
 
-Open points. Same format as before: answer below each question.
+-----------------------------------------------------------------------------
+ROUND 6 (2026-10-18): DONE FROM YOUR ROUND 5 ANSWERS
+-----------------------------------------------------------------------------
+Q49 / Q52 / Q53: new "Roads to use" section in the panel (all off by
+default, remembered, applies to every mode):
+- Avoid motorways, expressways and their ramps (motorway and trunk roads,
+  their ramps, and any road tagged as an expressway).
+- Allow fence hops: a straight link of up to 10 m from a dead end to a road
+  it doesn't connect to. To stay safe, a hop only starts at a real dead end,
+  never crosses another road, railroad, river, stream or shore, and never
+  starts or ends on a motorway, ramp, railroad, steps, driveway (it would
+  cross yards), bridge or tunnel. The loop's panel says how many it uses.
+- Use railroad tracks (main lines, narrow gauge and heritage lines, not
+  tunnels, yards, trams or subways). The loop's panel says how far it runs
+  along tracks. See Q55 on why this is off by default.
+- Paths, trails, footways, cycleways, bridleways, tracks, steps and rail
+  trails were already all used and still are. Indoor corridors and station
+  platforms are now left out.
 
-44. The 5% margin often makes the coverage target unreachable, because
-    the loop can't use roads just outside the edge. Examples:
-      - A 2.2 x 1.7 mi rectangle in SW Lawrence at 90%: the best loop now
-        reaches 71% of the area. With the old 20% margin it reached 90%.
-      - Lawrence city limits at 80%: the best loop reaches 77-78%
-        (warning shown). With a 20% margin it reaches 80% with roundness
-        0.53. Here the hull already covers the northern lobes, so part of
-        the shortfall may be the search rather than the margin.
-    The margin also scales the area's convex hull, not the outline itself,
-    so for a jagged city it adds more than 5% around the notches. Which do
-    you want?
-      (a) keep 5%,
-      (b) 5% by default, widened automatically when the target can't be
-          reached,
-      (c) a margin setting in the panel,
-      (d) 5% around the outline itself (follows the jagged edge), not
-          around its hull.
-    Answer: b
+Q53, Kansas at 75% stayed on major roads. Three causes, all fixed:
+- The download for "all roads along the rough loop" covered the corridor's
+  whole bounding box: 50,700 tiles for Kansas. Now only the tiles along the
+  loop: about 2,000.
+- Seams in the road data: one road is often split into several tile
+  features whose ends lie a metre or two apart (at bridges, tile edges),
+  and these weren't joined. That broke the main loop road in 5 places in
+  Kansas. Ends within 2.5 m are now joined.
+- The improvement step needed one unbroken sweep around a 1,100 mi loop; a
+  single cloverleaf ramp anywhere made it fail. Now the loop is improved
+  stretch by stretch (a few km to a few dozen km at a time); a stretch that
+  can't be improved simply stays.
+  Kansas at 75% now ends on all roads: 1,146 mi, roundness 0.62, coverage
+  79%, in about 27 s from a cold start in the browser (was about 60 s, on
+  major roads only).
 
-45. "Allow a path to cross a road twice": I took this to mean the
-    out-and-back stretch from an awkward start point (above). The loop
-    itself still never runs a street twice or crosses itself, and in
-    Area/Place mode nothing changed. Did you also mean loops that touch or
-    cross themselves (figure 8s, or two lobes meeting at one
-    intersection)? Those are risky for INTVL scoring: if it uses the GPS
-    track polygon, a figure 8's two halves can cancel each other out.
-    Answer: keep as is, no changes needed
+Speed:
+- Road tiles start downloading as soon as a pin, shape or place is set,
+  before "Find loop" is pressed.
+- 64 tile downloads at once instead of 16 (2-3x faster downloads).
+- Road network build about 3x faster; faster noding and sorting.
+- Solver workers start with the page and are reused between searches.
+- The search settles after 40 quiet sweeps instead of 64: same loops in
+  every benchmark, about 20% faster.
+- Big searches (staged) are 2-3x faster and slightly better.
+  Measured (same cached roads, this 2015 laptop, previous version vs now):
+                               before                    now
+    Lawrence city at 80%       roundness 0.429, 7.5 s    0.458, 2.6 s
+    30 mi start loop, Chicago  57.3 sq mi, 17 s          57.5 sq mi, 7.8 s
+    100 mi start loop, Denver  586 sq mi, 13 s           590 sq mi, 4.7 s
+    Douglas County at 80%      roundness 0.49, 6.7 s     0.49, 2.7 s
+  Browser, warm: a 5 mi start loop in about 1.5-2.5 s.
 
-46. "The places search seems to be very slow": Nominatim answered in about
-    1 second in my tests, so I made the lookup lighter (above). If you meant
-    finding the loop for a place: a Lawrence city-limits loop (~30 mi) now
-    takes 25-55 s on a 4-core laptop. Is anything
-    still slow, and at which step (search, boundary, downloading roads,
-    searching)?
-    Answer: it is unclear that the user must press enter after searching a place. add a search button. thats all.
+Fixes found along the way:
+- At a bridge crossing (no junction), paths arriving along the two roads
+  overwrote each other in the sweep, which could block the only way on.
+- Results could differ slightly between runs because tiles arrive in random
+  order; tiles are now assembled in a fixed order.
+- With motorways avoided, a 100 mi Denver loop came out 107.7 mi (rough
+  roads are simplified and shorter than the real ones); the improvement
+  step now brings such loops back under the limit (100.0 mi).
 
-47. Results still vary between runs for long loops (a 10 mi start loop in
-    Lawrence: 5.2 to 6.0 sq mi over 3 runs). "Find loop" doesn't search again once a
-    loop is up to date. Do you want a "Keep searching" button that
-    continues from the current best loop?
-    Answer: it should always be continually searching, and have a very high change of finding the best one every time, with pretty consistent results.
+-----------------------------------------------------------------------------
+OPEN POINTS FOR FUTURE DEVELOPMENT
+Same format as before: answer below each question.
+-----------------------------------------------------------------------------
 
-48. Kept road downloads are lost on reload. Should they be saved in the
-    browser (IndexedDB, can be tens of MB) so a reload doesn't download
-    again?
-    Answer: no, however major roads of the world should be precomputed
-
-=============================================================================
-ROUND 5 (2026-10-18): DONE FROM YOUR ROUND 4 ANSWERS, AND OPEN POINTS
-=============================================================================
-
-Done:
-- Q44 (b): area and place searches load roads 5% beyond the area. If the
-  coverage target can't be reached with those, the search repeats with
-  20% and then 40% by itself ("Roads near the area only reach 77% coverage.
-  Widening the search to 20% around it…"). The hint under the coverage
-  slider says so.
-- Q45: unchanged.
-- Q46: the Place tab has a Search button next to the box (Enter still works).
-- Q48 / "precompute major roads of the world": roads now come from
-  OpenFreeMap's vector tiles, which are exactly that: every OpenStreetMap
-  road on Earth, precomputed, rebuilt weekly and served from a CDN, free and
-  without keys. A search fetches just the tiles it needs, in parallel, and
-  keeps them in memory, so nearby searches reuse them. Hosting our own copy
-  wasn't an option: the world's roads are several GB and GitHub Pages
-  allows 1 GB. Tiles don't say which roads meet at a junction, so the app
-  rebuilds junctions from the geometry (roads that share a point, end on
-  another road or cross it are joined, except bridges and tunnels). On
-  Lawrence it matches the Overpass data to within about 3%. If the tile
-  server is unreachable, it falls back to Overpass as before.
-    Downloads: a 10 mi loop needs about 70 tiles, 2 MB, 1-4 s. Overpass
-    took tens of seconds for the same area (10-70 MB).
-- Q42/Q47 "blazing fast, best route, consistent": new search engine.
-    * Angular sweep: for a centre point and a junction, the best loop
-      through that junction that goes once around the centre (always moving
-      forward in angle) is found exactly, by sorting the junctions by angle
-      and running a dynamic program over (junction, distance so far). About
-      25 ms for 20,000 junctions. The search sweeps many centres spread
-      evenly around the start (or the area).
-    * Block polish: a loop is the boundary of a set of city blocks. The best
-      loops are improved by adding or removing single blocks and by
-      rerouting stretches of the loop along nearby streets, hundreds of
-      thousands of changes per second. This fixes what a sweep can't do (winding
-      streets) and grows area loops to the coverage target. Loops still
-      never cross or touch themselves; a bridge over another road is a
-      crossing the loop may use only once, straight on.
-    * The same search on the same computer gives the same loop every time
-      (the sequence of centres is fixed and the stopping rule counts sweeps
-      in order). Across computers with 1 to 6 parallel searches the results
-      matched or were within about 2% in my tests.
-    * Measured on saved Lawrence road data, 3 parallel searches, on this
-      2015 laptop:
-                              round 4                  now
-      5 mi start loop         1.33-1.35 sq mi, 1-2 s   1.39 sq mi, 0.6 s
-      10 mi start loop        5.2-6.0 sq mi, 9-12 s    6.06 sq mi, 2-3 s
-      rectangle at 90%        roundness 0.54, 6-12 s   0.52-0.54, under 1 s
-      Lawrence city at 80%    roundness 0.53, 43 s     0.49-0.50, 2-3 s
-        (the last two with the 20% margin)
-- Gigantic searches. Above about 80 sq mi (a 10 mi loop) the search finds
-  a rough loop on major roads from coarser tiles, then loads all roads in a
-  1 km corridor along it and searches again with them. The final loop
-  always follows the real road shapes. In the browser, from a cold start:
-      30 mi loop in central Chicago      about 10-15 s
-      100 mi loop around Denver          about 15-26 s
-      Douglas County, KS at 80%          about 20 s (incl. widening to 20%)
-  Most of that time is downloading tiles the first time.
-- The road data credit (OpenFreeMap, OpenMapTiles, OpenStreetMap
-  contributors) is now in the map's attribution line, as their licenses
-  require.
-
-Open points. Same format as before: answer below each question.
-
-49. Loops can use motorways and their ramps. The road list has always
-    included them ("deliberately broad"), and with long loops it shows: the
-    100 mi Denver loop runs along E-470 and I-76. Should motorways and
-    motorway ramps be left out? Trunk roads (expressways) too?
+54. Avoid motorways also drops trunk roads. In the US these are expressways,
+    but in the UK and elsewhere many trunk roads are ordinary main roads
+    with sidewalks. Keep trunk roads in the avoid list, or only drop
+    motorways, ramps and roads tagged as expressways?
     Answer:
 
-50. Q47 "it should always be continually searching": I made every search
-    find the best loop reliably and give the same result each time, and it
-    still ends by itself once it stops finding better loops (usually a few
-    seconds). Did you mean that it should literally never stop, i.e. keep
-    running in the background after the loop is shown, until you press
-    Stop or change something?
+55. Railroad tracks are an opt-in checkbox, off by default. Walking or
+    running along active tracks is trespassing in the US and dangerous.
+    Rail trails (old lines turned into paths) are always used, and abandoned
+    lines that aren't trails aren't in the road data at all. Keep the
+    checkbox off by default, turn it on by default, or remove it?
     Answer:
 
-51. Area mode trades a little roundness for speed: Lawrence city at 80%
-    reaches 0.49-0.50 in 2-3 s, where the old search reached 0.53 in 43 s
-    (it used roads further out). Is that OK, or should area searches take
-    longer to squeeze out the last few percent?
+56. Fence hops: 10 m limit, never from driveways, never across water. The
+    data has no fences, walls or buildings between roads, so a hop can still
+    cross private yards or parking lots. Should hops also be kept off
+    parking aisles and service roads, or limited to footpaths and streets?
+    Should hops be drawn differently on the map (e.g. dashed)?
     Answer:
 
-52. Road tiles include sidewalks, footpaths and parking-lot aisles, like the
-    Overpass data did, so a loop can use a short footpath or parking aisle
-    as a shortcut. Keep them, or leave out parking aisles and sidewalks
-    drawn separately from their street?
+57. Paths marked private or "no access" (access=no, foot=no) are used like
+    any other path. Leave them out?
+    Answer:
+
+58. One-way streets are ignored (fine on foot). Should one-way rules apply
+    for cyclists, e.g. with a Run/Bike switch?
+    Answer:
+
+59. Very large searches download about 2,000 tiles (Kansas, ~25 s). Options:
+    (a) keep it, (b) a lighter "major and minor roads only" refinement that
+    needs a quarter of the tiles but skips footpaths and tracks, (c) host a
+    precomputed path network for whole states (needs a server or paid
+    storage).
+    Answer:
+
+60. Big searches only improve the rough loop within 1 km of it, so the
+    final loop keeps the rough loop's overall shape. A wider corridor
+    (2-3 km) could find better loops but downloads 2-3x as many tiles.
+    Preference?
+    Answer:
+
+61. On a very long loop, the loop may keep a cloverleaf ramp that passes
+    under its own bridge (a tiny self-crossing) where no other way exists.
+    Is that acceptable for INTVL scoring, or should such spots be avoided
+    even at a cost in area?
+    Answer:
+
+62. Tiles start downloading as soon as a pin is dropped (up to 400 tiles,
+    ~5-15 MB). On mobile data this happens even if you never press Find
+    loop. OK, or only on Wi-Fi / only after Find loop?
+    Answer:
+
+63. The elevation service (Open-Meteo) limits requests per minute and
+    sometimes fails ("Too Many Requests") after several searches in a row,
+    and its 90 m resolution flattens short hills. Is the elevation profile
+    important enough to switch to another source?
+    Answer:
+
+64. Any other changes?
     Answer:

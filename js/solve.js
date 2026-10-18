@@ -38,7 +38,7 @@ async function runSolver(network, params, { signal, onProgress }) {
 // Collects round reports from the engines and stops them once the search
 // has settled. Each engine: { start(onMessage), stop() }.
 function coordinate(prep, params, engines, { signal, onProgress }) {
-    const tracker = new SearchTracker(engines.length);
+    const tracker = new SearchTracker(engines.length, Boolean(params.reference));
     return new Promise((resolve, reject) => {
         let finished = false;
         let reported = false;
@@ -86,25 +86,49 @@ function coordinate(prep, params, engines, { signal, onProgress }) {
     });
 }
 
+// Workers are kept between searches (and started soon after the page
+// loads), so a search doesn't wait for them to start and load the solver.
+// Each run has its own id; a worker drops a run when told to stop, and its
+// messages carry the run id, so late messages from an old run are ignored.
+const workerPool = [];
+let nextRun = 1;
+
+function poolWorkers(count) {
+    while (workerPool.length < count) workerPool.push(new Worker("js/solver-worker.js"));
+    return workerPool.slice(0, count);
+}
+
 function startWorkers(data, params) {
     const workers = workerCount();
-    return Array.from({ length: workers }, (_, k) => {
-        const worker = new Worker("js/solver-worker.js");
-        return {
-            start(onMessage) {
-                worker.onmessage = ({ data: message }) => onMessage(message);
-                worker.onerror = (event) => {
-                    // The worker script failed to load (e.g. file://).
-                    event.preventDefault();
-                    onMessage({ type: "error", message: event.message || "Worker failed", workerFailed: true });
-                };
-                worker.postMessage({ type: "run", graph: data, params, worker: k, workers });
-            },
-            stop() {
+    const run = nextRun++;
+    return poolWorkers(workers).map((worker, k) => ({
+        start(onMessage) {
+            worker.onmessage = ({ data: message }) => {
+                if (message.run === run) onMessage(message);
+            };
+            worker.onerror = (event) => {
+                // The worker script failed to load (e.g. file://): drop it.
+                event.preventDefault();
                 worker.terminate();
-            }
-        };
-    });
+                workerPool.splice(workerPool.indexOf(worker) >>> 0, 1);
+                onMessage({ type: "error", message: event.message || "Worker failed", workerFailed: true });
+            };
+            worker.postMessage({ type: "run", run, graph: data, params, worker: k, workers });
+        },
+        stop() {
+            worker.postMessage({ type: "stop" });
+        }
+    }));
+}
+
+if (typeof window !== "undefined" && typeof Worker !== "undefined") {
+    window.addEventListener("load", () => setTimeout(() => {
+        try {
+            poolWorkers(workerCount());
+        } catch {
+            // No workers here (see runSolver).
+        }
+    }, 500));
 }
 
 // The same search on the main thread, in slices that leave the page responsive.

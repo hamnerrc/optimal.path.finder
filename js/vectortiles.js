@@ -1,28 +1,34 @@
 // ==========================================================================
-// Mapbox Vector Tile decoding (just enough for road lines).
-// decodeTileLayer(buffer, layerName) returns { extent, features: [{ props,
-// lines: [[x, y, x, y, …], …] }] } for line features of one layer, in tile
-// coordinates (0…extent). Other layers are skipped without decoding.
+// Mapbox Vector Tile decoding (just enough for road lines and water).
+// decodeTileLayers(buffer, names, polygonLayers) returns, per layer name,
+// { extent, features: [{ props, lines: [[x, y, x, y, …], …] }] } for the
+// line features of that layer (for polygonLayers: the polygons' rings,
+// closed), in tile coordinates (0…extent). Other layers are skipped
+// without decoding.
 // ==========================================================================
 
-function decodeTileLayer(buffer, layerName) {
+function decodeTileLayers(buffer, names, polygonLayers = []) {
     const bytes = new Uint8Array(buffer);
     const reader = new PbfReader(bytes, 0, bytes.length);
+    const out = {};
+    for (const name of names) out[name] = { extent: 4096, features: [] };
     while (reader.more()) {
         const tag = reader.varint();
         if (tag >> 3 === 3 && (tag & 7) === 2) {
             const len = reader.varint();
-            const layer = decodeLayer(bytes, reader.pos, reader.pos + len, layerName);
+            const layer = decodeLayer(bytes, reader.pos, reader.pos + len, names, polygonLayers);
             reader.pos += len;
-            if (layer) return layer;
+            if (layer) out[layer.name] = layer;
         } else {
             reader.skip(tag & 7);
         }
     }
-    return { extent: 4096, features: [] };
+    return out;
 }
 
-function decodeLayer(bytes, start, end, wanted) {
+const decodeTileLayer = (buffer, layerName) => decodeTileLayers(buffer, [layerName])[layerName];
+
+function decodeLayer(bytes, start, end, wanted, polygonLayers) {
     const reader = new PbfReader(bytes, start, end);
     const keys = [], values = [], rawFeatures = [];
     let name = null, extent = 4096;
@@ -31,7 +37,7 @@ function decodeLayer(bytes, start, end, wanted) {
         const field = tag >> 3;
         if (field === 1) {
             name = reader.string();
-            if (name !== wanted) return null;
+            if (!wanted.includes(name)) return null;
         } else if (field === 2) {
             const len = reader.varint();
             rawFeatures.push([reader.pos, reader.pos + len]);
@@ -48,8 +54,9 @@ function decodeLayer(bytes, start, end, wanted) {
             reader.skip(tag & 7);
         }
     }
-    if (name !== wanted) return null;
+    if (!wanted.includes(name)) return null;
 
+    const polygons = polygonLayers.includes(name);
     const features = [];
     for (const [fStart, fEnd] of rawFeatures) {
         const r = new PbfReader(bytes, fStart, fEnd);
@@ -62,14 +69,16 @@ function decodeLayer(bytes, start, end, wanted) {
             else if (field === 4) geometry = r.packed();
             else r.skip(tag & 7);
         }
-        if (type !== 2 || !geometry) continue;
+        if (type !== (polygons ? 3 : 2) || !geometry) continue;
         const props = {};
         if (tags) for (let i = 0; i + 1 < tags.length; i += 2) props[keys[tags[i]]] = values[tags[i + 1]];
         features.push({ props, lines: decodeLines(geometry) });
     }
-    return { extent, features };
+    return { name, extent, features };
 }
 
+// Lines of a geometry; polygon rings come back closed (ClosePath repeats
+// the ring's first point).
 function decodeLines(geometry) {
     const lines = [];
     let x = 0, y = 0, line = null;
@@ -87,6 +96,8 @@ function decodeLines(geometry) {
                 }
                 line.push(x, y);
             }
+        } else if (command === 7 && line && line.length >= 2) {
+            line.push(line[0], line[1]);
         }
     }
     if (line && line.length >= 4) lines.push(line);
@@ -159,5 +170,5 @@ class PbfReader {
 PbfReader.decoder = new TextDecoder();
 
 if (typeof module !== "undefined") {
-    module.exports = { decodeTileLayer };
+    module.exports = { decodeTileLayer, decodeTileLayers };
 }

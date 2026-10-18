@@ -8,9 +8,13 @@
 
 const roadStore = [];   // [{ query, region, typesKey, data }], oldest first
 
+// "railway" in roadTypes stands for railroad tracks (see js/roadtiles.js).
 function buildRoadQuery(region, roadTypes) {
+    const highways = roadTypes.filter(t => t !== "railway");
+    const rail = roadTypes.includes("railway")
+        ? `way["railway"~"^(rail|narrow_gauge|preserved)$"]["tunnel"!="yes"]["service"!~"^(yard|crossover)$"]${region.overpassFilter};` : "";
     return `[out:json][timeout:${CONFIG.overpass.timeoutSeconds}];` +
-        `way["highway"~"^(${roadTypes.join("|")})$"]${region.overpassFilter};` +
+        `(way["highway"~"^(${highways.join("|")})$"]${region.overpassFilter};${rail});` +
         `out geom qt;`;
 }
 

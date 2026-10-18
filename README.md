@@ -28,8 +28,17 @@ profile follows. Loops can be saved in the browser and exported as KML (Google
 Earth, Google My Maps) or GPX (Garmin, Strava). Pressing "Find loops" again
 only recomputes start points whose pin or length changed. Road tiles are
 kept in memory, so removing a start point only hides its roads, and a new
-start point nearby loads instantly. The same search gives the same loop
-every time.
+start point nearby loads instantly. Tiles start downloading as soon as a
+pin, shape or place is set, before "Find loop" is pressed. The same search
+gives the same loop every time.
+
+**Roads to use** (in the panel, for every mode): avoid motorways,
+expressways and their ramps; allow fence hops (straight links of up to 10 m
+from a dead end to a road it doesn't connect to, never across another road,
+railroad, river or shore, and never from a driveway, bridge or tunnel); and
+use railroad tracks. Paths, trails, sidewalks and rail trails are always
+used. The loop's panel says how many fence hops it uses and how far it runs
+along railroad tracks.
 
 ## Running
 
@@ -52,8 +61,8 @@ js/config.js          Settings: road types, servers, defaults, colors
 js/geometry.js        Distance math and regions (circle, ellipse, rectangle, polygon, corridor)
 js/units.js           mi/km conversion and number formatting
 js/storage.js         Preferences and saved loops in localStorage
-js/vectortiles.js     Decodes Mapbox vector tiles (just the road layer)
-js/roadtiles.js       Loads roads from OpenFreeMap vector tiles and rebuilds junctions
+js/vectortiles.js     Decodes Mapbox vector tiles (road and water layers)
+js/roadtiles.js       Loads roads from OpenFreeMap vector tiles, rebuilds junctions, fence hops
 js/overpass.js        Downloads roads from the Overpass API (fallback if tiles fail)
 js/network.js         Turns OSM ways into a routing graph
 js/solver.js          Graph pruning, the angular sweep and block polish (see below)
@@ -81,9 +90,13 @@ asking Overpass, which runs a database query for each download.
 Tiles don't carry OSM node IDs, and simplification drops some junction points
 from straight roads, so junctions are rebuilt geometrically: roads that share
 a point, end on another road or cross it are joined there, unless one of them
-is a bridge or tunnel. Pieces of the same road cut at tile edges are snapped
-back together. In Lawrence, KS the result matches Overpass to within about
-3% of road length and junction count.
+is a bridge or tunnel. Line ends within 2.5 m of each other are joined: a
+road is often split into several features (at a bridge, or where its tags
+change), and pieces cut at tile edges come from separately simplified
+tiles, so their ends can be a metre or two apart. In Lawrence, KS the result
+matches Overpass to within about 3% of road length and junction count.
+Tiles are assembled in a fixed order, so the same search always gets the
+same network.
 
 If the tile server can't be reached, the Overpass API is used instead.
 
@@ -124,12 +137,16 @@ If the tile server can't be reached, the Overpass API is used instead.
 4. `SweepSearch` sweeps many centres (an evenly spread low-discrepancy
    sequence around the start or the area, every third sweep re-centred on
    the best loop so far), polishing each loop that comes close to the best.
-   `js/solve.js` runs one search per spare CPU core in Web Workers, each
-   taking its share of the sequence. `SearchTracker` stops them once enough
-   sweeps in a row (64 + 4 per worker, and at least half as many as it took
-   to find the best loop) have found nothing more than 0.1% better. Sweeps
-   are counted in sequence order, so the same search always gives the same
-   loop.
+   `js/solve.js` runs one search per spare CPU core in Web Workers (started
+   when the page loads and kept between searches), each taking its share of
+   the sequence. `SearchTracker` stops them once enough sweeps in a row
+   (40 + 4 per worker, and at least half as many as it took to find the
+   best loop) have found nothing more than 0.1% better. Sweeps are counted
+   in sequence order, so the same search always gives the same loop.
+
+At a virtual vertex (a road crossing another without a junction) the way
+on depends on the way in, so the sweep keeps separate states for paths
+arriving along each of the two roads.
 
 Area is computed exactly from the road geometry (shoelace formula). Coverage
 of the drawn shape is measured with scanlines.
@@ -147,14 +164,21 @@ stages:
 
 1. A rough loop on major roads only (motorway to tertiary; tertiary is
    dropped above 5,000 sq mi), from coarser tiles (at most 150).
-2. All roads within 1 km of the rough loop are loaded, and the search runs
-   again on them: around the rough loop's centre, in order along the rough
-   loop (so it can follow every bend of the real roads), and from the rough
-   loop itself traced onto the real roads and polished. The result always
-   uses the real road shapes.
+2. All roads within 1 km of the rough loop are loaded (just the tiles along
+   it), the rough loop is traced onto them, and it is improved stretch by
+   stretch (`SweepSearch.refine`): each stretch between two junctions, a
+   few km to a few dozen km long, is replaced by the best path between its
+   ends that keeps moving forward along the loop, if that makes the whole
+   loop better. A stretch that can't be improved (or rerouted at all, e.g. a
+   cloverleaf ramp that passes under its own bridge) stays as it is, so one
+   awkward spot can't block the rest of a very long loop. Every few passes
+   a sweep around the loop's centre is tried too, and the result is
+   polished block by block. The result always uses the real road shapes.
 
-A 30 mi loop in Chicago takes about 10-15 s, a 100 mi loop around Denver
-about 15-30 s, most of it downloading tiles the first time.
+From a cold start in the browser (2015 dual-core laptop): a 30 mi loop in
+Chicago and a 100 mi loop around Denver take a few seconds plus the
+download; Kansas at 75% coverage (a 1,140 mi loop, about 2,000 tiles) about
+30 s, most of it downloading.
 
 ## External services
 

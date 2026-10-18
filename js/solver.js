@@ -78,8 +78,11 @@ const SOLVER = {
     // The search ends after convergeSweeps + 4 × workers sweeps in a row
     // that improve the best loop by less than minGain (relative), and at
     // least half as many as it took to find it; see SearchTracker.
-    convergeSweeps: 64,
-    minGain: 0.001
+    convergeSweeps: 40,
+    minGain: 0.001,
+    // Improving a rough loop (SweepSearch.refine): rounds are whole passes
+    // along the loop, so far fewer are needed.
+    refineSweeps: 8
 };
 
 // --------------------------------------------------------------------------
@@ -1028,7 +1031,10 @@ function scoreLoop(metrics, objective) {
 // { score, feasible }, and the best one is returned:
 //   { edges, dirs, area, covered, length, score, feasible } or null.
 //
-// opts: { K, mu, lambda, target (polarTarget, area mode), close }
+// opts: { K, mu, lambda, target (polarTarget, area mode), close,
+//         order, period (go forward along a reference loop instead),
+//         end, endAng, theta0 (with order: the best path from s to end
+//         instead of a loop; close() gets its totals) }
 // scratch: reusable buffers (one object per search).
 function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
     // The planar map of buildFaces: a road crossing another without a
@@ -1036,24 +1042,30 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
     // on, so loops never cross themselves.
     const { V, vX: x, vY: y, vOff, vPiece, vCut, pFrom, pTo, pLen, pCross, pEdge, pCut } = g.faces;
     const TWO_PI = 2 * Math.PI;
-    const theta0 = Math.atan2(y[s] - cy, x[s] - cx);
+    const theta0 = opts.theta0 ?? Math.atan2(y[s] - cy, x[s] - cx);
+    const end = opts.end ?? -1;
     if (!scratch.ang || scratch.ang.length < V) {
         const slots = vOff[V];
         Object.assign(scratch, {
-            ang: new Float64Array(V), rank: new Int32Array(V), sel: new Int32Array(V),
+            ang: new Float64Array(V), rank: new Int32Array(V).fill(-1), sel: new Int32Array(V), selCount: 0,
             fOff: new Int32Array(V + 1), dS: new Float32Array(V + 1),
             fTo: new Int32Array(slots), fLen: new Float32Array(slots), fArea: new Float32Array(slots),
-            fCov: new Float32Array(slots), fHalf: new Int32Array(slots)
+            fCov: new Float32Array(slots), fHalf: new Int32Array(slots), fGroup: new Int8Array(slots)
         });
     }
-    const { ang, rank, fOff, dS, fTo, fLen, fArea, fCov, fHalf } = scratch;
+    const { ang, rank, fOff, dS, fTo, fLen, fArea, fCov, fHalf, fGroup } = scratch;
     const order = opts.order;
 
-    // Vertices that can be on a loop through s of this length, by angle.
-    const half = budget / 2;
+    // Vertices that can be on a loop through s of this length, by angle
+    // (a path to `end`: the vertices between s and end; opts.candidates, if
+    // given, lists all that might be, s first).
+    for (let i = 0; i < scratch.selCount; i++) rank[scratch.sel[i]] = -1;
+    const half = end >= 0 ? budget : budget / 2;
+    const candidates = opts.candidates;
+    const count = candidates ? candidates.length : V;
     const sel = [];
-    for (let v = 0; v < V; v++) {
-        rank[v] = -1;
+    for (let c = 0; c < count; c++) {
+        const v = candidates ? candidates[c] : c;
         const dx = x[v] - x[s], dy = y[v] - y[s];
         if (v !== s && dx * dx + dy * dy > half * half) continue;
         // The angle around the centre, or (opts.order) the position along a
@@ -1061,15 +1073,30 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
         let a = order ? (order[v] - order[s]) / opts.period * TWO_PI : Math.atan2(y[v] - cy, x[v] - cx) - theta0;
         a %= TWO_PI;
         if (a < 0) a += TWO_PI;
+        if (end >= 0 && v !== s && (v === end || a >= opts.endAng)) continue;
         ang[v] = v === s ? 0 : a;
         sel.push(v);
     }
-    sel.sort((a, b) => ang[a] - ang[b]);
+    sortByKey(sel, ang, V);
     const M = sel.length;
     for (let i = 0; i < M; i++) {
         rank[sel[i]] = i;
         scratch.sel[i] = sel[i];
     }
+    scratch.selCount = M;
+
+    // Piece end at vertex v made by a split: the loop must go straight on.
+    const cutEnd = (piece, v) => (pFrom[piece] === v ? pCut[piece] & 1 : pCut[piece] & 2) !== 0;
+    // Arriving at a split vertex, the way on depends on the way in: paths
+    // that arrive along different roads are kept apart (group 0: an ordinary
+    // street, 1 and 2: the two roads split there).
+    const groupAt = (piece, v) => {
+        if (!cutEnd(piece, v)) return 0;
+        for (let j = vOff[v]; j < vOff[v + 1]; j++) {
+            if (cutEnd(vPiece[j], v)) return pEdge[vPiece[j]] === pEdge[piece] ? 1 : 2;
+        }
+        return 1;
+    };
 
     // Forward pieces in rank order, with their length, swept area and
     // covered area. Rank M stands for "back at s".
@@ -1078,19 +1105,21 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
     for (let i = 0; i < M; i++) {
         fOff[i] = n;
         const v = sel[i];
-        dS[i] = Math.hypot(x[v] - x[s], y[v] - y[s]);
+        const home = end >= 0 ? end : s;
+        dS[i] = Math.hypot(x[v] - x[home], y[v] - y[home]);
         for (let j = vOff[v]; j < vOff[v + 1]; j++) {
             const p = vPiece[j];
             const forward = pFrom[p] === v;
             const w = forward ? pTo[p] : pFrom[p];
             let r = rank[w];
-            if (r < 0) continue;
-            let end = ang[w];
-            if (w === s) {
-                if (i === 0 || ang[v] < Math.PI) continue;
+            if (w === end) {
                 r = M;
-                end = TWO_PI;
-            } else if (r <= i || end - ang[v] >= Math.PI) {
+            } else if (r < 0) {
+                continue;
+            } else if (w === s) {
+                if (end >= 0 || i === 0 || ang[v] < Math.PI) continue;
+                r = M;
+            } else if (r <= i || ang[w] - ang[v] >= Math.PI) {
                 continue;
             }
             fTo[n] = r;
@@ -1099,17 +1128,24 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
             fArea[n] = ((forward ? pCross[p] : -pCross[p]) - (cx * (y[w] - y[v]) - cy * (x[w] - x[v]))) / 2;
             fCov[n] = target ? fanCover(target, x[v] - cx, y[v] - cy, x[w] - cx, y[w] - cy, theta0) : 0;
             fHalf[n] = 2 * p + (forward ? 0 : 1);
+            fGroup[n] = vCut[w] && r < M ? groupAt(p, w) : -1;
             n++;
         }
     }
     fOff[M] = n;
     dS[M] = 0;
-    // Piece end at vertex v made by a split: the loop must go straight on.
-    const cutEnd = (piece, v) => (pFrom[piece] === v ? pCut[piece] & 1 : pCut[piece] & 2) !== 0;
 
     // States: per vertex rank and length bucket, [area, covered, length].
-    const K = Math.max(8, Math.min(opts.K, Math.floor(SOLVER.maxStates / Math.max(1, M))));
-    const size = M * K;
+    // A split vertex has a row of buckets per group (see groupAt), others one.
+    const rowStart = scratch.rowStart && scratch.rowStart.length > M ? scratch.rowStart : (scratch.rowStart = new Int32Array(V + 1));
+    let rows = 0;
+    for (let i = 0; i < M; i++) {
+        rowStart[i] = rows;
+        rows += vCut[sel[i]] && i > 0 ? 3 : 1;
+    }
+    rowStart[M] = rows;
+    const K = Math.max(8, Math.min(opts.K, Math.floor(SOLVER.maxStates / Math.max(1, rows))));
+    const size = rows * K;
     if (!scratch.st || scratch.st.length < 3 * size) {
         scratch.st = new Float32Array(3 * size);
         scratch.pState = new Int32Array(size);
@@ -1125,12 +1161,13 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
     for (let i = 0; i < M; i++) {
         const e0 = fOff[i], e1 = fOff[i + 1];
         if (e0 === e1) continue;
-        const base = i * K;
         const v = scratch.sel[i];
         const split = vCut[v] !== 0;
+        // (Pruning by shorter paths is off at split vertices, so their rows
+        // don't need to be told apart here.)
         let top = -Infinity;
-        for (let k = 0; k < K; k++) {
-            const at = 3 * (base + k);
+        for (let state = rowStart[i] * K; state < rowStart[i + 1] * K; state++) {
+            const at = 3 * state;
             const a0 = st[at];
             if (a0 === -Infinity) continue;
             const c0 = st[at + 1];
@@ -1140,7 +1177,7 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
             if (w0 <= top && !split) continue;
             top = Math.max(top, w0);
             const l0 = st[at + 2];
-            const pIn = split && i > 0 ? fHalf[pSlot[base + k]] >> 1 : -1;
+            const pIn = split && i > 0 ? fHalf[pSlot[state]] >> 1 : -1;
             for (let j = e0; j < e1; j++) {
                 if (split) {
                     const pOut = fHalf[j] >> 1;
@@ -1157,20 +1194,20 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
                     const result = opts.close(a1, c1, l1);
                     if (!best || isBetterResult(result, best)) {
                         best = { area: a1, covered: c1, length: l1, score: result.score, feasible: result.feasible };
-                        bestState = base + k;
+                        bestState = state;
                         bestSlot = j;
                     }
                     continue;
                 }
                 let kk = (l1 / q) | 0;
                 if (kk >= K) kk = K - 1;
-                const idx = r * K + kk;
+                const idx = (rowStart[r] + (fGroup[j] > 0 ? fGroup[j] : 0)) * K + kk;
                 const old = st[3 * idx];
                 if (old === -Infinity || a1 + mu * c1 - lambda * l1 > old + mu * st[3 * idx + 1] - lambda * st[3 * idx + 2]) {
                     st[3 * idx] = a1;
                     st[3 * idx + 1] = c1;
                     st[3 * idx + 2] = l1;
-                    pState[idx] = base + k;
+                    pState[idx] = state;
                     pSlot[idx] = j;
                 }
             }
@@ -1194,6 +1231,22 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
         }
     }
     return { ...best, edges, dirs };
+}
+
+// Sorts vertex ids (below maxId) by key[id] (keys in [0, 2π)). Packs each key and id into
+// one number so a native numeric sort can do it, which is several times
+// faster than sorting with a comparator.
+function sortByKey(ids, key, maxId) {
+    const n = ids.length;
+    if (maxId > 2 ** 21) {
+        ids.sort((a, b) => key[a] - key[b]);
+        return;
+    }
+    const packed = new Float64Array(n);
+    const scale = 2 ** 31 / (2 * Math.PI);
+    for (let i = 0; i < n; i++) packed[i] = Math.floor(key[ids[i]] * scale) * 2 ** 21 + ids[i];
+    packed.sort();
+    for (let i = 0; i < n; i++) ids[i] = packed[i] % 2 ** 21;
 }
 
 // Target area inside the fan from the centre to the straight street from
@@ -1765,9 +1818,9 @@ class SweepSearch {
     // Sweep number i of the shared sequence.
     sweep(i) {
         const { g, isStart } = this;
-        if (this.reference && i === 0) {
-            // Improving a rough loop: start from the rough loop itself, traced
-            // on these roads and polished, in case no sweep can follow it.
+        if (this.reference && this.rounds === 0) {
+            // Improving a rough loop (every search, on its first sweep): start
+            // from the rough loop itself, traced on these roads and polished.
             const traced = traceLoop(g, this.reference);
             // (If it can't be polished, e.g. as it crosses itself on a
             // bridge, it is still a loop on the real roads.)
@@ -1777,6 +1830,12 @@ class SweepSearch {
                 cand.centroid = loopCentroid(g, cand.edges, cand.dirs);
                 this.best = cand;
             }
+        }
+        // Improving a rough loop: after the first sweep, mostly reroute the
+        // best loop stretch by stretch.
+        if (this.reference && this.best && i % 4 !== 0) {
+            this.refine(i);
+            return;
         }
         const recentre = this.best && this.rounds % SOLVER.recentreEvery === SOLVER.recentreEvery - 1;
         const [u, v, w] = r3(i);
@@ -1824,9 +1883,9 @@ class SweepSearch {
             : (area, covered, length) => scoreLoop({ length, area, coverage: covered / this.targetArea, repeats: 0 }, objective);
         // Marginal area per meter of length for a round loop of this size.
         const lambda = 0.8 * (isStart ? budget : 2 * Math.PI * this.radius) / (2 * Math.PI) * (1 + mu);
-        // Improving a rough loop: every other sweep goes in order along it
+        // Improving a rough loop: the first sweep goes in order along it
         // rather than around the centre, so it can follow its every wiggle.
-        const along = this.along && i % 2 === 1 ? this.along : null;
+        const along = this.along && i === 1 ? this.along : null;
         const swept = sweepLoop(g, s, center.x, center.y, budget,
             { K: SOLVER.lengthBuckets, mu, lambda, target, close, order: along?.order, period: along?.period }, this.scratch);
         this.evaluations++;
@@ -1850,6 +1909,143 @@ class SweepSearch {
             cand.centroid = loopCentroid(g, cand.edges, cand.dirs);
             this.best = cand;
         }
+    }
+
+    // One pass of rerouting the best loop, stretch by stretch: each stretch
+    // between two junctions (a "window", a few km to a few dozen km long)
+    // is replaced by the best path between its ends that keeps moving
+    // forward along the loop (sweepLoop with an end), if that makes the
+    // whole loop better. A stretch that can't be improved (or rerouted at
+    // all, e.g. a cloverleaf ramp under its own bridge) stays as it is, so
+    // one awkward spot can't block the rest of a very long loop.
+    refine(i) {
+        const { g, isStart, objective } = this;
+        const F = g.faces;
+        const c = this.fixedCenter || this.best.centroid;
+        const [u, v, w] = r3(i);
+        const target = isStart ? null : (this.refineTarget ||= polarTarget(this.targetXY, c.x, c.y, 0, SOLVER.coverageBins));
+        let loop = this.best;
+        const along = positionsAlong(F, loopPoints(g, loop.edges, loop.dirs), 0);
+        const weights = SOLVER.coverageWeights;
+        const mu = isStart ? 0 : weights[Math.floor(w * weights.length)];
+        const stem = loop.metrics.stem || 0;
+
+        // The loop as pieces: start vertex, piece, direction, and the index
+        // of its merged edge in loop.edges.
+        const unpack = (lp) => {
+            const verts = [], pcs = [], dirs = [], edgeAt = [];
+            lp.edges.forEach((e, k) => {
+                if (lp.dirs[k] === 1) for (let p = F.eOff[e]; p < F.eOff[e + 1]; p++) { verts.push(F.pFrom[p]); pcs.push(p); dirs.push(1); edgeAt.push(k); }
+                else for (let p = F.eOff[e + 1] - 1; p >= F.eOff[e]; p--) { verts.push(F.pTo[p]); pcs.push(p); dirs.push(-1); edgeAt.push(k); }
+            });
+            const n = pcs.length;
+            const cumL = new Float64Array(n + 1), cumA = new Float64Array(n + 1), cumC = new Float64Array(n + 1);
+            for (let k = 0; k < n; k++) {
+                const a = verts[k], b = verts[(k + 1) % n], p = pcs[k];
+                const ax = F.vX[a] - c.x, ay = F.vY[a] - c.y, bx = F.vX[b] - c.x, by = F.vY[b] - c.y;
+                cumL[k + 1] = cumL[k] + F.pLen[p];
+                cumA[k + 1] = cumA[k] + ((dirs[k] === 1 ? F.pCross[p] : -F.pCross[p]) - (c.x * (F.vY[b] - F.vY[a]) - c.y * (F.vX[b] - F.vX[a]))) / 2;
+                cumC[k + 1] = cumC[k] + (target ? fanCover(target, ax, ay, bx, by, 0) : 0);
+            }
+            return { verts, edgeAt, n, cumL, cumA, cumC };
+        };
+        let L = unpack(loop);
+        const total = () => L.cumL[L.n];
+        // Vertices by position along the loop, so a window's sweep only
+        // looks at the vertices in its stretch.
+        const byOrder = Int32Array.from({ length: F.V }, (_, k) => k);
+        sortByKey(byOrder, Float64Array.from(along.order, o => o / along.period * 2 * Math.PI * (1 - 1e-12)), F.V);
+        const sortedPos = Float64Array.from(byOrder, k => along.order[k]);
+        const firstAfter = (o) => {
+            let lo = 0, hi = F.V;
+            while (lo < hi) {
+                const mid = (lo + hi) >> 1;
+                if (sortedPos[mid] <= o) lo = mid + 1;
+                else hi = mid;
+            }
+            return lo;
+        };
+        const between = (sV, eV) => {
+            const a = firstAfter(along.order[sV]), b = firstAfter(along.order[eV]);
+            const out = [sV];
+            if (a <= b) for (let k = a; k < b; k++) out.push(byOrder[k]);
+            else {
+                for (let k = a; k < F.V; k++) out.push(byOrder[k]);
+                for (let k = 0; k < b; k++) out.push(byOrder[k]);
+            }
+            return out;
+        };
+        // Window length: 3-25 km, at most a third of the loop.
+        const W = Math.min(3000 * 8 ** u, total() / 3);
+        const isEnd = (vtx) => vtx < g.N && !F.vCut[vtx] && !(isStart && vtx === loop.s);
+        const sum = (arr, a, b) => b >= a ? arr[b] - arr[a] : arr[L.n] - arr[a] + arr[b];
+
+        let pos = v * W;
+        const stop = pos + total();
+        while (pos < stop) {
+            // Window ends: the first junctions at or after pos and pos + W.
+            const n = L.n;
+            const find = (from) => {
+                const at = ((from % total()) + total()) % total();
+                let k = 0;
+                while (k < n && L.cumL[k] < at) k++;
+                for (let t = 0; t < n; t++) if (isEnd(L.verts[(k + t) % n])) return (k + t) % n;
+                return -1;
+            };
+            const a = find(pos);
+            if (a < 0) break;
+            const b = find(L.cumL[a] + W);
+            if (b < 0 || b === a) break;
+            const winLen = sum(L.cumL, a, b);
+            pos += Math.max(W / 2, 1);
+            // The join to the start must stay on the loop (start mode).
+            if (isStart && (b - a + n) % n > (L.verts.indexOf(loop.s) - a + n) % n) continue;
+
+            const restL = total() - winLen, restA = L.cumA[n] - sum(L.cumA, a, b), restC = L.cumC[n] - sum(L.cumC, a, b);
+            const sV = L.verts[a], eV = L.verts[b];
+            const startAng = along.order[sV];
+            const endAng = ((along.order[eV] - startAng) / along.period * 2 * Math.PI + 2 * Math.PI) % (2 * Math.PI);
+            // Paths up to 3× the stretch, but no longer than the length left
+            // (unless the loop is already too long: then as long as the
+            // stretch, so that shorter ways round can win).
+            const room = isStart ? objective.maxLengthM - 2 * stem - restL : this.budget - restL;
+            const budget = Math.min(Math.max(room, winLen), 3 * winLen + 2000);
+            if (!(budget > 0) || !(endAng > 0)) continue;
+            const area = L.cumA[n], length = total();
+            const lambda = (isStart ? 0.8 * length / (2 * Math.PI) : 2 * area / length) * (0.6 + 0.8 * w);
+            const close = isStart
+                ? (pa, pc, pl) => scoreLoop({ length: pl + restL + 2 * stem, area: pa + restA, repeats: 0 }, objective)
+                : (pa, pc, pl) => scoreLoop({ length: pl + restL, area: pa + restA, coverage: (pc + restC) / this.targetArea, repeats: 0 }, objective);
+            const path = sweepLoop(g, sV, c.x, c.y, budget,
+                { K: 24, mu, lambda: lambda * (1 + mu), target, close, order: along.order, period: along.period, end: eV, endAng, theta0: 0, candidates: between(sV, eV) }, this.scratch);
+            this.evaluations++;
+            if (!path) continue;
+            const cand = this.candidate({
+                edges: [], dirs: [], length: path.length + restL, area: path.area + restA, covered: path.covered + restC
+            }, loop.s, stem, c);
+            if (!isBetterResult(cand, loop) || cand.score <= loop.score * (1 + 1e-9)) continue;
+            // Splice: the path, then the loop from b on round to a.
+            const ea = L.edgeAt[a], eb = L.edgeAt[b];
+            const edges = path.edges.slice(), dirs = path.dirs.slice();
+            for (let k = eb; k !== ea; k = (k + 1) % loop.edges.length) {
+                edges.push(loop.edges[k]);
+                dirs.push(loop.dirs[k]);
+            }
+            cand.edges = edges;
+            cand.dirs = dirs;
+            if (isStart) cand.s = loop.s;
+            loop = cand;
+            L = unpack(loop);
+        }
+        if (loop === this.best) return;
+        // Polish the result block by block (if it doesn't cross itself).
+        const polished = this.polishLoop({ edges: loop.edges, dirs: loop.dirs });
+        if (polished) {
+            const next = this.candidate(polished, isStart ? polished.join : loop.s, polished.stem, c);
+            if (isBetterResult(next, loop)) loop = next;
+        }
+        loop.centroid = loopCentroid(g, loop.edges, loop.dirs);
+        if (isBetterResult(loop, this.best)) this.best = loop;
     }
 
     candidate(loop, s, stem, center) {
@@ -1994,10 +2190,13 @@ function traceLoop(g, ring) {
     };
 
     // Walk the stops, keeping a stack of (junction, edge in); coming back to
-    // a junction already on the stack cuts out everything since.
-    const nodes = [stops[0]], edges = [];
+    // a junction already on the stack cuts out everything since (a detour
+    // out and back). Near the end, coming back to a junction from the first
+    // half closes the ring there instead, and the start of the stack before
+    // it is dropped.
+    let nodes = [stops[0]], edges = [];
     const onStack = new Map([[stops[0], 0]]);
-    for (let i = 0; i < stops.length; i++) {
+    walk: for (let i = 0; i < stops.length; i++) {
         const to = stops[(i + 1) % stops.length];
         const path = route(nodes[nodes.length - 1], to);
         if (!path) return null;
@@ -2006,10 +2205,11 @@ function traceLoop(g, ring) {
             const v = eFrom[e] === u ? eTo[e] : eFrom[e];
             if (onStack.has(v)) {
                 const j = onStack.get(v);
-                // Closing the whole ring: done once we're back at the start.
-                if (j === 0 && i === stops.length - 1) {
+                if ((j === 0 && i === stops.length - 1) || (i >= 0.9 * stops.length && j < nodes.length / 2)) {
                     edges.push(e);
-                    break;
+                    nodes = nodes.slice(j);
+                    edges = edges.slice(j);
+                    break walk;
                 }
                 while (nodes.length - 1 > j) {
                     onStack.delete(nodes.pop());
@@ -2036,11 +2236,11 @@ function traceLoop(g, ring) {
 }
 
 // Each vertex's position along a reference loop (a ring of points): the
-// distance along it to the nearest point, measured on a smoothed copy so
-// that positions change gradually around its corners.
-function positionsAlong(faces, ring) {
+// distance along it to the nearest point, measured on a copy smoothed
+// `smooth` times so that positions change gradually around its corners.
+function positionsAlong(faces, ring, smooth = 3) {
     let pts = ring;
-    for (let pass = 0; pass < 3; pass++) {
+    for (let pass = 0; pass < smooth; pass++) {
         // Chaikin corner cutting.
         const next = [];
         for (let i = 0; i < pts.length; i++) {
@@ -2115,6 +2315,18 @@ function outlinePoint(outline, from, phi, scale) {
     return { x: from.x + dx * far * scale, y: from.y + dy * far * scale };
 }
 
+// The vertices of a loop of merged edges in order, with every split along
+// its roads (so the points follow the roads closely).
+function loopPoints(g, edges, dirs) {
+    const { vX, vY, pFrom, pTo, eOff } = g.faces;
+    const pts = [];
+    edges.forEach((e, i) => {
+        if (dirs[i] === 1) for (let p = eOff[e]; p < eOff[e + 1]; p++) pts.push({ x: vX[pFrom[p]], y: vY[pFrom[p]] });
+        else for (let p = eOff[e + 1] - 1; p >= eOff[e]; p--) pts.push({ x: vX[pTo[p]], y: vY[pTo[p]] });
+    });
+    return pts;
+}
+
 function loopCentroid(g, edges, dirs) {
     return polygonCentroidXY(edges.map((e, i) => {
         const n = dirs[i] === 1 ? g.eFrom[e] : g.eTo[e];
@@ -2129,8 +2341,8 @@ function loopCentroid(g, edges, dirs) {
 // sequence order, whichever search finishes first, so the same search
 // always ends at the same sweep with the same loop.
 class SearchTracker {
-    constructor(workers) {
-        this.minStale = SOLVER.convergeSweeps + 4 * workers;
+    constructor(workers, refining = false) {
+        this.minStale = refining ? SOLVER.refineSweeps + 2 * workers : SOLVER.convergeSweeps + 4 * workers;
         this.needed = this.minStale;
         this.stale = 0;
         this.rounds = 0;
@@ -2226,7 +2438,10 @@ function expandLoop(prep, res, params, exact) {
     }
 
     const coords = [];
+    let hops = 0, railM = 0;
     for (const [e, dir] of ordered) {
+        if (prep.source[e].highway === "hop") hops++;
+        else if (prep.source[e].highway === "railway") railM += prep.source[e].distance;
         const geometry = prep.source[e].coords;
         const line = dir === 1 ? geometry : [...geometry].reverse();
         for (let k = coords.length ? 1 : 0; k < line.length; k++) coords.push(line[k]);
@@ -2241,6 +2456,8 @@ function expandLoop(prep, res, params, exact) {
         iq: 4 * Math.PI * m.area / m.length ** 2,
         repeats: m.repeats,
         stemM,
+        hops,                         // fence hops used
+        railM,                        // length along railroad tracks
         score: res.score,
         feasible: res.feasible,
         center: res.center,
