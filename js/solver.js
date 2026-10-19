@@ -85,16 +85,21 @@ const SOLVER = {
     refineSweeps: 8,
     // What the search adds to a road's cost on top of its length (the
     // loop's real length and area are still what's shown): this many
-    // meters per meter of climb along it, and with "prefer smaller roads"
-    // this share of the length of big roads and railroad tracks. In area
+    // meters per meter of climb along it with "prefer flatter loops", and
+    // with "prefer smaller roads" this share of the length of big roads and
+    // railroad tracks. In area
     // mode the cost counts as extra length (so as less roundness); in start
     // mode as lost area, as much as one more meter of loop would enclose,
     // so a loop in the hills isn't made shorter than the limit.
-    climbCost: 2,
+    climbCost: 3,
     bigRoadCost: {
         motorway: 0.08, motorway_link: 0.08, trunk: 0.08, trunk_link: 0.08, railway: 0.08,
         primary: 0.03, primary_link: 0.03
     },
+    // "Avoid motorways" in the rough stage of a big search (see
+    // searchStaged): motorways and trunk roads count as this much longer.
+    avoidedRoadCost: 0.5,
+    avoidedRoads: ["motorway", "motorway_link", "trunk", "trunk_link"],
     // Private stretches shorter than this aren't flagged (expandLoop).
     minPrivateM: 50
 };
@@ -121,6 +126,8 @@ const SOLVER = {
 //                               faces.pPen per piece. In area mode the
 //                               extra cost is part of eLen and pLen.
 // params.preferSmall: count big roads as a little longer (bigRoadCost).
+// params.preferFlat: count the climb along roads as extra length (climbCost).
+// params.avoidMotorways: count motorways as much longer (avoidedRoadCost).
 // The rest (chains of original edges, stem paths) stays on the main thread
 // to turn results back into road geometry (expandLoop).
 function prepareGraph(network, params) {
@@ -163,8 +170,9 @@ function prepareGraph(network, params) {
         oFrom[e] = index.get(edge.from);
         oTo[e] = index.get(edge.to);
         oLen[e] = edge.distance;
-        oExtra[e] = SOLVER.climbCost * (edge.climb || 0) +
-            (params.preferSmall ? (SOLVER.bigRoadCost[edge.highway] || 0) * edge.distance : 0);
+        oExtra[e] = (params.preferFlat ? SOLVER.climbCost * (edge.climb || 0) : 0) +
+            (params.preferSmall ? (SOLVER.bigRoadCost[edge.highway] || 0) * edge.distance : 0) +
+            (params.avoidMotorways && SOLVER.avoidedRoads.includes(edge.highway) ? SOLVER.avoidedRoadCost * edge.distance : 0);
         let cross = 0;
         for (let i = 1; i < edge.coords.length; i++) {
             const [aLat, aLng] = edge.coords[i - 1];
@@ -2697,15 +2705,18 @@ function expandLoop(prep, res, params, exact) {
         stemM = res.metrics.stem;
     }
 
-    // Stretches to check before running: fence hops, railroad tracks and
-    // roads marked private (each a run of road geometry).
+    // Stretches to check before running: fence hops, railroad tracks,
+    // motorways (usually closed to people on foot or bike) and roads marked
+    // private (each a run of road geometry).
     const coords = [], flags = [];
-    let hops = 0, railM = 0, privateM = 0;
+    let hops = 0, railM = 0, motorwayM = 0, privateM = 0;
     for (const [e, dir] of ordered) {
         const edge = prep.source[e];
-        const kind = edge.highway === "hop" ? "hop" : edge.highway === "railway" ? "rail" : edge.restricted ? "private" : null;
+        const kind = edge.highway === "hop" ? "hop" : edge.highway === "railway" ? "rail"
+            : edge.highway === "motorway" || edge.highway === "motorway_link" ? "motorway" : edge.restricted ? "private" : null;
         if (kind === "hop") hops++;
         else if (kind === "rail") railM += edge.distance;
+        else if (kind === "motorway") motorwayM += edge.distance;
         else if (kind === "private") privateM += edge.distance;
         const line = dir === 1 ? edge.coords : [...edge.coords].reverse();
         if (kind) {
@@ -2745,8 +2756,9 @@ function expandLoop(prep, res, params, exact) {
         stemM,
         hops,                         // fence hops used
         railM,                        // length along railroad tracks
+        motorwayM,                    // length on motorways
         privateM,                     // length on roads marked private
-        flags: kept,                  // [{ kind: "hop" | "rail" | "private", coords }]
+        flags: kept,                  // [{ kind: "hop" | "rail" | "motorway" | "private", coords }]
         score: res.score,
         feasible: res.feasible,
         center: res.center,

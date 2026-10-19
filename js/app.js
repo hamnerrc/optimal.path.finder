@@ -61,6 +61,7 @@ const ui = {
     hopsInput: $("hopsInput"),
     railwaysInput: $("railwaysInput"),
     preferSmallInput: $("preferSmallInput"),
+    preferFlatInput: $("preferFlatInput"),
 
     routesSection: $("routesSection"),
     routeList: $("routeList"),
@@ -130,14 +131,15 @@ const prefs = {
     paceFormat: PACE_FORMATS[storedPrefs.paceFormat] ? storedPrefs.paceFormat : (storedPrefs.units === "km" ? "min/km" : "min/mi"),
     speedMps: storedPrefs.speedMps > 0 ? storedPrefs.speedMps : METERS_PER_MILE / CONFIG.defaultPaceSecPerMile,
     // Road options (see roadTypesFor and solverParams in js/pipeline.js).
-    // Fence hops, railroad tracks and preferring smaller roads are on by
-    // default (loops that use hops or tracks say so); the choices stored
+    // Fence hops, railroad tracks and preferring smaller roads and flatter
+    // loops are on by default (loops that use hops or tracks say so); the choices stored
     // before that default (roadsVersion 2) are not kept.
     roads: {
         noMotorways: storedPrefs.roads?.noMotorways === true,
         hops: storedPrefs.roadsVersion === 2 ? storedPrefs.roads?.hops !== false : true,
         railways: storedPrefs.roadsVersion === 2 ? storedPrefs.roads?.railways !== false : true,
-        preferSmall: storedPrefs.roads?.preferSmall !== false
+        preferSmall: storedPrefs.roads?.preferSmall !== false,
+        preferFlat: storedPrefs.roads?.preferFlat !== false
     },
     roadsVersion: 2
 };
@@ -374,7 +376,10 @@ function addStart(latlng) {
             entry.latlng = e.target.getLatLng();
             updateRegionLayer(entry.circle, startRegion(entry));
         })
-        .on("dragend", () => renderStartList())
+        .on("dragend", () => {
+            renderStartList();
+            render();
+        })
         .on("click", () => setActiveStart(entry.id))
         .addTo(layers.starts);
 
@@ -445,6 +450,7 @@ function renderStartList() {
             if (!(value > 0)) return;
             entry.maxDistanceM = fromDistanceUnit(value);
             updateRegionLayer(entry.circle, startRegion(entry));
+            render();
         });
 
         row.querySelector("button").addEventListener("click", (e) => {
@@ -574,7 +580,7 @@ ui.deleteShapeButton.addEventListener("click", deleteShape);
 ui.cancelEditButton.addEventListener("click", cancelEditing);
 ui.doneEditButton.addEventListener("click", finishEditing);
 
-const ROAD_OPTION_INPUTS = { noMotorways: ui.noMotorwaysInput, hops: ui.hopsInput, railways: ui.railwaysInput, preferSmall: ui.preferSmallInput };
+const ROAD_OPTION_INPUTS = { noMotorways: ui.noMotorwaysInput, hops: ui.hopsInput, railways: ui.railwaysInput, preferSmall: ui.preferSmallInput, preferFlat: ui.preferFlatInput };
 const showRoadOptionsCount = () => {
     const on = Object.values(prefs.roads).filter(Boolean).length;
     ui.roadOptionsCount.textContent = `${on} on`;
@@ -893,15 +899,17 @@ function routeNote(result) {
 // What a loop uses that should be checked before running it (marked in
 // orange on the map).
 function flagWarning(flags) {
-    let hops = 0, railM = 0, privateM = 0;
+    let hops = 0, railM = 0, motorwayM = 0, privateM = 0;
     for (const { kind, coords } of flags) {
         if (kind === "hop") hops += coords.length - 1;
         else if (kind === "rail") railM += lineLength(coords);
+        else if (kind === "motorway") motorwayM += lineLength(coords);
         else privateM += lineLength(coords);
     }
     const notes = [];
     if (hops > 0) notes.push(`It uses ${hops} fence hop${hops > 1 ? "s" : ""} (a gap under 10 m between roads that don't connect): check ${hops > 1 ? "they" : "it"} can be crossed.`);
     if (railM > 0) notes.push(`${formatDistance(railM)} of it runs along railroad tracks: only run there where it's allowed.`);
+    if (motorwayM > 0) notes.push(`${formatDistance(motorwayM)} of it is on motorways, which are usually closed to people on foot or bike. "Avoid motorways" under Roads to use leaves them out.`);
     if (privateM > 0) notes.push(`${formatDistance(privateM)} of it is on roads or paths marked private or no entry: check you may use them.`);
     return notes.join(" ");
 }
@@ -1043,7 +1051,7 @@ function drawRouteDecor() {
     }
     // Stretches to check (see flagWarning); a hop is too short to see from
     // afar, so it also gets a dot.
-    const flagNames = { hop: "Fence hop", rail: "Railroad tracks", private: "Marked private or no entry" };
+    const flagNames = { hop: "Fence hop", rail: "Railroad tracks", motorway: "Motorway", private: "Marked private or no entry" };
     for (const { kind, coords } of route.flags || []) {
         L.polyline(coords, { color: CONFIG.colors.flag, weight: 7, opacity: 0.85, lineCap: "butt" })
             .bindTooltip(flagNames[kind]).addTo(arrowsLayer);

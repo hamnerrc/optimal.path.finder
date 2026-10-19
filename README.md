@@ -36,15 +36,17 @@ gives the same loop every time.
 expressways and their ramps (off by default); allow fence hops (straight
 links of up to 10 m from a dead end to a road it doesn't connect to, never
 across another road, railroad, river or shore, and never from a driveway,
-bridge or tunnel; on by default); use railroad tracks (on by default); and prefer smaller roads (on by
-default): while searching, motorways, trunk roads and railroad tracks count
-as 8% longer and primary roads as 3%, so a road right beside them is taken
-when it's about as good, but they are still used where they are clearly
-better.
+bridge or tunnel; on by default); use railroad tracks (on by default);
+prefer smaller roads (on by default): while searching, motorways, trunk
+roads and railroad tracks count as 8% longer and primary roads as 3%, so a
+road right beside them is taken when it's about as good, but they are still
+used where they are clearly better; and prefer flatter loops (on by
+default): each meter of climb counts as 3 m of extra length while
+searching.
 Paths, trails, sidewalks and rail trails are always used, and so are roads
 and paths marked private or no entry. A loop that uses fence hops, railroad
-tracks or private roads says so in a warning and marks those stretches in
-orange on the map, so they can be checked before running.
+tracks, motorways or private roads says so in a warning and marks those
+stretches in orange on the map, so they can be checked before running.
 
 ## Running
 
@@ -163,16 +165,16 @@ arriving along each of the two roads.
 Area is computed exactly from the road geometry (shoelace formula). Coverage
 of the drawn shape is measured with scanlines.
 
-**Climb.** Before searching, every road gets its climb from terrain tiles
-(`addRoadClimb` in `js/elevation.js`; at most 64 tiles, zoom 13 or
-coarser), and the search counts each meter of climb as 2 m of extra length
-(`SOLVER.climbCost`), so of two loops that are about as good, the flatter
-one wins, while a much bigger or rounder loop still wins over a hill. With
-"prefer smaller roads", big roads get their extra length the same way. In
-area mode the extra length lowers roundness; in start point mode it counts
-as the area one more meter of loop would enclose, so a loop in the hills
-still uses its whole length. The length, area and roundness shown are
-always the real ones.
+**Climb.** With "prefer flatter loops", every road first gets its climb
+from terrain tiles (`addRoadClimb` in `js/elevation.js`; at most 64 tiles,
+zoom 13 or coarser), and the search counts each meter of climb as 3 m of
+extra length (`SOLVER.climbCost`), so of two loops that are about as good,
+the flatter one wins, while a much bigger or rounder loop still wins over a
+hill. With "prefer smaller roads", big roads get their extra length the
+same way. In area mode the extra length lowers roundness; in start point
+mode it counts as the area one more meter of loop would enclose, so a loop
+in the hills still uses its whole length. The length, area and roundness
+shown are always the real ones.
 
 In area mode, roads are loaded 20% beyond the shape (`CONFIG.areaMargins`):
 its convex hull and its north-south bounding box, both enlarged by 20%, so

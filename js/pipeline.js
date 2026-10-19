@@ -9,8 +9,9 @@
 //      the rough loop's centre that improves it with them; then again in
 //      a corridor along the improved loop, while that still helps.
 //
-// Every road gets its climb from terrain tiles first (addRoadClimb), which
-// the search counts as extra length (see SOLVER.climbCost).
+// With "prefer flatter loops", every road gets its climb from terrain tiles
+// first (addRoadClimb), which the search counts as extra length (see
+// SOLVER.climbCost).
 //
 // Area searches load roads a little beyond the area (CONFIG.areaMargins);
 // if the coverage target can't be met with those, the margin is widened and
@@ -27,7 +28,7 @@
 //            | { mode: "area", target: [{lat,lng}], coverage }
 //   region     full-detail road region
 //   target     area mode: the area's region (for wider margins)
-//   roads      road options: { noMotorways, hops, railways, preferSmall } (see
+//   roads      road options: { noMotorways, hops, railways, preferSmall, preferFlat } (see
 //              roadTypesFor and solverParams)
 // options: { signal, onStatus(text, fraction), onLoop(loop, final), onNetwork(network) }
 // Resolves with the final loop: { coords, lengthM, areaM2, iq, coverage, feasible, score, chunked }.
@@ -79,7 +80,7 @@ async function searchFullDetail(job, { signal, onStatus, onLoop, onNetwork }, ma
     const network = buildRoadNetwork(osm, job.region);
     if (network.edges.length === 0) throw new Error("No roads found here.");
     onNetwork(network);
-    await loadClimb(network, signal, onStatus, 0);
+    await loadClimb(network, job.roads, signal, onStatus, 0);
 
     onStatus("Searching…", 0);
     await nextFrame();
@@ -98,19 +99,24 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
     const settings = CONFIG.chunked;
 
     // Stage 1: rough loop on major roads ------------------------------------
+    // With "avoid motorways" the rough loop may still use motorways and
+    // trunk roads, counted as much longer (without them, major roads can be
+    // too few to make a loop: most of Kansas's US highways are trunk roads).
+    // It only sets the shape: the loop on all roads leaves them out.
     const coarseRegion = objective.mode === "start"
         ? createCircleRegion(objective.start, objective.maxLengthM * settings.startRadiusFraction)
         : job.region;
-    const osm = await loadMajorRoads(coarseRegion, job.roads, signal, (done, total) =>
+    const avoidMotorways = Boolean(job.roads?.noMotorways);
+    const osm = await loadMajorRoads(coarseRegion, { ...job.roads, noMotorways: false }, signal, (done, total) =>
         onStatus(`Large area: loading major roads (${done} of ${total})…`, 0));
     onStatus("Building major road network…", 0);
     await nextFrame();
     const coarse = buildRoadNetwork(osm, coarseRegion);
     if (coarse.edges.length === 0) throw new Error("No major roads found here.");
     onNetwork(coarse);
-    await loadClimb(coarse, signal, onStatus, 0);
+    await loadClimb(coarse, job.roads, signal, onStatus, 0);
 
-    const rough = { ...await runSolver(coarse, solverParams(job), {
+    const rough = { ...await runSolver(coarse, { ...solverParams(job), avoidMotorways }, {
         signal,
         onProgress: ({ fraction, rounds, best }) => {
             if (best) onLoop({ ...best, chunked: true }, false);
@@ -136,7 +142,7 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
                 onStatus(`Loading all roads along ${what} (${done} of ${total} tiles)…`, share(0))), corridor);
             if (local.edges.length === 0) break;
             onNetwork(local);
-            await loadClimb(local, signal, onStatus, share(0));
+            await loadClimb(local, job.roads, signal, onStatus, share(0));
             await nextFrame();
             const reference = simplifyLine(loopPart(best), 400);
             fine = { ...await runSolver(local, { ...solverParams(job), center: best.center, anchor: best.anchor, reference }, {
@@ -239,15 +245,16 @@ function loopPart(loop) {
 
 // Solver params for a job.
 function solverParams({ objective, roads }) {
-    const preferSmall = Boolean(roads?.preferSmall);
+    const prefer = { preferSmall: Boolean(roads?.preferSmall), preferFlat: Boolean(roads?.preferFlat) };
     return objective.mode === "start"
-        ? { mode: "start", start: objective.start, maxLengthM: objective.maxLengthM, preferSmall }
-        : { mode: "area", target: objective.target, coverage: objective.coverage, preferSmall };
+        ? { mode: "start", start: objective.start, maxLengthM: objective.maxLengthM, ...prefer }
+        : { mode: "area", target: objective.target, coverage: objective.coverage, ...prefer };
 }
 
-// The climb along every road (for the search), from terrain tiles. Without
-// them, the search goes on without it.
-async function loadClimb(network, signal, onStatus, fraction) {
+// The climb along every road (for "prefer flatter loops"), from terrain
+// tiles. Without them, the search goes on without it.
+async function loadClimb(network, roads, signal, onStatus, fraction) {
+    if (!roads?.preferFlat) return;
     onStatus("Reading the climb along the roads…", fraction);
     const t0 = Date.now();
     await addRoadClimb(network, signal);
