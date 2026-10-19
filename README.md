@@ -36,7 +36,11 @@ gives the same loop every time.
 expressways and their ramps (off by default); allow fence hops (straight
 links of up to 10 m from a dead end to a road it doesn't connect to, never
 across another road, railroad, river or shore, and never from a driveway,
-bridge or tunnel; on by default); and use railroad tracks (on by default).
+bridge or tunnel; on by default); use railroad tracks (on by default); and prefer smaller roads (on by
+default): while searching, motorways, trunk roads and railroad tracks count
+as 8% longer and primary roads as 3%, so a road right beside them is taken
+when it's about as good, but they are still used where they are clearly
+better.
 Paths, trails, sidewalks and rail trails are always used, and so are roads
 and paths marked private or no entry. A loop that uses fence hops, railroad
 tracks or private roads says so in a warning and marks those stretches in
@@ -159,11 +163,23 @@ arriving along each of the two roads.
 Area is computed exactly from the road geometry (shoelace formula). Coverage
 of the drawn shape is measured with scanlines.
 
-In area mode, roads are loaded 5% beyond the shape (`CONFIG.areaMargins`):
-its convex hull and its north-south bounding box, both enlarged by 5%, so
-the loop can use roads just outside its edge, including the corners of a
-square of grid streets around a round area. If that can't reach the
-coverage target, the search is repeated with 20% and then 40%.
+**Climb.** Before searching, every road gets its climb from terrain tiles
+(`addRoadClimb` in `js/elevation.js`; at most 64 tiles, zoom 13 or
+coarser), and the search counts each meter of climb as 2 m of extra length
+(`SOLVER.climbCost`), so of two loops that are about as good, the flatter
+one wins, while a much bigger or rounder loop still wins over a hill. With
+"prefer smaller roads", big roads get their extra length the same way. In
+area mode the extra length lowers roundness; in start point mode it counts
+as the area one more meter of loop would enclose, so a loop in the hills
+still uses its whole length. The length, area and roundness shown are
+always the real ones.
+
+In area mode, roads are loaded 20% beyond the shape (`CONFIG.areaMargins`):
+its convex hull and its north-south bounding box, both enlarged by 20%, so
+the loop can use roads outside its edge, including the corners of a
+square of grid streets around a round area. A wider margin often gives a
+much rounder loop. If the coverage target still can't be reached, the
+search is repeated with 40%.
 
 ### Big searches
 
@@ -185,10 +201,14 @@ that, `js/pipeline.js` searches in two stages:
    awkward spot can't block the rest of a very long loop. Every few passes
    a sweep around the loop's centre is tried too, and the result is
    polished block by block. The result always uses the real road shapes.
+3. The same again in a corridor along the improved loop, so each side can
+   move further (up to three passes, until a pass gains less than 0.5%).
 
 A 30 mi loop in Chicago and a 100 mi loop around Denver take a few seconds
-plus the download. Kansas (a 1,000 mi loop) downloads about 14,000 tiles
-along the rough loop and takes about a minute on a 2015 dual-core laptop.
+plus the download. Kansas (a 1,000 mi loop) downloads about 17,700 tiles
+along the rough loop (about 2 minutes in Chrome on a 2015 dual-core
+laptop, which manages about 220 tile requests a second) and then searches
+for about 50 seconds, second pass included.
 
 ## External services
 

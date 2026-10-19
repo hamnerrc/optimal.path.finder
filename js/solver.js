@@ -82,7 +82,21 @@ const SOLVER = {
     minGain: 0.001,
     // Improving a rough loop (SweepSearch.refine): rounds are whole passes
     // along the loop, so far fewer are needed.
-    refineSweeps: 8
+    refineSweeps: 8,
+    // What the search adds to a road's cost on top of its length (the
+    // loop's real length and area are still what's shown): this many
+    // meters per meter of climb along it, and with "prefer smaller roads"
+    // this share of the length of big roads and railroad tracks. In area
+    // mode the cost counts as extra length (so as less roundness); in start
+    // mode as lost area, as much as one more meter of loop would enclose,
+    // so a loop in the hills isn't made shorter than the limit.
+    climbCost: 2,
+    bigRoadCost: {
+        motorway: 0.08, motorway_link: 0.08, trunk: 0.08, trunk_link: 0.08, railway: 0.08,
+        primary: 0.03, primary_link: 0.03
+    },
+    // Private stretches shorter than this aren't flagged (expandLoop).
+    minPrivateM: 50
 };
 
 // --------------------------------------------------------------------------
@@ -102,6 +116,11 @@ const SOLVER = {
 //   lat0, lng0, kx, ky          the projection
 //   startX, startY              start mode: the start node
 //   faces                       the planar map and its faces (buildFaces)
+//   ePen                        start mode: area lost to each merged edge's
+//                               extra cost (see SOLVER.climbCost); also
+//                               faces.pPen per piece. In area mode the
+//                               extra cost is part of eLen and pLen.
+// params.preferSmall: count big roads as a little longer (bigRoadCost).
 // The rest (chains of original edges, stem paths) stays on the main thread
 // to turn results back into road geometry (expandLoop).
 function prepareGraph(network, params) {
@@ -139,10 +158,13 @@ function prepareGraph(network, params) {
     const oTo = new Int32Array(E0);
     const oLen = new Float64Array(E0);
     const oCross = new Float64Array(E0);
+    const oExtra = new Float64Array(E0);   // extra cost, in meters
     source.forEach((edge, e) => {
         oFrom[e] = index.get(edge.from);
         oTo[e] = index.get(edge.to);
         oLen[e] = edge.distance;
+        oExtra[e] = SOLVER.climbCost * (edge.climb || 0) +
+            (params.preferSmall ? (SOLVER.bigRoadCost[edge.highway] || 0) * edge.distance : 0);
         let cross = 0;
         for (let i = 1; i < edge.coords.length; i++) {
             const [aLat, aLng] = edge.coords[i - 1];
@@ -258,6 +280,7 @@ function prepareGraph(network, params) {
     const eTo = new Int32Array(E);
     const eLen = new Float64Array(E);
     const eCross = new Float64Array(E);
+    const eExtra = new Float64Array(E);
     const chainOff = new Int32Array(E + 1);
     chains.forEach((chain, e) => {
         chainOff[e + 1] = chainOff[e] + chain.edges.length;
@@ -273,6 +296,7 @@ function prepareGraph(network, params) {
             chainEdge[chainOff[e] + k] = oe;
             chainDir[chainOff[e] + k] = dir;
             eLen[e] += oLen[oe];
+            eExtra[e] += oExtra[oe];
             eCross[e] += dir * oCross[oe];
             at = other(oe, at);
         });
@@ -301,14 +325,25 @@ function prepareGraph(network, params) {
         return pts;
     });
     const targetXY = params.mode === "area" ? params.target.map(p => project(p.lat, p.lng)) : null;
+    // Extra cost (SOLVER.climbCost): area mode, as length.
+    const realLen = eLen.slice();
+    if (params.mode === "area") for (let e = 0; e < E; e++) eLen[e] += eExtra[e];
 
     const data = {
         N: M, E, x, y, eFrom, eTo, eLen, eCross,
         adjOff: adjacency.adjOff, adjEdge: adjacency.adjEdge,
-        nStem: null,
+        nStem: null, ePen: null,
         lat0, lng0, kx, ky,
         faces: buildFaces(M, eFrom, eTo, eLen, lines, targetXY)
     };
+    if (params.mode === "start") {
+        // Start mode, as area: each meter costs what one more meter of a
+        // round loop of the length limit would enclose.
+        const perMeter = 0.8 * params.maxLengthM / (2 * Math.PI);
+        const { P, pEdge, pLen } = data.faces;
+        data.ePen = Float64Array.from(eExtra, extra => perMeter * extra);
+        data.faces.pPen = Float64Array.from({ length: P }, (_, p) => realLen[pEdge[p]] > 0 ? data.ePen[pEdge[p]] * pLen[p] / realLen[pEdge[p]] : 0);
+    }
     const prepared = {
         data, network, source, oFrom, oTo, chainOff, chainEdge, chainDir, cOrig, project, unproject,
         stats: { nodes: N, junctions: M, edges: E }
@@ -1146,7 +1181,7 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
     // The planar map of buildFaces: a road crossing another without a
     // junction meets it at a vertex the loop can pass only once, straight
     // on, so loops never cross themselves.
-    const { V, vX: x, vY: y, vOff, vPiece, vCut, pFrom, pTo, pLen, pCross, pEdge, pCut } = g.faces;
+    const { V, vX: x, vY: y, vOff, vPiece, vCut, pFrom, pTo, pLen, pCross, pEdge, pCut, pPen } = g.faces;
     const TWO_PI = 2 * Math.PI;
     const theta0 = opts.theta0 ?? Math.atan2(y[s] - cy, x[s] - cx);
     const end = opts.end ?? -1;
@@ -1231,7 +1266,8 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
             fTo[n] = r;
             fLen[n] = pLen[p];
             // Shoelace sum relative to the centre.
-            fArea[n] = ((forward ? pCross[p] : -pCross[p]) - (cx * (y[w] - y[v]) - cy * (x[w] - x[v]))) / 2;
+            // (Start mode: less the area lost to the piece's extra cost.)
+            fArea[n] = ((forward ? pCross[p] : -pCross[p]) - (cx * (y[w] - y[v]) - cy * (x[w] - x[v]))) / 2 - (pPen ? pPen[p] : 0);
             fCov[n] = target ? fanCover(target, x[v] - cx, y[v] - cy, x[w] - cx, y[w] - cy, theta0) : 0;
             fHalf[n] = 2 * p + (forward ? 0 : 1);
             fGroup[n] = vCut[w] && r < M ? groupAt(p, w) : -1;
@@ -1482,6 +1518,7 @@ class FacePolish {
         this.onB[p] = this.bCount;
         this.bList[this.bCount++] = p;
         this.length += fc.pLen[p];
+        if (fc.pPen) this.area -= fc.pPen[p];
         this.vB[fc.pFrom[p]]++;
         this.vB[fc.pTo[p]]++;
         this.setOut(p);
@@ -1494,6 +1531,7 @@ class FacePolish {
         this.onB[last] = i;
         this.onB[p] = -1;
         this.length -= fc.pLen[p];
+        if (fc.pPen) this.area += fc.pPen[p];
         this.vB[fc.pFrom[p]]--;
         this.vB[fc.pTo[p]]--;
         if (out[fc.pFrom[p]] === 2 * p) out[fc.pFrom[p]] = -1;
@@ -1521,7 +1559,8 @@ class FacePolish {
     }
 
     // Whether face f can be flipped (in ↔ out) keeping the inside one simple
-    // piece. Sets this.nextLength and this.nextStem.
+    // piece. Sets this.nextLength, this.nextStem and this.dPen (start mode:
+    // the change in area lost to extra costs, see addBoundary).
     check(f) {
         const { fc, inR, vB, nStem } = this;
         if (!fc.faceOk[f]) return false;
@@ -1531,7 +1570,7 @@ class FacePolish {
         // A street of f is a "contact" if it is on the boundary now (it
         // leaves the boundary when f flips; the others join it). Contacts
         // must form one unbroken run.
-        let contacts = 0, runs = 0, dLength = 0;
+        let contacts = 0, runs = 0, dLength = 0, dPen = 0;
         let prev = inR[fc.hFace[fc.faceHalf[b - 1] ^ 1]] !== fin;
         let stem = this.stem, stemLeaves = false;
         for (let k = a; k < b; k++) {
@@ -1543,8 +1582,10 @@ class FacePolish {
                 contacts++;
                 if (!prev) runs++;
                 dLength -= fc.pLen[p];
+                if (fc.pPen) dPen += fc.pPen[p];
             } else {
                 dLength += fc.pLen[p];
+                if (fc.pPen) dPen -= fc.pPen[p];
                 // A vertex that joins the boundary must not be on it already
                 // (the loop would touch itself).
                 if (!prev && vB[v]) return false;
@@ -1570,6 +1611,7 @@ class FacePolish {
         }
         this.nextLength = this.length + dLength;
         this.nextStem = stem;
+        this.dPen = dPen;
         return true;
     }
 
@@ -1664,7 +1706,7 @@ class FacePolish {
             const f = random() < 0.5 ? inner : (inner === left ? right : left);
             if (!this.check(f)) continue;
             const sign = inR[f] ? -1 : 1;
-            const area = this.area + sign * fc.faceArea[f];
+            const area = this.area + sign * fc.faceArea[f] + this.dPen;
             const covered = fc.faceCover ? this.covered + sign * fc.faceCover[f] : 0;
             const next = this.logScore(area, this.nextLength, covered, this.nextStem);
             if (next < current && random() >= Math.exp((next - current) / (T0 * Math.exp(cool * m)))) continue;
@@ -1705,11 +1747,12 @@ class FacePolish {
         if (this.cutEnd(p0, a)) return null;
         const k = 2 + Math.floor(random() * Math.min(30, this.bCount / 3));
         const stretch = [];
-        let v = a, lengthS = 0;
+        let v = a, lengthS = 0, pen = 0;
         for (let i = 0; ; i++) {
             const h = out[v];
             stretch.push(h);
             lengthS += fc.pLen[h >> 1];
+            if (fc.pPen) pen += fc.pPen[h >> 1];
             v = h & 1 ? fc.pFrom[h >> 1] : fc.pTo[h >> 1];
             if (v === a || stretch.length >= this.bCount - 2) return null;
             if (i + 1 >= k && !this.cutEnd(h >> 1, v)) break;
@@ -1760,6 +1803,7 @@ class FacePolish {
         for (let w = b; w !== a;) {
             const p = prevPiece[w];
             this.onPath[p] = stamp;
+            if (fc.pPen) pen -= fc.pPen[p];
             w = fc.pFrom[p] === w ? fc.pTo[p] : fc.pFrom[p];
             if (w !== a) pathVertices.push(w);
         }
@@ -1805,7 +1849,7 @@ class FacePolish {
             }
             for (const w of pathVertices) if (nStem[w] < stem) stem = nStem[w];
         }
-        return { faces, dArea: sign * dArea, dCovered: sign * dCovered, dLength: dist[b] - lengthS, stem };
+        return { faces, dArea: sign * dArea + pen, dCovered: sign * dCovered, dLength: dist[b] - lengthS, stem };
     }
 
     // The boundary as a loop of merged edges, starting at the junction
@@ -2045,7 +2089,17 @@ class SweepSearch {
         const [u, v, w] = r3(i);
         const target = isStart ? null : (this.refineTarget ||= polarTarget(this.targetXY, c.x, c.y, 0, SOLVER.coverageBins));
         let loop = this.best;
-        const along = positionsAlong(F, loopPoints(g, loop.edges, loop.dirs), 0);
+        // (Kept while the best loop stays the same.)
+        if (this.alongBest !== loop) {
+            this.alongBest = loop;
+            const along = positionsAlong(F, loopPoints(g, loop.edges, loop.dirs), 0);
+            // Vertices by position along the loop, so a window's sweep only
+            // looks at the vertices in its stretch.
+            const byOrder = Int32Array.from({ length: F.V }, (_, k) => k);
+            sortByKey(byOrder, Float64Array.from(along.order, o => o / along.period * 2 * Math.PI * (1 - 1e-12)), F.V);
+            this.alongLoop = { along, byOrder, sortedPos: Float64Array.from(byOrder, k => along.order[k]) };
+        }
+        const { along, byOrder, sortedPos } = this.alongLoop;
         const weights = SOLVER.coverageWeights;
         const mu = isStart ? 0 : weights[Math.floor(w * weights.length)];
         const stem = loop.metrics.stem || 0;
@@ -2064,18 +2118,13 @@ class SweepSearch {
                 const a = verts[k], b = verts[(k + 1) % n], p = pcs[k];
                 const ax = F.vX[a] - c.x, ay = F.vY[a] - c.y, bx = F.vX[b] - c.x, by = F.vY[b] - c.y;
                 cumL[k + 1] = cumL[k] + F.pLen[p];
-                cumA[k + 1] = cumA[k] + ((dirs[k] === 1 ? F.pCross[p] : -F.pCross[p]) - (c.x * (F.vY[b] - F.vY[a]) - c.y * (F.vX[b] - F.vX[a]))) / 2;
+                cumA[k + 1] = cumA[k] + ((dirs[k] === 1 ? F.pCross[p] : -F.pCross[p]) - (c.x * (F.vY[b] - F.vY[a]) - c.y * (F.vX[b] - F.vX[a]))) / 2 - (F.pPen ? F.pPen[p] : 0);
                 cumC[k + 1] = cumC[k] + (target ? fanCover(target, ax, ay, bx, by, 0) : 0);
             }
             return { verts, edgeAt, n, cumL, cumA, cumC };
         };
         let L = unpack(loop);
         const total = () => L.cumL[L.n];
-        // Vertices by position along the loop, so a window's sweep only
-        // looks at the vertices in its stretch.
-        const byOrder = Int32Array.from({ length: F.V }, (_, k) => k);
-        sortByKey(byOrder, Float64Array.from(along.order, o => o / along.period * 2 * Math.PI * (1 - 1e-12)), F.V);
-        const sortedPos = Float64Array.from(byOrder, k => along.order[k]);
         const firstAfter = (o) => {
             let lo = 0, hi = F.V;
             while (lo < hi) {
@@ -2185,7 +2234,7 @@ class SweepSearch {
         const xs = [], ys = [];
         edges.forEach((e, i) => {
             length += g.eLen[e];
-            cross += dirs[i] * g.eCross[e];
+            cross += dirs[i] * g.eCross[e] - (g.ePen ? 2 * g.ePen[e] : 0);
             const v = dirs[i] === 1 ? g.eFrom[e] : g.eTo[e];
             xs.push(g.x[v]);
             ys.push(g.y[v]);
@@ -2611,6 +2660,12 @@ const isBetterResult = (a, b) => !b || (a.feasible && !b.feasible) || (a.feasibl
 // Results (main thread)
 // --------------------------------------------------------------------------
 
+const polylineLength = (coords) => {
+    let m = 0;
+    for (let i = 1; i < coords.length; i++) m += haversine(coords[i - 1][0], coords[i - 1][1], coords[i][0], coords[i][1]);
+    return m;
+};
+
 // Turns a search result into road geometry and measurements. For a start
 // loop with a stem, the coordinates run start → loop → start.
 function expandLoop(prep, res, params, exact) {
@@ -2662,20 +2717,36 @@ function expandLoop(prep, res, params, exact) {
         if (kind) flags[flags.length - 1].end = coords.length - 1;
     }
     flags.forEach(flag => delete flag.end);
+    // Short private stretches (a loop clipping the edge of a property
+    // where roads meet) aren't worth a warning.
+    const kept = flags.filter(flag => flag.kind !== "private" || polylineLength(flag.coords) >= SOLVER.minPrivateM);
+    privateM = kept.reduce((sum, flag) => sum + (flag.kind === "private" ? polylineLength(flag.coords) : 0), 0);
+
+    // The real length and area (the search's include extra costs, see
+    // SOLVER.climbCost).
+    let lengthM = 0, cross = 0;
+    for (const [e] of ordered) lengthM += prep.source[e].distance;
+    let prev = prep.project(coords[0][0], coords[0][1]);
+    for (let i = 1; i < coords.length; i++) {
+        const p = prep.project(coords[i][0], coords[i][1]);
+        cross += prev.x * p.y - p.x * prev.y;
+        prev = p;
+    }
+    const areaM2 = Math.abs(cross) / 2;
 
     const m = res.metrics;
     const result = {
         mode: params.mode,
         coords,                       // closed: first point === last point
-        lengthM: m.length,
-        areaM2: m.area,
-        iq: 4 * Math.PI * m.area / m.length ** 2,
+        lengthM,
+        areaM2,
+        iq: 4 * Math.PI * areaM2 / lengthM ** 2,
         repeats: m.repeats,
         stemM,
         hops,                         // fence hops used
         railM,                        // length along railroad tracks
         privateM,                     // length on roads marked private
-        flags,                        // [{ kind: "hop" | "rail" | "private", coords }]
+        flags: kept,                  // [{ kind: "hop" | "rail" | "private", coords }]
         score: res.score,
         feasible: res.feasible,
         center: res.center,

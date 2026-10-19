@@ -4,7 +4,7 @@ Live site: https://hamnerrc.github.io/optimal.path.finder/ (updates on push)
 =============================================================================
 
 -----------------------------------------------------------------------------
-ROUNDS 2-6 (2026-10-18), IN SHORT
+ROUNDS 2-7 (2026-10-18), IN SHORT
 -----------------------------------------------------------------------------
 Modes
 - Start point: the largest-area loop no longer than each pin's max length.
@@ -13,36 +13,44 @@ Modes
 - Area (circle, ellipse, rotatable rectangle, freehand) and Place (a real
   boundary, searched by name with a Search button): the roundest loop
   (isoperimetric quotient) covering at least n% of the shape (slider,
-  default 90%). Ties go to the bigger loop. Roads are loaded 5% beyond the
-  shape, widened to 20% and then 40% if the target can't be reached.
+  default 90%). Ties go to the bigger loop. Roads are loaded 20% beyond the
+  shape (its convex hull and north-south bounding box), widened to 40% if
+  the target can't be reached.
 - Loops never run a street twice and never cross or touch themselves.
 
 Loop panel and exports
 - Distance, area, roundness, coverage, time from pace (min/mi, min/km, mph,
-  km/h), elevation profile with climb. mi/km toggle.
+  km/h), elevation profile with climb (AWS terrain tiles, 10 m data in the
+  US, a sample every 20 m). mi/km toggle.
 - Drag the green flag to choose the start; Reverse. Save in the browser;
   KML and GPX export.
+- Fence hops, railroad tracks and roads marked private are drawn in orange
+  and named in a warning (private stretches under 50 m are left out).
 
 Roads
 - Every OpenStreetMap road and path, from OpenFreeMap vector tiles
   (precomputed, worldwide, from a CDN), with Overpass as the fallback.
   Junctions are rebuilt from the tile geometry (bridges and tunnels kept
   apart, road pieces whose ends are within 2.5 m joined). Tiles stay in
-  memory for later searches and start downloading as soon as a pin, shape
-  or place is set.
-- "Roads to use" panel: avoid motorways (motorway and trunk roads, their
-  ramps, roads tagged as expressways), fence hops (10 m, never from
-  driveways, bridges or tunnels, never across roads, tracks or water),
-  railroad tracks. Indoor corridors and platforms are never used.
+  memory for later searches, are retried if a download fails, and start
+  downloading as soon as a pin, shape or place is set.
+- "Roads to use" panel: avoid motorways (off by default); fence hops (10 m,
+  never from driveways, bridges or tunnels, never across roads, tracks or
+  water; on); railroad tracks (on); prefer smaller roads (on). Private
+  roads are used like any other. Indoor corridors and platforms never.
 
 Search
 - No time limit and no settings: it runs until better loops stop turning
   up; the best loop so far is shown live and Stop keeps it.
 - Engine: an exact angular sweep (dynamic program over junctions sorted by
-  angle) from many centres, then block-by-block polish, in parallel Web
-  Workers. The same search gives the same loop every time.
-- Big searches: a rough loop on major roads first, then all roads in a
-  corridor along it, improved stretch by stretch.
+  angle) from many centres spread evenly in every direction, then
+  block-by-block polish, in parallel Web Workers. The same search gives the
+  same loop every time.
+- Climb counts against a loop: 1 m of climb as 2 m of extra length.
+- Up to 80 sq mi, and countryside up to 2,500 tiles, every road is loaded
+  at once. Bigger: a rough loop on major roads, then all roads in a 3%
+  corridor along it, improved stretch by stretch, then again along the
+  improved loop while that gains at least 0.5%.
 
 Answers kept as they are: no figure-8s or self-touching loops (Q45); the
 search stops by itself (Q50); area mode may trade a little roundness for
@@ -50,126 +58,107 @@ speed (Q51); road downloads are not stored between page loads (Q48); trunk
 roads stay in "avoid motorways" (Q54); one-way streets are ignored (Q58);
 very large searches keep downloading every road along the loop (Q59);
 cloverleaf self-crossings on huge loops are fine (Q61); tiles download as
-soon as a pin is dropped (Q62).
+soon as a pin is dropped (Q62); the corridor stays at 3% (Q66).
 
 -----------------------------------------------------------------------------
-ROUND 7 (2026-10-18): DONE FROM YOUR ROUND 6 ANSWERS
+ROUND 8 (2026-10-18): DONE FROM YOUR ROUND 7 ANSWERS
 -----------------------------------------------------------------------------
-Q55 / Q56 / Q57: fence hops and railroad tracks are now on by default, and
-roads and paths marked private or no entry (access=no/private, foot=no)
-are used like any other. When a loop uses any of them, the loop panel
-shows a warning ("It uses 2 fence hops... check they can be crossed",
-"154 mi of it runs along railroad tracks...", "0.3 mi of it is on roads
-or paths marked private...") and those stretches are drawn in orange on
-the map (a hop also gets a dot), with a label on hover. Saved loops keep
-the marks. Your earlier choices for these two boxes were reset once to the
-new defaults.
+Q65: the margin around an area is now 20% (then 40% if the target still
+can't be reached). Area searches got much rounder, see the table.
 
-Q60: the corridor for big searches is now 3% of the rough loop's size (its
-length / pi) to either side, at least 1 km. Kansas: about 15 km, 14,000
-tiles. The stretches improved one at a time now reach up to a twelfth of
-the loop (85 km for Kansas) instead of 25 km. See Q66 for the time.
+Q66: the corridor stays at 3%. (Tested 1.5%: half the tiles, but Kansas
+came out a little less round, 0.709 instead of 0.713 at 75%.)
 
-Q63: elevation now comes from AWS Terrain Tiles (free, served from a CDN,
-no request limit): 10 m data in the US, 30 m or better elsewhere, read
-from the tile images in the browser. Samples every 20 m (up to 1,000 per
-loop) instead of every 40 m (up to 200). Open-Meteo is the fallback.
+Q67: after improving the rough loop, a second pass loads a new corridor
+along the improved loop and improves it again, and so on (up to 3 passes)
+while a pass gains at least 0.5%. A second pass is cheap: about 98% of its
+tiles are already loaded, so it adds about 20 s for Kansas. Honest result:
+on Kansas the second pass only gains about 0.001-0.002 roundness, and
+then it stops by itself. The big Kansas gain this round came from the
+20% margin (Q65), which gives the rough stage room for a better shape:
+Kansas at 75% went from 0.645 to 0.713 (see Q73).
+Speed: fence-hop detection now only looks around dead ends (same roads,
+faster), and the improvement stage reuses its work between rounds.
 
-Q64: tested on 15 places (table below). That turned up several problems,
-all fixed:
-- Countryside searches were badly broken. Anything over 80 sq mi (a loop
-  over 10 mi) went to the staged search, whose first stage only has major
-  roads, of which farmland has few: a 20 mi loop near Boone, Iowa came out
-  27 mi long; a 50 mi loop in western Kansas and a 12 mi loop in Vermont
-  failed ("no roads here that form a loop"). Now an area loads every road
-  at once whenever that's few enough tiles and road points (up to 2,500
-  tiles holding 800,000 points); only dense big areas use stages.
-- The block polish almost never ran. A footpath or drive that loops back
-  across itself (common: turnarounds, park paths) broke the block map for
-  every loop around it, so in most searches over a few miles the polish
-  silently gave up. Fixed: such roads are cut at their own crossing in the
-  block map. (Also: a fence hop could cross back over its own road.)
-- The search centres were spread over far fewer directions than intended:
-  the evenly spread sequence lined up with the every-third-sweep
-  re-centring, so most directions around a start were never tried (a 50 mi
-  farm loop found 145 sq mi instead of 150). Fixed, and start-point
-  centres now sit about a loop's radius from the start, where they belong.
-- With several workers, one that found no loop at all made the search wait
-  forever (it never finished). Fixed.
-- One failed tile out of thousands (a dropped connection) threw away the
-  whole improvement stage of a big search. Tiles are now retried.
-- The 5% margin around an area is now its convex hull and its north-south
-  bounding box together, so a square of grid streets around a round area
-  is possible (a 6 mi circle around Ames, Iowa: roundness 0.64 -> 0.75).
+Q68: new checkbox "Prefer smaller roads" (on by default). While searching,
+motorways, trunk roads and railroad tracks count as 8% longer and primary
+roads as 3%. So a road right beside a highway is taken when it's about as
+good, but a highway that is clearly better is still used (nothing is
+blocked). The length, area and roundness shown are the real ones.
 
-Your Kansas route: 1,007 mi, roundness 0.697, covering 64% of Kansas (it
-goes 28 km into Oklahoma, past the 5% margin). The app at 63%: 951 mi,
-roundness 0.726, coverage 64%, mostly on minor roads (was 0.676 on mostly
-major roads). See Q67 about getting closer to the best possible.
+Q69: private stretches shorter than 50 m are no longer flagged.
 
-Results (same cached roads; railroad tracks and hops on, as now by default):
+Q70: before searching, every road gets its climb from the terrain tiles
+(up to 64 tiles, zoom 13 or coarser; small searches take under a second
+for this), and the search counts 1 m of climb as 2 m of extra length. So
+of two loops that are about as good, the flatter one wins clearly, while a
+loop that is much bigger or rounder still wins over a hill. In start point
+mode the climb counts as lost area rather than used length, so a loop in
+the hills still uses its whole length limit. Bridges and tunnels only count
+the height difference between their ends. Examples (climb of the loop):
+  San Francisco, 8 mi      4.1 sq mi, 690 ft  ->  4.0 sq mi, 245 ft
+  Lawrence, 5 mi           1.5 sq mi, 315 ft  ->  1.5 sq mi, 270 ft
+  Vermont hills, 12 mi     6.3 sq mi, 1,237 ft -> 6.5 sq mi, 1,130 ft
+  Denver, 100 mi           590 sq mi, 3,057 ft -> 583 sq mi, 3,149 ft
+                           (and no railroad tracks: 1.4 mi before)
+Flat places (Chicago, Iowa, western Kansas) give the same loops as before.
+
+Results (round 7 code vs now, same cached roads, same laptop):
                                   before                now
-  Lawrence, 5 mi start            1.5 sq mi             1.5 sq mi
+  Lawrence, 5 mi start            1.5 sq mi             1.5 sq mi (flatter)
   Chicago Loop, 10 mi             6.4 sq mi             6.4 sq mi
-  Farm near Boone IA, 20 mi       27 mi long (!), 0.41  21.5 sq mi, 0.68
-  Farm in W Kansas, 50 mi         failed                150 sq mi, 0.76
-  Denver, 100 mi                  590 sq mi             590 sq mi
-  Boulder, 15 mi                  11.4 sq mi            11.6 sq mi
-  San Francisco, 8 mi             4.2 sq mi             4.1-4.2 sq mi
+  Farm near Boone IA, 20 mi       21.5 sq mi            21.5 sq mi
+  Farm in W Kansas, 50 mi         150 sq mi             150 sq mi
+  Denver, 100 mi                  590 sq mi             583 sq mi (no rail)
+  Boulder, 15 mi                  11.6 sq mi            11.6 sq mi
+  San Francisco, 8 mi             4.1 sq mi             4.0 sq mi (flatter)
   London, 6 mi                    2.4 sq mi             2.4 sq mi
-  Vermont hills, 12 mi            failed                6.3-6.5 sq mi
-  Lawrence city at 80%            roundness 0.46        0.62
-  Douglas County at 80%           0.49                  0.64-0.65
-  6 mi circle, Chicago, 90%       0.70                  0.64-0.66 (Q65)
-  6 mi circle, Ames IA, 90%       0.51, misses target   0.75
-  Kansas at 63%                   0.68                  0.73
-  Kansas at 75%                   0.62                  0.65 (Q67)
-Ranges are over 1, 3 and 6 workers (the number depends on the computer);
-results now agree closely whatever the number.
+  Vermont hills, 12 mi            6.3 sq mi             6.5 sq mi
+  Lawrence city at 80%            roundness 0.62        0.66
+  Douglas County at 80%           0.64                  0.73
+  6 mi circle, Chicago, 90%       0.64                  0.72-0.76
+  6 mi circle, Ames IA, 90%       0.75                  0.75
+  Kansas at 63%                   0.726                 0.751
+  Kansas at 75%                   0.645                 0.713
+Time: Kansas at 75% from a cold start in Chrome on this 2015 laptop takes
+about 3 minutes: 2 minutes of it is downloading 17,700 road tiles (only
+19 MB, but the browser manages about 220 tile requests a second here,
+whatever the number in parallel), the second pass about 20 s. With the
+tiles already loaded the whole search is about 50 s. Small searches take
+about a second longer than before (the climb).
 
 -----------------------------------------------------------------------------
 OPEN POINTS FOR FUTURE DEVELOPMENT
 Same format as before: answer below each question.
 -----------------------------------------------------------------------------
 
-65. The margin only widens (to 20%, then 40%) when the target can't be
-    reached at 5%. Often a wider margin gives a much rounder loop even when
-    5% can reach the target:
-        Chicago 6 mi circle at 90%    0.65 at 5%    0.76 at 20%
-        Douglas County at 80%         0.65          0.73
-        Lawrence city at 80%          0.62          0.66
-    (The Chicago circle got worse than before for this reason: the search
-    now reaches 90% at 5%, so it no longer widens to 20%.) Options: (a)
-    keep, (b) also try 20% and keep whichever is better (about twice the
-    time for area searches), (c) make 20% the default margin.
+71. Climb weight: 1 m of climb counts as 2 m of extra length (San
+    Francisco: 2% less area for a third of the climb). Stronger (e.g. 4 m,
+    flatter loops, more area given up), weaker, or keep? Should it be a
+    checkbox ("prefer flatter loops") rather than always on?
     Answer:
 
-66. With the 3% corridor, Kansas downloads 14,000 tiles (was 2,000) and
-    took about 2.5 minutes from a cold start in the browser here (90 s
-    downloading, 30 s building the road network, the rest searching).
-    Keep 3%, or use less (e.g. 1.5%, about half the tiles)?
+72. "Prefer smaller roads" is on by default, with highways and railroad
+    tracks counted 8% longer and primary roads 3%. Keep it on by default?
+    Stronger or weaker?
     Answer:
 
-67. Huge areas: the corridor lets the improvement move each side of the
-    rough loop by up to 3%, but not change its overall shape, which comes
-    from the major roads. Kansas at 75% is a wide, short loop (roundness
-    0.65); a rectangle touching the north and south borders would be about
-    0.76. A second round (a new corridor around the improved loop, and so
-    on) could move further, at roughly another minute per round. Worth it?
+73. Kansas shape: the shape of a huge loop is still set by the rough loop
+    on major roads (Kansas has few; its grid of section-line roads is all
+    minor roads, which the coarse tiles don't hold). Corridor passes only
+    move each side a little. Getting closer to the ~0.76 rectangle would
+    need a better rough stage, e.g. a middle stage on zoom-12/13 tiles
+    (most minor roads, no paths or tracks; roughly 4 times fewer tiles
+    than full detail) before the corridor. That could add a minute or more
+    for Kansas. Worth trying?
     Answer:
 
-68. Your Kansas route prefers small roads. The search doesn't care which
-    roads it uses, only roundness, so it happily takes highways or (now on
-    by default) railroad tracks: the Kansas loop runs 154 mi on tracks.
-    Should the search prefer smaller roads, e.g. count highways (and
-    tracks) as a few % longer than they are while searching (the loop's
-    real length is still shown)? As a checkbox, or always?
+74. The cold-start download for Kansas (17,700 tiles, about 2 minutes
+    here) is limited by the number of requests, not by data. Is that time
+    acceptable on your own computer? (If it is much faster there, nothing
+    to do; if not, the corridor could be narrower where the loop runs
+    straight through open country.)
     Answer:
 
-69. Small private bits are flagged often (e.g. 0.01 mi of a private drive
-    in Lawrence). Ignore private stretches shorter than, say, 50 m in the
-    warning?
-    Answer:
-
-70. Any other changes?
+75. Any other changes?
     Answer:

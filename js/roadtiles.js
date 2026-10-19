@@ -615,34 +615,63 @@ function hopLines(lines, barriers, z) {
     // (Not driveways either: a hop from one to the next crosses yards.)
     const usable = (line) => !line.brunnel && !line.driveway && !NO_HOP_TYPES.has(line.highway);
 
-    // Streets at each point (a line end counts once, an inner point twice).
+    // Streets at each line end (a line end counts once, an inner point
+    // twice); only the ends are counted, as only they can start a hop.
     const degree = new Map();
     for (const { pts } of lines) {
-        for (let i = 0; i < pts.length; i += 2) {
+        for (const i of [0, pts.length - 2]) {
             const k = key(pts[i], pts[i + 1]);
-            degree.set(k, (degree.get(k) || 0) + (i === 0 || i === pts.length - 2 ? 1 : 2));
+            degree.set(k, (degree.get(k) || 0) + 1);
         }
     }
+    for (const { pts } of lines) {
+        for (let i = 2; i < pts.length - 2; i += 2) {
+            const k = key(pts[i], pts[i + 1]);
+            const d = degree.get(k);
+            if (d !== undefined) degree.set(k, d + 2);
+        }
+    }
+    // Where hops can start: real dead ends (not ends made by the tile edge,
+    // where the road may go on).
+    const ends = [];
+    lines.forEach((line, li) => {
+        if (!usable(line)) return;
+        const p = line.pts;
+        for (const i of [0, p.length - 2]) {
+            const x = p[i], y = p[i + 1];
+            if (degree.get(key(x, y)) === 1 && x % TILE_EXTENT !== 0 && y % TILE_EXTENT !== 0) ends.push(li, i);
+        }
+    });
 
-    // Segment grid: roads (index ≥ 0 into lines) and barriers (−1 − index).
+    // Segment grid: roads (index ≥ 0 into lines) and barriers (−1 − index),
+    // in the cells around dead ends only.
     const cell = Math.max(16, Math.ceil(2 * reach));
+    const cellKey = (cx, cy) => cx * 2 ** 24 + cy;
     const grid = new Map();
+    for (let k = 0; k < ends.length; k += 2) {
+        const p = lines[ends[k]].pts, i = ends[k + 1];
+        const cx = Math.floor(p[i] / cell), cy = Math.floor(p[i + 1] / cell);
+        for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) grid.set(cellKey(cx + dx, cy + dy), null);
+    }
     const addSegments = (pts, id) => {
         for (let i = 0; i + 3 < pts.length; i += 2) {
             const x0 = Math.floor(Math.min(pts[i], pts[i + 2]) / cell), x1 = Math.floor(Math.max(pts[i], pts[i + 2]) / cell);
             const y0 = Math.floor(Math.min(pts[i + 1], pts[i + 3]) / cell), y1 = Math.floor(Math.max(pts[i + 1], pts[i + 3]) / cell);
             for (let cx = x0; cx <= x1; cx++) {
                 for (let cy = y0; cy <= y1; cy++) {
-                    const k = cx * 2 ** 24 + cy;
-                    let list = grid.get(k);
-                    if (!list) grid.set(k, list = []);
-                    list.push(id, i);
+                    const k = cellKey(cx, cy);
+                    const list = grid.get(k);
+                    if (list === undefined) continue;
+                    if (list === null) grid.set(k, [id, i]);
+                    else list.push(id, i);
                 }
             }
         }
     };
-    lines.forEach((line, li) => addSegments(line.pts, line.brunnel ? null : li));
-    barriers.forEach((pts, bi) => addSegments(pts, -1 - bi));
+    if (ends.length) {
+        lines.forEach((line, li) => addSegments(line.pts, line.brunnel ? null : li));
+        barriers.forEach((pts, bi) => addSegments(pts, -1 - bi));
+    }
     const segmentsNear = (x, y, fn) => {
         const cx = Math.floor(x / cell), cy = Math.floor(y / cell);
         for (let dx = -1; dx <= 1; dx++) {
@@ -655,63 +684,58 @@ function hopLines(lines, barriers, z) {
     const ptsOf = (id) => id === null ? null : id >= 0 ? lines[id].pts : barriers[-1 - id];
 
     const hops = [], splits = new Map(), seen = new Set();
-    lines.forEach((line, li) => {
-        if (!usable(line)) return;
-        const p = line.pts;
-        for (const i of [0, p.length - 2]) {
-            const x = p[i], y = p[i + 1];
-            if (degree.get(key(x, y)) !== 1) continue;
-            // Not an end made by the tile edge (the road may go on).
-            if (x % TILE_EXTENT === 0 || y % TILE_EXTENT === 0) continue;
+    for (let end = 0; end < ends.length; end += 2) {
+        const li = ends[end], i = ends[end + 1];
+        const p = lines[li].pts;
+        const x = p[i], y = p[i + 1];
 
-            // The nearest point on another usable road.
-            let best = null;
-            segmentsNear(x, y, (id, si) => {
-                if (id === null || id < 0 || id === li || !usable(lines[id])) return;
-                const q = lines[id].pts;
-                const ax = q[si], ay = q[si + 1], ex = q[si + 2] - ax, ey = q[si + 3] - ay;
-                const len2 = ex * ex + ey * ey;
-                const t = len2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * ex + (y - ay) * ey) / len2)) : 0;
-                const px = Math.round(ax + t * ex), py = Math.round(ay + t * ey);
-                const d = Math.hypot(px - x, py - y);
-                if (d <= reach && d > SNAP_UNITS && (!best || d < best.d)) best = { d, id, si, t, px, py };
-            });
-            if (!best) continue;
-            const pairKey = `${Math.min(key(x, y), key(best.px, best.py))},${Math.max(key(x, y), key(best.px, best.py))}`;
-            if (seen.has(pairKey)) continue;
+        // The nearest point on another usable road.
+        let best = null;
+        segmentsNear(x, y, (id, si) => {
+            if (id === null || id < 0 || id === li || !usable(lines[id])) return;
+            const q = lines[id].pts;
+            const ax = q[si], ay = q[si + 1], ex = q[si + 2] - ax, ey = q[si + 3] - ay;
+            const len2 = ex * ex + ey * ey;
+            const t = len2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * ex + (y - ay) * ey) / len2)) : 0;
+            const px = Math.round(ax + t * ex), py = Math.round(ay + t * ey);
+            const d = Math.hypot(px - x, py - y);
+            if (d <= reach && d > SNAP_UNITS && (!best || d < best.d)) best = { d, id, si, t, px, py };
+        });
+        if (!best) continue;
+        const pairKey = `${Math.min(key(x, y), key(best.px, best.py))},${Math.max(key(x, y), key(best.px, best.py))}`;
+        if (seen.has(pairKey)) continue;
 
-            // Nothing in the way: no other road, track or water crossed.
-            let blocked = false;
-            const hx = best.px - x, hy = best.py - y;
-            segmentsNear(x, y, (id, si) => {
-                if (blocked || id === null) return;
-                const q = ptsOf(id);
-                const ax = q[si], ay = q[si + 1], bx = q[si + 2], by = q[si + 3];
-                // The hop's own ends touch its two roads (but it mustn't
-                // cross back over the rest of the road it starts from).
-                if ((id === li && si === (i === 0 ? 0 : p.length - 4)) || (id === best.id && si === best.si)) return;
-                const sx = bx - ax, sy = by - ay;
-                const den = hx * sy - hy * sx;
-                if (den === 0) return;
-                const t = ((ax - x) * sy - (ay - y) * sx) / den;
-                const u = ((ax - x) * hy - (ay - y) * hx) / den;
-                if (t > 0 && t < 1 && u >= 0 && u <= 1) blocked = true;
-            });
-            if (blocked) continue;
-            seen.add(pairKey);
+        // Nothing in the way: no other road, track or water crossed.
+        let blocked = false;
+        const hx = best.px - x, hy = best.py - y;
+        segmentsNear(x, y, (id, si) => {
+            if (blocked || id === null) return;
+            const q = ptsOf(id);
+            const ax = q[si], ay = q[si + 1], bx = q[si + 2], by = q[si + 3];
+            // The hop's own ends touch its two roads (but it mustn't
+            // cross back over the rest of the road it starts from).
+            if ((id === li && si === (i === 0 ? 0 : p.length - 4)) || (id === best.id && si === best.si)) return;
+            const sx = bx - ax, sy = by - ay;
+            const den = hx * sy - hy * sx;
+            if (den === 0) return;
+            const t = ((ax - x) * sy - (ay - y) * sx) / den;
+            const u = ((ax - x) * hy - (ay - y) * hx) / den;
+            if (t > 0 && t < 1 && u >= 0 && u <= 1) blocked = true;
+        });
+        if (blocked) continue;
+        seen.add(pairKey);
 
-            // Split the road hopped to at the hop's end (unless that's
-            // already one of its points).
-            const q = lines[best.id].pts;
-            const atVertex = (best.px === q[best.si] && best.py === q[best.si + 1]) || (best.px === q[best.si + 2] && best.py === q[best.si + 3]);
-            if (!atVertex) {
-                let list = splits.get(best.id);
-                if (!list) splits.set(best.id, list = []);
-                list.push(best.si, best.t, best.px, best.py);
-            }
-            hops.push({ highway: "hop", brunnel: false, oneway: 0, expressway: false, driveway: false, restricted: false, pts: [x, y, best.px, best.py] });
+        // Split the road hopped to at the hop's end (unless that's
+        // already one of its points).
+        const q = lines[best.id].pts;
+        const atVertex = (best.px === q[best.si] && best.py === q[best.si + 1]) || (best.px === q[best.si + 2] && best.py === q[best.si + 3]);
+        if (!atVertex) {
+            let list = splits.get(best.id);
+            if (!list) splits.set(best.id, list = []);
+            list.push(best.si, best.t, best.px, best.py);
         }
-    });
+        hops.push({ highway: "hop", brunnel: false, oneway: 0, expressway: false, driveway: false, restricted: false, pts: [x, y, best.px, best.py] });
+    }
 
     for (const [li, list] of splits) {
         const p = lines[li].pts;
@@ -748,6 +772,8 @@ function linesToWays(lines, z) {
         const tags = { highway: line.highway };
         if (line.oneway) tags.oneway = line.oneway === 1 ? "yes" : "-1";
         if (line.restricted && !line.highway.startsWith("motorway")) tags.access = "no";
+        // (A bridge or a tunnel: the elevation under it doesn't count.)
+        if (line.brunnel) tags.bridge = "yes";
         ways.push({ type: "way", id: k + 1, nodes, geometry, tags });
     });
     return ways;

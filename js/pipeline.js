@@ -6,7 +6,11 @@
 // every road at once. Big ones (see CONFIG.chunked) go in two stages:
 //   1. A rough loop on major roads only, from coarser tiles.
 //   2. All roads in a corridor along the rough loop, and a search around
-//      the rough loop's centre that improves it with them.
+//      the rough loop's centre that improves it with them; then again in
+//      a corridor along the improved loop, while that still helps.
+//
+// Every road gets its climb from terrain tiles first (addRoadClimb), which
+// the search counts as extra length (see SOLVER.climbCost).
 //
 // Area searches load roads a little beyond the area (CONFIG.areaMargins);
 // if the coverage target can't be met with those, the margin is widened and
@@ -23,7 +27,8 @@
 //            | { mode: "area", target: [{lat,lng}], coverage }
 //   region     full-detail road region
 //   target     area mode: the area's region (for wider margins)
-//   roads      road options: { noMotorways, hops, railways } (see roadTypesFor)
+//   roads      road options: { noMotorways, hops, railways, preferSmall } (see
+//              roadTypesFor and solverParams)
 // options: { signal, onStatus(text, fraction), onLoop(loop, final), onNetwork(network) }
 // Resolves with the final loop: { coords, lengthM, areaM2, iq, coverage, feasible, score, chunked }.
 async function searchLoop(job, options) {
@@ -74,10 +79,11 @@ async function searchFullDetail(job, { signal, onStatus, onLoop, onNetwork }, ma
     const network = buildRoadNetwork(osm, job.region);
     if (network.edges.length === 0) throw new Error("No roads found here.");
     onNetwork(network);
+    await loadClimb(network, signal, onStatus, 0);
 
     onStatus("Searching…", 0);
     await nextFrame();
-    const result = await runSolver(network, solverParams(job.objective), {
+    const result = await runSolver(network, solverParams(job), {
         signal,
         onProgress: ({ fraction, rounds, best }) => {
             if (best) onLoop(best, false);
@@ -102,8 +108,9 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
     const coarse = buildRoadNetwork(osm, coarseRegion);
     if (coarse.edges.length === 0) throw new Error("No major roads found here.");
     onNetwork(coarse);
+    await loadClimb(coarse, signal, onStatus, 0);
 
-    const rough = { ...await runSolver(coarse, solverParams(objective), {
+    const rough = { ...await runSolver(coarse, solverParams(job), {
         signal,
         onProgress: ({ fraction, rounds, best }) => {
             if (best) onLoop({ ...best, chunked: true }, false);
@@ -112,35 +119,50 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
     }), chunked: true };
     onLoop(rough, false);
 
-    // Stage 2: all roads along the rough loop -------------------------------
-    try {
-        let line = rough.coords.map(([lat, lng]) => ({ lat, lng }));
-        if (objective.mode === "start") line = [objective.start, ...line];
-        const radius = Math.max(settings.corridorMinM, settings.corridorFraction * rough.lengthM / Math.PI);
-        const corridor = createCorridorRegion(simplifyLine(line, 400), radius);
-        const local = buildRoadNetwork(await loadRoads(corridor, job.roads, signal, (done, total) =>
-            onStatus(`Loading all roads along the rough loop (${done} of ${total} tiles)…`, 0.4)), corridor);
-        if (local.edges.length === 0) return rough;
-        onNetwork(local);
-        await nextFrame();
-        const reference = simplifyLine(loopPart(rough), 400);
-        const fine = await runSolver(local, { ...solverParams(objective), center: rough.center, anchor: rough.anchor, reference }, {
-            signal,
-            onProgress: ({ fraction, rounds, best }) => {
-                if (best) onLoop({ ...best, chunked: true }, false);
-                onStatus(`Improving the loop with all roads (round ${rounds})…`, 0.4 + 0.6 * fraction);
-            }
-        });
+    // Stage 2: all roads along the rough loop, then along the improved one --
+    // Each pass can move each side of the loop by up to the corridor's
+    // width; the next pass starts from where the last one got to.
+    let best = rough;
+    for (let pass = 1; pass <= settings.corridorPasses; pass++) {
+        const share = (fraction) => 0.4 + 0.6 * (pass - 1 + fraction) / settings.corridorPasses;
+        let fine;
+        try {
+            let line = loopPart(best);
+            if (objective.mode === "start") line = [objective.start, ...line];
+            const radius = Math.max(settings.corridorMinM, settings.corridorFraction * best.lengthM / Math.PI);
+            const corridor = createCorridorRegion(simplifyLine(line, 400), radius);
+            const what = pass === 1 ? "the rough loop" : "the improved loop";
+            const local = buildRoadNetwork(await loadRoads(corridor, job.roads, signal, (done, total) =>
+                onStatus(`Loading all roads along ${what} (${done} of ${total} tiles)…`, share(0))), corridor);
+            if (local.edges.length === 0) break;
+            onNetwork(local);
+            await loadClimb(local, signal, onStatus, share(0));
+            await nextFrame();
+            const reference = simplifyLine(loopPart(best), 400);
+            fine = { ...await runSolver(local, { ...solverParams(job), center: best.center, anchor: best.anchor, reference }, {
+                signal,
+                onProgress: ({ fraction, rounds, best: loop }) => {
+                    if (loop && (pass === 1 || isBetterResult(loop, best))) onLoop({ ...loop, chunked: true }, false);
+                    onStatus(pass === 1 ? `Improving the loop with all roads (round ${rounds})…`
+                        : `Improving the loop further, pass ${pass} (round ${rounds})…`, share(fraction));
+                }
+            }), chunked: true };
+        } catch (err) {
+            // A failed pass (e.g. a busy server) shouldn't lose the loop.
+            if (err.name === "AbortError") throw err;
+            console.warn("[Search] Loop not improved with all roads:", err);
+            break;
+        }
         // The rough loop's major roads come from simplified tiles, so its
-        // length and area are only approximate: the loop on all roads (with
-        // the real road shapes) wins.
-        return { ...fine, chunked: true };
-    } catch (err) {
-        // A failed second stage (e.g. a busy server) shouldn't lose the loop.
-        if (err.name === "AbortError") throw err;
-        console.warn("[Search] Loop not improved with all roads:", err);
-        return rough;
+        // length and area are only approximate: the first loop on all roads
+        // (with the real road shapes) wins. After that, a pass that barely
+        // helped is the last.
+        const gain = pass === 1 ? Infinity : (fine.score - best.score) / Math.abs(best.score);
+        if (pass === 1 || isBetterResult(fine, best)) best = fine;
+        if (gain < settings.passMinGain) break;
+        if (pass < settings.corridorPasses) onLoop(best, false);
     }
+    return best;
 }
 
 // Downloads (into the tile store) the tiles a search for `job` will start
@@ -215,11 +237,21 @@ function loopPart(loop) {
     return kept.length >= 3 ? kept : points.slice(0, -1);
 }
 
-// Solver params for an objective.
-function solverParams(objective) {
+// Solver params for a job.
+function solverParams({ objective, roads }) {
+    const preferSmall = Boolean(roads?.preferSmall);
     return objective.mode === "start"
-        ? { mode: "start", start: objective.start, maxLengthM: objective.maxLengthM }
-        : { mode: "area", target: objective.target, coverage: objective.coverage };
+        ? { mode: "start", start: objective.start, maxLengthM: objective.maxLengthM, preferSmall }
+        : { mode: "area", target: objective.target, coverage: objective.coverage, preferSmall };
+}
+
+// The climb along every road (for the search), from terrain tiles. Without
+// them, the search goes on without it.
+async function loadClimb(network, signal, onStatus, fraction) {
+    onStatus("Reading the climb along the roads…", fraction);
+    const t0 = Date.now();
+    await addRoadClimb(network, signal);
+    console.log(`[Elevation] Climb along ${network.edges.length} roads in ${Date.now() - t0} ms`);
 }
 
 const searchingText = (rounds) => `Searching, round ${rounds}. Finishes by itself once better loops stop turning up.`;

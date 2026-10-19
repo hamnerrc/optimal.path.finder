@@ -38,12 +38,12 @@ const CONFIG = {
     defaultDistanceMiles: 5,
 
     // Area mode: default share of the drawn area the loop must enclose, and
-    // how far beyond the drawn area roads are loaded (1.05 = 5% larger, as a
-    // scale factor on the area's convex hull), so the loop can use roads
-    // just outside its edge. If the coverage can't be reached, the search
-    // is repeated with the next margin.
+    // how far beyond the drawn area roads are loaded (1.2 = 20% larger, as a
+    // scale factor on the area's convex hull and bounding box), so the loop
+    // can use roads outside its edge. If the coverage can't be reached, the
+    // search is repeated with the next margin.
     defaultCoveragePercent: 90,
-    areaMargins: [1.05, 1.2, 1.4],
+    areaMargins: [1.2, 1.4],
 
     // Default pace for time estimates, in seconds per mile.
     defaultPaceSecPerMile: 540,
@@ -53,7 +53,9 @@ const CONFIG = {
     // (the countryside): up to maxFullTiles road tiles holding no more than
     // maxFullVertices road points. Other searches go in two stages: a rough
     // loop on major roads only, from coarser tiles (at most maxCoarseTiles
-    // of them), then all roads in a corridor along that loop to improve it.
+    // of them), then all roads in a corridor along that loop to improve it,
+    // and again along the improved loop (up to corridorPasses passes, until
+    // a pass improves the loop by less than passMinGain).
     chunked: {
         fullDetailMaxSqMiles: 80,
         maxFullTiles: 2500,
@@ -76,7 +78,9 @@ const CONFIG = {
         // The corridor reaches this share of the rough loop's size (its
         // length / π) to either side, and at least corridorMinM.
         corridorFraction: 0.03,
-        corridorMinM: 1000
+        corridorMinM: 1000,
+        corridorPasses: 3,
+        passMinGain: 0.005
     },
 
     // Ask for confirmation before downloading areas larger than this.
@@ -139,7 +143,12 @@ const CONFIG = {
         tileUrl: "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
         maxTileZoom: 14,
         maxTiles: 48,
-        cacheTiles: 96,
+        cacheTiles: 128,
+        // The climb along every road, for the search (see SOLVER.climbCost):
+        // read at the most detailed zoom (up to searchMaxZoom) that needs at
+        // most searchMaxTiles tiles.
+        searchMaxZoom: 13,
+        searchMaxTiles: 64,
         url: "https://api.open-meteo.com/v1/elevation",
         batchSize: 100,          // coordinates per request (API limit)
         maxSamples: 1000,

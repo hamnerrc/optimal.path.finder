@@ -60,6 +60,7 @@ const ui = {
     noMotorwaysInput: $("noMotorwaysInput"),
     hopsInput: $("hopsInput"),
     railwaysInput: $("railwaysInput"),
+    preferSmallInput: $("preferSmallInput"),
 
     routesSection: $("routesSection"),
     routeList: $("routeList"),
@@ -128,13 +129,15 @@ const prefs = {
     // Pace is stored as a speed (m/s) and shown in the chosen format.
     paceFormat: PACE_FORMATS[storedPrefs.paceFormat] ? storedPrefs.paceFormat : (storedPrefs.units === "km" ? "min/km" : "min/mi"),
     speedMps: storedPrefs.speedMps > 0 ? storedPrefs.speedMps : METERS_PER_MILE / CONFIG.defaultPaceSecPerMile,
-    // Road options (see roadTypesFor in js/pipeline.js). Fence hops and
-    // railroad tracks are on by default (loops that use them say so); the
-    // choices stored before that default (roadsVersion 2) are not kept.
+    // Road options (see roadTypesFor and solverParams in js/pipeline.js).
+    // Fence hops, railroad tracks and preferring smaller roads are on by
+    // default (loops that use hops or tracks say so); the choices stored
+    // before that default (roadsVersion 2) are not kept.
     roads: {
         noMotorways: storedPrefs.roads?.noMotorways === true,
         hops: storedPrefs.roadsVersion === 2 ? storedPrefs.roads?.hops !== false : true,
-        railways: storedPrefs.roadsVersion === 2 ? storedPrefs.roads?.railways !== false : true
+        railways: storedPrefs.roadsVersion === 2 ? storedPrefs.roads?.railways !== false : true,
+        preferSmall: storedPrefs.roads?.preferSmall !== false
     },
     roadsVersion: 2
 };
@@ -571,7 +574,7 @@ ui.deleteShapeButton.addEventListener("click", deleteShape);
 ui.cancelEditButton.addEventListener("click", cancelEditing);
 ui.doneEditButton.addEventListener("click", finishEditing);
 
-const ROAD_OPTION_INPUTS = { noMotorways: ui.noMotorwaysInput, hops: ui.hopsInput, railways: ui.railwaysInput };
+const ROAD_OPTION_INPUTS = { noMotorways: ui.noMotorwaysInput, hops: ui.hopsInput, railways: ui.railwaysInput, preferSmall: ui.preferSmallInput };
 const showRoadOptionsCount = () => {
     const on = Object.values(prefs.roads).filter(Boolean).length;
     ui.roadOptionsCount.textContent = `${on} on`;
