@@ -56,23 +56,30 @@ function coordinate(prep, params, engines, { signal, onProgress }) {
         if (signal?.aborted) return onAbort();
         signal?.addEventListener("abort", onAbort);
 
-        engines.forEach(engine => engine.start((message) => {
+        const settle = (improved) => {
+            onProgress?.({
+                fraction: tracker.fraction,
+                rounds: tracker.rounds,
+                best: improved ? expandLoop(prep, tracker.best, params, false) : null
+            });
+            if (tracker.done) {
+                finish();
+                resolve(expandLoop(prep, tracker.best, params, true));
+            }
+        };
+        engines.forEach((engine, k) => engine.start((message) => {
             if (finished) return;
             if (message.type === "round") {
                 reported = true;
-                const improved = tracker.report(message.best, message.index);
-                onProgress?.({
-                    fraction: tracker.fraction,
-                    rounds: tracker.rounds,
-                    best: improved ? expandLoop(prep, tracker.best, params, false) : null
-                });
-                if (tracker.done) {
-                    finish();
-                    resolve(expandLoop(prep, tracker.best, params, true));
-                }
+                settle(tracker.report(message.best, message.index));
             } else if (message.type === "error") {
-                // Every engine fails the same way on a bad graph; report it once.
-                if (++failures < engines.length && !message.workerFailed) return;
+                // Every engine fails the same way on a bad graph; report it
+                // once. One that just found no loop where it looked stops,
+                // and the others go on.
+                if (++failures < engines.length && !message.workerFailed) {
+                    settle(tracker.drop(k, engines.length));
+                    return;
+                }
                 finish();
                 if (tracker.best) {
                     resolve(expandLoop(prep, tracker.best, params, true));

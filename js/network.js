@@ -8,7 +8,8 @@
 //
 //   nodes      Map<osmNodeId, { id, lat, lng }>
 //   edges      [{ id, from, to, distance, coords: [[lat, lng], …],
-//                 wayId, highway, name, oneway }]
+//                 wayId, highway, name, oneway, restricted }]
+//              (restricted: marked private or no entry on foot)
 //   stats      { intersections, segments, totalMiles, ways }
 //
 // Points are numbered as they're first seen, so the work per point uses
@@ -84,6 +85,8 @@ function buildRoadNetwork(osmData, region) {
 
     for (const { way, pts } of runs) {
         const tags = way.tags || {};
+        const restricted = tags.highway !== "motorway" && tags.highway !== "motorway_link" &&
+            isRestricted(tags.access, tags.foot);
         let start = pts[0];
         let prev = start;
         let coords = [[lats[start], lngs[start]]];
@@ -105,7 +108,8 @@ function buildRoadNetwork(osmData, region) {
                     wayId: way.id,
                     highway: tags.highway || (tags.railway ? "railway" : undefined),
                     name: tags.name || null,
-                    oneway: parseOneway(tags)
+                    oneway: parseOneway(tags),
+                    restricted
                 });
                 totalMeters += distance;
                 start = k;

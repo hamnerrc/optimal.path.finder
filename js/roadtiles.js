@@ -35,7 +35,7 @@ const TILE_NOT_PATHS = new Set(["corridor", "platform"]);
 const TILE_RAIL_TYPES = new Set(["rail", "narrow_gauge", "preserved"]);
 
 let tileTemplatePromise = null;
-// "z/x/y" -> Promise<{ lines: [{ highway, brunnel, oneway, expressway, driveway, pts }],
+// "z/x/y" -> Promise<{ lines: [{ highway, brunnel, oneway, expressway, driveway, restricted, pts }],
 //                      barriers: [pts] }>  (see tileContents)
 const tileStore = new Map();
 let tileStoreVertices = 0;
@@ -53,19 +53,26 @@ function roadTileZoom(bbox, maxTiles, top = 12) {
 // cover `region` (anything with a bbox, optionally contains() and outline).
 // roadTypes filters highway types; zoom defaults to full detail.
 // noExpressways also leaves out other roads tagged as expressways; hops adds
-// fence hops (see hopLines).
-async function fetchRoadsFromTiles(region, signal, { roadTypes = CONFIG.roadTypes, zoom = CONFIG.roadTiles.zoom, noExpressways = false, hops = false, onProgress } = {}) {
+// fence hops (see hopLines). Fails with err.tooManyRoads once the tiles
+// hold more than maxVertices points.
+async function fetchRoadsFromTiles(region, signal, { roadTypes = CONFIG.roadTypes, zoom = CONFIG.roadTiles.zoom, noExpressways = false, hops = false, onProgress, maxVertices = Infinity } = {}) {
     const template = await tileTemplate(signal);
     const tiles = tilesCovering(region, zoom);
     const types = new Set(roadTypes);
 
-    let done = 0;
+    let done = 0, vertices = 0;
     onProgress?.(0, tiles.length);
     const loaded = new Array(tiles.length);
     await forEachLimited(tiles.map((tile, i) => ({ ...tile, i })), CONFIG.roadTiles.concurrency, async ({ x, y, i }) => {
         loaded[i] = await loadTile(template, zoom, x, y, signal);
         // (A tile shared with a prefetch doesn't stop when the search does.)
         signal?.throwIfAborted();
+        vertices += loaded[i].vertices;
+        if (vertices > maxVertices) {
+            const err = new Error("Too many roads to load at once.");
+            err.tooManyRoads = true;
+            throw err;
+        }
         onProgress?.(++done, tiles.length);
     });
     trimTileStore();
@@ -117,15 +124,10 @@ function loadTile(template, z, x, y, signal) {
         tileStore.set(key, entry);
         return entry;
     }
-    entry = fetch(template.replace("{z}", z).replace("{x}", x).replace("{y}", y), { signal })
-        .then(response => {
-            if (response.status === 204 || response.status === 404) return new ArrayBuffer(0);
-            if (!response.ok) throw new Error(`Road tile download failed (HTTP ${response.status})`);
-            return response.arrayBuffer();
-        })
+    entry = fetchTile(template.replace("{z}", z).replace("{x}", x).replace("{y}", y), signal)
         .then(buffer => {
             const contents = tileContents(buffer, z, x, y);
-            entry.vertices = contents.lines.reduce((sum, line) => sum + line.pts.length / 2, 0) +
+            contents.vertices = entry.vertices = contents.lines.reduce((sum, line) => sum + line.pts.length / 2, 0) +
                 contents.barriers.reduce((sum, pts) => sum + pts.length / 2, 0);
             tileStoreVertices += entry.vertices;
             return contents;
@@ -133,6 +135,28 @@ function loadTile(template, z, x, y, signal) {
     entry.catch(() => tileStore.delete(key));
     tileStore.set(key, entry);
     return entry;
+}
+
+// A tile's data (empty if there are no roads there). A dropped connection
+// or a busy server is tried again a few times: one failed tile among
+// thousands shouldn't fail a search.
+async function fetchTile(url, signal, attempts = 4) {
+    for (let i = 1; ; i++) {
+        let response;
+        try {
+            response = await fetch(url, { signal });
+        } catch (err) {
+            if (err.name === "AbortError" || i >= attempts) throw err;
+            await new Promise(resolve => setTimeout(resolve, 500 * i));
+            continue;
+        }
+        if (response.status === 204 || response.status === 404) return new ArrayBuffer(0);
+        if (response.ok) return response.arrayBuffer();
+        if ((response.status !== 429 && response.status < 500) || i >= attempts) {
+            throw new Error(`Road tile download failed (HTTP ${response.status})`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000 * i));
+    }
 }
 
 function trimTileStore() {
@@ -144,11 +168,16 @@ function trimTileStore() {
     }
 }
 
-// Runs fn over items with at most `limit` running at once.
+// Runs fn over items with at most `limit` running at once, until one fails.
 async function forEachLimited(items, limit, fn) {
-    let next = 0;
+    let next = 0, failed = false;
     const worker = async () => {
-        while (next < items.length) await fn(items[next++]);
+        try {
+            while (next < items.length && !failed) await fn(items[next++]);
+        } catch (err) {
+            failed = true;
+            throw err;
+        }
     };
     await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
@@ -262,8 +291,9 @@ function tileContents(buffer, z, tx, ty) {
         const oneway = props.oneway === 1 ? 1 : props.oneway === -1 ? -1 : 0;
         const expressway = props.expressway === 1;
         const driveway = props.service === "driveway";
+        const restricted = isRestricted(props.access, props.foot);
         for (const line of geometry) {
-            for (const pts of clipped(roads, line)) lines.push({ highway, brunnel, oneway, expressway, driveway, pts });
+            for (const pts of clipped(roads, line)) lines.push({ highway, brunnel, oneway, expressway, driveway, restricted, pts });
         }
     }
     for (const name of ["waterway", "water"]) {
@@ -274,6 +304,14 @@ function tileContents(buffer, z, tx, ty) {
         }
     }
     return { lines, barriers };
+}
+
+// Marked private or no entry on foot (OpenMapTiles' access "no" stands
+// for access=no or private). These are used like any other road, but
+// flagged on the loop. (Not motorways: no one expects to walk those.)
+function isRestricted(access, foot) {
+    if (foot === "yes" || foot === "designated" || foot === "permissive") return false;
+    return access === "no" || access === "private" || foot === "no" || foot === "private";
 }
 
 function tileHighway(props) {
@@ -649,8 +687,9 @@ function hopLines(lines, barriers, z) {
                 if (blocked || id === null) return;
                 const q = ptsOf(id);
                 const ax = q[si], ay = q[si + 1], bx = q[si + 2], by = q[si + 3];
-                // The hop's own ends touch its two roads.
-                if (id === li || (id === best.id && si === best.si)) return;
+                // The hop's own ends touch its two roads (but it mustn't
+                // cross back over the rest of the road it starts from).
+                if ((id === li && si === (i === 0 ? 0 : p.length - 4)) || (id === best.id && si === best.si)) return;
                 const sx = bx - ax, sy = by - ay;
                 const den = hx * sy - hy * sx;
                 if (den === 0) return;
@@ -670,7 +709,7 @@ function hopLines(lines, barriers, z) {
                 if (!list) splits.set(best.id, list = []);
                 list.push(best.si, best.t, best.px, best.py);
             }
-            hops.push({ highway: "hop", brunnel: false, oneway: 0, expressway: false, driveway: false, pts: [x, y, best.px, best.py] });
+            hops.push({ highway: "hop", brunnel: false, oneway: 0, expressway: false, driveway: false, restricted: false, pts: [x, y, best.px, best.py] });
         }
     });
 
@@ -708,6 +747,7 @@ function linesToWays(lines, z) {
         }
         const tags = { highway: line.highway };
         if (line.oneway) tags.oneway = line.oneway === 1 ? "yes" : "-1";
+        if (line.restricted && !line.highway.startsWith("motorway")) tags.access = "no";
         ways.push({ type: "way", id: k + 1, nodes, geometry, tags });
     });
     return ways;

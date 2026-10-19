@@ -33,12 +33,14 @@ pin, shape or place is set, before "Find loop" is pressed. The same search
 gives the same loop every time.
 
 **Roads to use** (in the panel, for every mode): avoid motorways,
-expressways and their ramps; allow fence hops (straight links of up to 10 m
-from a dead end to a road it doesn't connect to, never across another road,
-railroad, river or shore, and never from a driveway, bridge or tunnel); and
-use railroad tracks. Paths, trails, sidewalks and rail trails are always
-used. The loop's panel says how many fence hops it uses and how far it runs
-along railroad tracks.
+expressways and their ramps (off by default); allow fence hops (straight
+links of up to 10 m from a dead end to a road it doesn't connect to, never
+across another road, railroad, river or shore, and never from a driveway,
+bridge or tunnel; on by default); and use railroad tracks (on by default).
+Paths, trails, sidewalks and rail trails are always used, and so are roads
+and paths marked private or no entry. A loop that uses fence hops, railroad
+tracks or private roads says so in a warning and marks those stretches in
+orange on the map, so they can be checked before running.
 
 ## Running
 
@@ -70,7 +72,7 @@ js/solver-worker.js   Runs one search in a Web Worker
 js/solve.js           Runs parallel searches in workers until they settle
 js/pipeline.js        Roads → network → solver; staged search for big areas
 js/loop.js            Distances along a loop, start point, direction
-js/elevation.js       Elevation samples and profile (Open-Meteo)
+js/elevation.js       Elevation samples and profile (terrain tiles, Open-Meteo fallback)
 js/export.js          KML and GPX export
 js/map.js             Leaflet map, icons, drawing of shapes, roads and loops
 js/app.js             App state, panel UI, map interaction, search, toasts
@@ -114,6 +116,9 @@ If the tile server can't be reached, the Overpass API is used instead.
    (a road crossing another without a junction, e.g. on a bridge, gets a
    "virtual" vertex there that a loop can only pass straight through) and
    lists its faces, the blocks between roads, within each 2-connected part.
+   A path or drive that loops back across itself is cut at the crossing in
+   this map (the loop still follows the real road), since one such spot
+   would otherwise stop the block polish for every loop around it.
 2. **Angular sweep** (`sweepLoop`). Pick a centre and a junction s. Among
    all loops through s that wind once around the centre, always moving
    forward in angle (star-shaped loops, which the roundest loops are), the
@@ -135,8 +140,11 @@ If the tile server can't be reached, the Overpass API is used instead.
    handles what a sweep can't: winding streets, and reaching the coverage
    target in area mode.
 4. `SweepSearch` sweeps many centres (an evenly spread low-discrepancy
-   sequence around the start or the area, every third sweep re-centred on
-   the best loop so far), polishing each loop that comes close to the best.
+   sequence: in start point mode about a loop's radius from the start, in
+   area mode around the area's middle; every third sweep of each search is
+   re-centred on its best loop so far, and the other sweeps of all searches
+   together take consecutive points of the sequence, so every direction is
+   tried), polishing each loop that comes close to the best.
    `js/solve.js` runs one search per spare CPU core in Web Workers (started
    when the page loads and kept between searches), each taking its share of
    the sequence. `SearchTracker` stops them once enough sweeps in a row
@@ -151,23 +159,26 @@ arriving along each of the two roads.
 Area is computed exactly from the road geometry (shoelace formula). Coverage
 of the drawn shape is measured with scanlines.
 
-In area mode, roads are loaded for the shape's convex hull enlarged by 5%
-(`CONFIG.areaMargins`), so the loop can use roads just outside its edge. If
-that can't reach the coverage target, the search is repeated with 20% and
-then 40%.
+In area mode, roads are loaded 5% beyond the shape (`CONFIG.areaMargins`):
+its convex hull and its north-south bounding box, both enlarged by 5%, so
+the loop can use roads just outside its edge, including the corners of a
+square of grid streets around a round area. If that can't reach the
+coverage target, the search is repeated with 20% and then 40%.
 
 ### Big searches
 
 Up to about 80 sq mi (`CONFIG.chunked.fullDetailMaxSqMiles`, a 10 mi loop)
-every road is loaded at once. Beyond that, `js/pipeline.js` searches in two
-stages:
+every road is loaded at once. So are bigger areas with few roads (the
+countryside): up to 2,500 tiles holding at most 800,000 road points, which
+covers a 50 mi loop in rural Kansas (1,500 tiles, 67,000 points). Beyond
+that, `js/pipeline.js` searches in two stages:
 
 1. A rough loop on major roads only (motorway to tertiary; tertiary is
    dropped above 5,000 sq mi), from coarser tiles (at most 150).
-2. All roads within 1 km of the rough loop are loaded (just the tiles along
-   it), the rough loop is traced onto them, and it is improved stretch by
-   stretch (`SweepSearch.refine`): each stretch between two junctions, a
-   few km to a few dozen km long, is replaced by the best path between its
+2. All roads within 3% of the rough loop's size (its length / π, at least
+   1 km) to either side are loaded (just the tiles along it), the rough loop is traced onto them, and it is improved stretch by
+   stretch (`SweepSearch.refine`): each stretch between two junctions, from
+   3 km up to a twelfth of the loop long, is replaced by the best path between its
    ends that keeps moving forward along the loop, if that makes the whole
    loop better. A stretch that can't be improved (or rerouted at all, e.g. a
    cloverleaf ramp that passes under its own bridge) stays as it is, so one
@@ -175,17 +186,18 @@ stages:
    a sweep around the loop's centre is tried too, and the result is
    polished block by block. The result always uses the real road shapes.
 
-From a cold start in the browser (2015 dual-core laptop): a 30 mi loop in
-Chicago and a 100 mi loop around Denver take a few seconds plus the
-download; Kansas at 75% coverage (a 1,140 mi loop, about 2,000 tiles) about
-30 s, most of it downloading.
+A 30 mi loop in Chicago and a 100 mi loop around Denver take a few seconds
+plus the download. Kansas (a 1,000 mi loop) downloads about 14,000 tiles
+along the rough loop and takes about a minute on a 2015 dual-core laptop.
 
 ## External services
 
 - Map tiles: Esri World Street Map by default; CyclOSM and OSM France in the layer switcher
 - Road data: OpenFreeMap vector tiles (tiles.openfreemap.org); Overpass API
   (overpass-api.de, with fallback mirrors) if they can't be reached
-- Elevation: Open-Meteo elevation API (about 90 m resolution)
+- Elevation: AWS Terrain Tiles (s3.amazonaws.com/elevation-tiles-prod, 10 m
+  data in the US, no request limit), read from the tile images in the
+  browser; Open-Meteo elevation API (about 90 m) if they can't be loaded
 - Place search and boundaries: Nominatim (names first; the boundary is
   downloaded only for the place you pick)
 

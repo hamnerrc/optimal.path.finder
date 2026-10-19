@@ -46,6 +46,7 @@ function serializeRoute(route, name) {
         coverage: route.coverage ?? null,
         startOffsetM: route.startOffsetM,
         reversed: route.reversed,
+        flags: route.flags || [],
         // Kept so reopening the loop doesn't need the elevation service.
         elevation: typeof route.elevation === "object" && route.elevation
             ? { heights: Array.from(route.elevation.heights, h => Math.round(h * 10) / 10), length: route.elevation.length }

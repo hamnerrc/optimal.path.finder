@@ -415,67 +415,15 @@ function largestComponent(g) {
 function buildFaces(N, eFrom, eTo, eLen, lines, target) {
     const E = lines.length;
 
-    // 1. Crossings between segments of different edges (grid of cells).
-    const CELL = 100;
-    const grid = new Map();
-    for (let e = 0; e < E; e++) {
-        const p = lines[e];
-        for (let i = 0; i + 3 < p.length; i += 2) {
-            const x0 = Math.floor(Math.min(p[i], p[i + 2]) / CELL), x1 = Math.floor(Math.max(p[i], p[i + 2]) / CELL);
-            const y0 = Math.floor(Math.min(p[i + 1], p[i + 3]) / CELL), y1 = Math.floor(Math.max(p[i + 1], p[i + 3]) / CELL);
-            for (let cx = x0; cx <= x1; cx++) {
-                for (let cy = y0; cy <= y1; cy++) {
-                    const key = cx * 65536 + cy;
-                    let cell = grid.get(key);
-                    if (!cell) grid.set(key, cell = []);
-                    cell.push(e, i);
-                }
-            }
-        }
-    }
-    const cuts = Array.from({ length: E }, () => []);   // [position, vertex]
-    const vx = [], vy = [];
-    const seenCut = new Set();
-    for (const [key, cell] of grid) {
-        for (let a = 0; a < cell.length; a += 2) {
-            const ea = cell[a], ia = cell[a + 1], pa = lines[ea];
-            const ax = pa[ia], ay = pa[ia + 1], rx = pa[ia + 2] - ax, ry = pa[ia + 3] - ay;
-            for (let b = a + 2; b < cell.length; b += 2) {
-                const eb = cell[b];
-                if (eb === ea) continue;
-                const ib = cell[b + 1], pb = lines[eb];
-                const bx = pb[ib], by = pb[ib + 1], sx = pb[ib + 2] - bx, sy = pb[ib + 3] - by;
-                const den = rx * sy - ry * sx;
-                if (den === 0) continue;
-                const t = ((bx - ax) * sy - (by - ay) * sx) / den;
-                const u = ((bx - ax) * ry - (by - ay) * rx) / den;
-                if (t < 0 || t > 1 || u < 0 || u > 1) continue;
-                const px = ax + t * rx, py = ay + t * ry;
-                // Count each crossing once: in the cell that holds it.
-                if (Math.floor(px / CELL) * 65536 + Math.floor(py / CELL) !== key) continue;
-                const posA = ia / 2 + t, posB = ib / 2 + u;
-                const endA = posA < 1e-6 ? eFrom[ea] : posA > pa.length / 2 - 1 - 1e-6 ? eTo[ea] : -1;
-                const endB = posB < 1e-6 ? eFrom[eb] : posB > pb.length / 2 - 1 - 1e-6 ? eTo[eb] : -1;
-                if (endA >= 0 && endB >= 0) continue;   // junctions of both
-                // Also found from the neighbouring segment if it's at a
-                // vertex of the road's geometry.
-                const id = `${Math.min(ea, eb)},${Math.max(ea, eb)},${px.toFixed(2)},${py.toFixed(2)}`;
-                if (seenCut.has(id)) continue;
-                seenCut.add(id);
-                if (endA >= 0 || endB >= 0) {
-                    // One road runs over a junction of the other (e.g. a
-                    // bridge right above a crossroads): split it there.
-                    if (endB >= 0) cuts[ea].push(posA, endB);
-                    else cuts[eb].push(posB, endA);
-                    continue;
-                }
-                const v = N + vx.length;
-                vx.push(px);
-                vy.push(py);
-                cuts[ea].push(posA, v);
-                cuts[eb].push(posB, v);
-            }
-        }
+    // 1. Crossings between segments of different edges (grid of cells). A
+    //    road that crosses itself (a footpath or drive looping back over
+    //    itself) would make the map non-planar, so its little loop is cut
+    //    off at the crossing first (in the map only: a loop on it still
+    //    follows the real road), and the crossings found again.
+    let { cuts, vx, vy, tangled } = findCrossings(N, eFrom, eTo, lines);
+    if (tangled.size) {
+        for (const e of tangled) lines[e] = untangleLine(lines[e]);
+        ({ cuts, vx, vy } = findCrossings(N, eFrom, eTo, lines));
     }
     const V = N + vx.length;
 
@@ -648,6 +596,115 @@ function buildFaces(N, eFrom, eTo, eLen, lines, target) {
     };
     if (target) faces.faceCover = faceCoverage(faces, pLine, target);
     return faces;
+}
+
+// Crossings between the lines of different edges, as cuts per edge
+// ([position along the line, vertex], …) and new "virtual" vertices
+// (numbered from N) at proper crossings; and the edges that cross
+// themselves.
+function findCrossings(N, eFrom, eTo, lines) {
+    const E = lines.length;
+    const CELL = 100;
+    const grid = new Map();
+    for (let e = 0; e < E; e++) {
+        const p = lines[e];
+        for (let i = 0; i + 3 < p.length; i += 2) {
+            const x0 = Math.floor(Math.min(p[i], p[i + 2]) / CELL), x1 = Math.floor(Math.max(p[i], p[i + 2]) / CELL);
+            const y0 = Math.floor(Math.min(p[i + 1], p[i + 3]) / CELL), y1 = Math.floor(Math.max(p[i + 1], p[i + 3]) / CELL);
+            for (let cx = x0; cx <= x1; cx++) {
+                for (let cy = y0; cy <= y1; cy++) {
+                    const key = cx * 65536 + cy;
+                    let cell = grid.get(key);
+                    if (!cell) grid.set(key, cell = []);
+                    cell.push(e, i);
+                }
+            }
+        }
+    }
+    const cuts = Array.from({ length: E }, () => []);   // [position, vertex]
+    const vx = [], vy = [];
+    const tangled = new Set();
+    const seenCut = new Set();
+    for (const [key, cell] of grid) {
+        for (let a = 0; a < cell.length; a += 2) {
+            const ea = cell[a], ia = cell[a + 1], pa = lines[ea];
+            const ax = pa[ia], ay = pa[ia + 1], rx = pa[ia + 2] - ax, ry = pa[ia + 3] - ay;
+            for (let b = a + 2; b < cell.length; b += 2) {
+                const eb = cell[b];
+                if (eb === ea) {
+                    // Non-adjacent segments of one line crossing.
+                    const ib = cell[b + 1];
+                    if (Math.abs(ib - ia) > 2 && !tangled.has(ea) && segmentsCross(pa, ia, ib)) tangled.add(ea);
+                    continue;
+                }
+                const ib = cell[b + 1], pb = lines[eb];
+                const bx = pb[ib], by = pb[ib + 1], sx = pb[ib + 2] - bx, sy = pb[ib + 3] - by;
+                const den = rx * sy - ry * sx;
+                if (den === 0) continue;
+                const t = ((bx - ax) * sy - (by - ay) * sx) / den;
+                const u = ((bx - ax) * ry - (by - ay) * rx) / den;
+                if (t < 0 || t > 1 || u < 0 || u > 1) continue;
+                const px = ax + t * rx, py = ay + t * ry;
+                // Count each crossing once: in the cell that holds it.
+                if (Math.floor(px / CELL) * 65536 + Math.floor(py / CELL) !== key) continue;
+                const posA = ia / 2 + t, posB = ib / 2 + u;
+                const endA = posA < 1e-6 ? eFrom[ea] : posA > pa.length / 2 - 1 - 1e-6 ? eTo[ea] : -1;
+                const endB = posB < 1e-6 ? eFrom[eb] : posB > pb.length / 2 - 1 - 1e-6 ? eTo[eb] : -1;
+                if (endA >= 0 && endB >= 0) continue;   // junctions of both
+                // Also found from the neighbouring segment if it's at a
+                // vertex of the road's geometry.
+                const id = `${Math.min(ea, eb)},${Math.max(ea, eb)},${px.toFixed(2)},${py.toFixed(2)}`;
+                if (seenCut.has(id)) continue;
+                seenCut.add(id);
+                if (endA >= 0 || endB >= 0) {
+                    // One road runs over a junction of the other (e.g. a
+                    // bridge right above a crossroads): split it there.
+                    if (endB >= 0) cuts[ea].push(posA, endB);
+                    else cuts[eb].push(posB, endA);
+                    continue;
+                }
+                const v = N + vx.length;
+                vx.push(px);
+                vy.push(py);
+                cuts[ea].push(posA, v);
+                cuts[eb].push(posB, v);
+            }
+        }
+    }
+    return { cuts, vx, vy, tangled };
+}
+
+// Whether segments i and j (indices into the flat [x, y, …] line p) cross
+// at a point inside both.
+function segmentsCross(p, i, j) {
+    const ax = p[i], ay = p[i + 1], rx = p[i + 2] - ax, ry = p[i + 3] - ay;
+    const bx = p[j], by = p[j + 1], sx = p[j + 2] - bx, sy = p[j + 3] - by;
+    const den = rx * sy - ry * sx;
+    if (den === 0) return false;
+    const t = ((bx - ax) * sy - (by - ay) * sx) / den;
+    const u = ((bx - ax) * ry - (by - ay) * rx) / den;
+    return t > 0 && t < 1 && u > 0 && u < 1;
+}
+
+// A line that crosses itself, with each loop it makes cut off at the
+// crossing.
+function untangleLine(p) {
+    let pts = p.slice();
+    for (let changed = true; changed;) {
+        changed = false;
+        search: for (let i = 0; i + 3 < pts.length; i += 2) {
+            for (let j = i + 4; j + 3 < pts.length; j += 2) {
+                if (!segmentsCross(pts, i, j)) continue;
+                const ax = pts[i], ay = pts[i + 1], rx = pts[i + 2] - ax, ry = pts[i + 3] - ay;
+                const sx = pts[j + 2] - pts[j], sy = pts[j + 3] - pts[j + 1];
+                const t = ((pts[j] - ax) * sy - (pts[j + 1] - ay) * sx) / (rx * sy - ry * sx);
+                pts = [...pts.slice(0, i + 2), ax + t * rx, ay + t * ry, ...pts.slice(j + 2)];
+                changed = true;
+                break search;
+            }
+        }
+    }
+    return pts;
 }
 
 // Biconnected components of a multigraph (Tarjan, iterative): returns the
@@ -851,6 +908,55 @@ function nearestJunction(g, px, py, allowed) {
         }
     }
     return best;
+}
+
+// The same for many points: junctions by grid cell, searched outward from
+// the point's cell. Returns nearest(px, py).
+function junctionFinder(g) {
+    const { N, x, y } = g;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (let n = 0; n < N; n++) {
+        minX = Math.min(minX, x[n]);
+        maxX = Math.max(maxX, x[n]);
+        minY = Math.min(minY, y[n]);
+        maxY = Math.max(maxY, y[n]);
+    }
+    // About two junctions per cell.
+    const cell = Math.max(1, Math.sqrt((maxX - minX) * (maxY - minY) / Math.max(1, N) * 2));
+    const W = Math.floor((maxX - minX) / cell) + 1, H = Math.floor((maxY - minY) / cell) + 1;
+    const cellOf = (n) => Math.floor((y[n] - minY) / cell) * W + Math.floor((x[n] - minX) / cell);
+    const off = new Int32Array(W * H + 1);
+    for (let n = 0; n < N; n++) off[cellOf(n) + 1]++;
+    for (let c = 0; c < W * H; c++) off[c + 1] += off[c];
+    const fill = off.slice(0, W * H), list = new Int32Array(N);
+    for (let n = 0; n < N; n++) list[fill[cellOf(n)]++] = n;
+    return (px, py) => {
+        const cx = Math.min(W - 1, Math.max(0, Math.floor((px - minX) / cell)));
+        const cy = Math.min(H - 1, Math.max(0, Math.floor((py - minY) / cell)));
+        let best = -1, bestD = Infinity;
+        for (let r = 0; r <= Math.max(W, H); r++) {
+            // Cells r rings out are at least (r − 1) cells away.
+            if (best >= 0 && ((r - 1) * cell) ** 2 > bestD) break;
+            for (let gy = cy - r; gy <= cy + r; gy++) {
+                if (gy < 0 || gy >= H) continue;
+                const edge = gy === cy - r || gy === cy + r;
+                for (let gx = cx - r; gx <= cx + r; gx += edge ? 1 : 2 * r) {
+                    if (gx < 0 || gx >= W) continue;
+                    const c = gy * W + gx;
+                    for (let k = off[c]; k < off[c + 1]; k++) {
+                        const n = list[k];
+                        const d = (x[n] - px) ** 2 + (y[n] - py) ** 2;
+                        if (d < bestD) {
+                            bestD = d;
+                            best = n;
+                        }
+                    }
+                    if (r === 0) break;
+                }
+            }
+        }
+        return best;
+    };
 }
 
 // --------------------------------------------------------------------------
@@ -1837,8 +1943,16 @@ class SweepSearch {
             this.refine(i);
             return;
         }
-        const recentre = this.best && this.rounds % SOLVER.recentreEvery === SOLVER.recentreEvery - 1;
-        const [u, v, w] = r3(i);
+
+        // Every few sweeps a search re-centres on its best loop so far. The
+        // other sweeps of all searches together take consecutive points of
+        // the evenly spread sequence: skipping every few points instead
+        // would leave whole directions out.
+        const every = SOLVER.recentreEvery;
+        const recentreSlot = this.rounds % every === every - 1;
+        const recentre = this.best && recentreSlot;
+        const fresh = this.worker + this.workers * (this.rounds - Math.floor(this.rounds / every));
+        const [u, v, w] = r3(recentreSlot ? 1e6 + i : fresh);
         let center;
         if (this.fixedCenter) {
             // Improving a rough loop: its own centre first, then nearby.
@@ -1849,8 +1963,10 @@ class SweepSearch {
             const spread = 0.1 * this.radius * Math.sqrt(u);
             center = { x: c.x + spread * Math.cos(2 * Math.PI * v), y: c.y + spread * Math.sin(2 * Math.PI * v) };
         } else if (isStart) {
-            // Anywhere a loop through the start could be centred.
-            const r = this.radius * Math.sqrt(0.04 + 1.1 * u);
+            // Where a loop through the start is centred: about a loop's
+            // radius away (a circle's or a square's, with the start
+            // anywhere on it), now and then anywhere nearer.
+            const r = this.radius * (i % 5 === 4 ? Math.sqrt(0.04 + 1.1 * u) : 0.6 + 0.6 * u);
             center = { x: this.origin.x + r * Math.cos(2 * Math.PI * v), y: this.origin.y + r * Math.sin(2 * Math.PI * v) };
         } else {
             const r = 0.35 * this.radius * Math.sqrt(u);
@@ -1869,7 +1985,11 @@ class SweepSearch {
             // A junction on the target's outline (or the rough loop's), in a
             // direction that turns by the golden angle each sweep.
             const phi = 2 * Math.PI * w;
-            const at = this.anchor && (this.fixedCenter || i % 2 === 0) ? this.anchor : outlinePoint(this.targetXY, center, phi, Math.sqrt(this.params.coverage));
+            // (On the outline shrunk to the coverage, or as far out as a
+            // little beyond it.)
+            const k = Math.sqrt(this.params.coverage);
+            const scale = k + (1.05 - k) * ((i * 0.6180339887) % 1);
+            const at = this.anchor && (this.fixedCenter || i % 2 === 0) ? this.anchor : outlinePoint(this.targetXY, center, phi, scale);
             s = nearestJunction(g, at.x, at.y, n => !g.faces.vCut[n]);
             budget = this.budget;
             const weights = SOLVER.coverageWeights;
@@ -1975,8 +2095,9 @@ class SweepSearch {
             }
             return out;
         };
-        // Window length: 3-25 km, at most a third of the loop.
-        const W = Math.min(3000 * 8 ** u, total() / 3);
+        // Window length: from 3 km up to 25 km or a twelfth of the loop
+        // (spread evenly on a log scale), at most a third of the loop.
+        const W = Math.min(3000 * Math.max(25 / 3, total() / 36000) ** u, total() / 3);
         const isEnd = (vtx) => vtx < g.N && !F.vCut[vtx] && !(isStart && vtx === loop.s);
         const sum = (arr, a, b) => b >= a ? arr[b] - arr[a] : arr[L.n] - arr[a] + arr[b];
 
@@ -2141,12 +2262,13 @@ function mulberry32(seed) {
 function traceLoop(g, ring) {
     const { N, x, y, eFrom, eTo, eLen, adjOff, adjEdge } = g;
     const spacing = 300;
+    const nearest = junctionFinder(g);
     const stops = [];
     for (let i = 0; i < ring.length; i++) {
         const a = ring[i], b = ring[(i + 1) % ring.length];
         const parts = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) / spacing));
         for (let k = 0; k < parts; k++) {
-            const n = nearestJunction(g, a.x + (b.x - a.x) * k / parts, a.y + (b.y - a.y) * k / parts);
+            const n = nearest(a.x + (b.x - a.x) * k / parts, a.y + (b.y - a.y) * k / parts);
             if (stops[stops.length - 1] !== n) stops.push(n);
         }
     }
@@ -2239,7 +2361,14 @@ function traceLoop(g, ring) {
 // distance along it to the nearest point, measured on a copy smoothed
 // `smooth` times so that positions change gradually around its corners.
 function positionsAlong(faces, ring, smooth = 3) {
-    let pts = ring;
+    // Points closer together than 1/4000 of the way round add nothing.
+    let around = 0;
+    for (let i = 0; i < ring.length; i++) around += Math.hypot(ring[(i + 1) % ring.length].x - ring[i].x, ring[(i + 1) % ring.length].y - ring[i].y);
+    let pts = [ring[0]];
+    for (const p of ring) {
+        const q = pts[pts.length - 1];
+        if (Math.hypot(p.x - q.x, p.y - q.y) >= around / 4000) pts.push(p);
+    }
     for (let pass = 0; pass < smooth; pass++) {
         // Chaikin corner cutting.
         const next = [];
@@ -2252,39 +2381,96 @@ function positionsAlong(faces, ring, smooth = 3) {
     const n = pts.length;
     const cum = new Float64Array(n + 1);
     for (let i = 0; i < n; i++) cum[i + 1] = cum[i] + Math.hypot(pts[(i + 1) % n].x - pts[i].x, pts[(i + 1) % n].y - pts[i].y);
-    // Segments by grid cell, searched outward from each vertex's cell.
-    const CELL = Math.max(200, cum[n] / 200);
-    const grid = new Map();
-    for (let i = 0; i < n; i++) {
+    // Segments by grid cell (each listed in every cell its box overlaps).
+    const { V, vX, vY } = faces;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    const extend = (x, y) => {
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+    };
+    for (const p of pts) extend(p.x, p.y);
+    for (let v = 0; v < V; v++) extend(vX[v], vY[v]);
+    const CELL = Math.max(200, cum[n] / 1000, Math.sqrt((maxX - minX) * (maxY - minY) / 4e6));
+    const W = Math.floor((maxX - minX) / CELL) + 1, H = Math.floor((maxY - minY) / CELL) + 1;
+    const cellX = (x) => Math.floor((x - minX) / CELL), cellY = (y) => Math.floor((y - minY) / CELL);
+    const eachCell = (i, fn) => {
         const a = pts[i], b = pts[(i + 1) % n];
-        for (let cx = Math.floor(Math.min(a.x, b.x) / CELL); cx <= Math.floor(Math.max(a.x, b.x) / CELL); cx++) {
-            for (let cy = Math.floor(Math.min(a.y, b.y) / CELL); cy <= Math.floor(Math.max(a.y, b.y) / CELL); cy++) {
-                const key = cx * 1e6 + cy;
-                if (!grid.has(key)) grid.set(key, []);
-                grid.get(key).push(i);
+        for (let cy = cellY(Math.min(a.y, b.y)); cy <= cellY(Math.max(a.y, b.y)); cy++) {
+            for (let cx = cellX(Math.min(a.x, b.x)); cx <= cellX(Math.max(a.x, b.x)); cx++) fn(cy * W + cx);
+        }
+    };
+    const segOff = new Int32Array(W * H + 1);
+    for (let i = 0; i < n; i++) eachCell(i, c => segOff[c + 1]++);
+    for (let c = 0; c < W * H; c++) segOff[c + 1] += segOff[c];
+    const segList = new Int32Array(segOff[W * H]), fill = segOff.slice(0, W * H);
+    for (let i = 0; i < n; i++) eachCell(i, c => { segList[fill[c]++] = i; });
+
+    let projT = 0;
+    const segDist2 = (i, px, py) => {
+        const a = pts[i], b = pts[(i + 1) % n];
+        const ex = b.x - a.x, ey = b.y - a.y, len2 = ex * ex + ey * ey;
+        projT = len2 > 0 ? Math.max(0, Math.min(1, ((px - a.x) * ex + (py - a.y) * ey) / len2)) : 0;
+        return (a.x + projT * ex - px) ** 2 + (a.y + projT * ey - py) ** 2;
+    };
+    // Calls fn(segment) for the segments in cells up to `reach` from cell
+    // (cx, cy) (some more than once); false if there were none.
+    const near = (cx, cy, reach, fn) => {
+        const rings = Math.ceil(reach / CELL) + 1;
+        let any = false;
+        for (let gy = Math.max(0, cy - rings); gy <= Math.min(H - 1, cy + rings); gy++) {
+            for (let gx = Math.max(0, cx - rings); gx <= Math.min(W - 1, cx + rings); gx++) {
+                const c = gy * W + gx;
+                for (let k = segOff[c]; k < segOff[c + 1]; k++) {
+                    any = true;
+                    fn(segList[k]);
+                }
             }
         }
-    }
-    const order = new Float64Array(faces.V);
-    for (let v = 0; v < faces.V; v++) {
-        const px = faces.vX[v], py = faces.vY[v];
-        const cx = Math.floor(px / CELL), cy = Math.floor(py / CELL);
+        return any;
+    };
+    // Per grid cell, the segments that can be nearest to some point in it:
+    // within d + 2h of its centre, where d is the distance from the centre
+    // to the nearest segment and h half the cell's diagonal.
+    const candOff = new Int32Array(W * H).fill(-1), candLen = new Int32Array(W * H);
+    let cand = new Int32Array(1024), candCount = 0;
+    const stamp = new Int32Array(n).fill(-1);
+    const candidates = (cx, cy) => {
+        const c = cy * W + cx;
+        if (candOff[c] >= 0) return c;
+        const mx = minX + (cx + 0.5) * CELL, my = minY + (cy + 0.5) * CELL;
+        let d = Infinity;
+        for (let reach = CELL; ; reach *= 2) {
+            const any = near(cx, cy, reach, i => { d = Math.min(d, segDist2(i, mx, my)); });
+            if ((any && reach * reach >= d) || reach > 2 * (W + H) * CELL) break;
+        }
+        const limit = Math.sqrt(d) + CELL * Math.SQRT2;
+        candOff[c] = candCount;
+        near(cx, cy, limit, i => {
+            if (stamp[i] === c || segDist2(i, mx, my) > limit * limit) return;
+            stamp[i] = c;
+            if (candCount === cand.length) {
+                const grown = new Int32Array(2 * cand.length);
+                grown.set(cand);
+                cand = grown;
+            }
+            cand[candCount++] = i;
+        });
+        candLen[c] = candCount - candOff[c];
+        return c;
+    };
+    const order = new Float64Array(V);
+    for (let v = 0; v < V; v++) {
+        const px = vX[v], py = vY[v];
+        const c = candidates(cellX(px), cellY(py));
         let best = Infinity, at = 0;
-        for (let ring = 0; ring < 50 && (best === Infinity || (ring - 1) * CELL < Math.sqrt(best)); ring++) {
-            for (let dx = -ring; dx <= ring; dx++) {
-                for (let dy = -ring; dy <= ring; dy++) {
-                    if (Math.max(Math.abs(dx), Math.abs(dy)) !== ring) continue;
-                    for (const i of grid.get((cx + dx) * 1e6 + cy + dy) || []) {
-                        const a = pts[i], b = pts[(i + 1) % n];
-                        const ex = b.x - a.x, ey = b.y - a.y, len2 = ex * ex + ey * ey;
-                        const t = len2 > 0 ? Math.max(0, Math.min(1, ((px - a.x) * ex + (py - a.y) * ey) / len2)) : 0;
-                        const d = (a.x + t * ex - px) ** 2 + (a.y + t * ey - py) ** 2;
-                        if (d < best) {
-                            best = d;
-                            at = cum[i] + t * (cum[i + 1] - cum[i]);
-                        }
-                    }
-                }
+        for (let k = candOff[c]; k < candOff[c] + candLen[c]; k++) {
+            const i = cand[k];
+            const d = segDist2(i, px, py);
+            if (d < best) {
+                best = d;
+                at = cum[i] + projT * (cum[i + 1] - cum[i]);
             }
         }
         order[v] = at;
@@ -2355,11 +2541,30 @@ class SearchTracker {
     // didn't change). Returns true if the overall best changed.
     report(result, index = this.rounds) {
         this.pending.set(index, result);
+        return this.flush();
+    }
+
+    // Search `worker` of `workers` has stopped (it found no loop at all):
+    // its sweeps count as finding nothing, so the others aren't held up.
+    drop(worker, workers) {
+        (this.dropped ||= new Set()).add(worker);
+        this.workers = workers;
+        return this.flush();
+    }
+
+    flush() {
         let changed = false;
-        while (this.pending.has(this.rounds) && !this.done) {
-            const next = this.pending.get(this.rounds);
-            this.pending.delete(this.rounds);
-            changed = this.count(next) || changed;
+        for (;;) {
+            if (this.done) break;
+            if (this.pending.has(this.rounds)) {
+                const next = this.pending.get(this.rounds);
+                this.pending.delete(this.rounds);
+                changed = this.count(next) || changed;
+            } else if (this.dropped?.has(this.rounds % this.workers)) {
+                changed = this.count(null) || changed;
+            } else {
+                break;
+            }
         }
         return changed;
     }
@@ -2437,15 +2642,26 @@ function expandLoop(prep, res, params, exact) {
         stemM = res.metrics.stem;
     }
 
-    const coords = [];
-    let hops = 0, railM = 0;
+    // Stretches to check before running: fence hops, railroad tracks and
+    // roads marked private (each a run of road geometry).
+    const coords = [], flags = [];
+    let hops = 0, railM = 0, privateM = 0;
     for (const [e, dir] of ordered) {
-        if (prep.source[e].highway === "hop") hops++;
-        else if (prep.source[e].highway === "railway") railM += prep.source[e].distance;
-        const geometry = prep.source[e].coords;
-        const line = dir === 1 ? geometry : [...geometry].reverse();
+        const edge = prep.source[e];
+        const kind = edge.highway === "hop" ? "hop" : edge.highway === "railway" ? "rail" : edge.restricted ? "private" : null;
+        if (kind === "hop") hops++;
+        else if (kind === "rail") railM += edge.distance;
+        else if (kind === "private") privateM += edge.distance;
+        const line = dir === 1 ? edge.coords : [...edge.coords].reverse();
+        if (kind) {
+            const last = flags[flags.length - 1];
+            if (last && last.kind === kind && last.end === coords.length - 1) last.coords.push(...line.slice(1));
+            else flags.push({ kind, coords: line.slice() });
+        }
         for (let k = coords.length ? 1 : 0; k < line.length; k++) coords.push(line[k]);
+        if (kind) flags[flags.length - 1].end = coords.length - 1;
     }
+    flags.forEach(flag => delete flag.end);
 
     const m = res.metrics;
     const result = {
@@ -2458,6 +2674,8 @@ function expandLoop(prep, res, params, exact) {
         stemM,
         hops,                         // fence hops used
         railM,                        // length along railroad tracks
+        privateM,                     // length on roads marked private
+        flags,                        // [{ kind: "hop" | "rail" | "private", coords }]
         score: res.score,
         feasible: res.feasible,
         center: res.center,

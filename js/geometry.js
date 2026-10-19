@@ -354,17 +354,31 @@ function createShapeRegion(shape) {
     return createPolygonRegion(shape.points, shape.type);
 }
 
-// The region roads are loaded from for an area search: the shape's convex
-// hull grown by `factor` around its center, so the loop can use roads just
-// outside it, including around the outside of any inward notches (e.g. in
-// city limits).
+// The region roads are loaded from for an area search, so the loop can use
+// roads just outside the shape, e.g. around the outside of inward notches
+// (in city limits) or at the corners of a square of streets around a round
+// area: the shape's convex hull grown by `factor` around its centre,
+// together with its bounding box (north-south and east-west, like most road
+// grids) grown by `factor` around its centre (the convex hull of both).
 function marginRegion(region, factor) {
-    if (region.type === "circle") return createCircleRegion(region.center, region.radiusMeters * factor);
     const bbox = region.bbox;
     const { toXY, toLatLng } = localProjection((bbox.minLat + bbox.maxLat) / 2, (bbox.minLng + bbox.maxLng) / 2);
-    const xy = convexHull(region.outline.map(toXY));
-    const c = polygonCentroidXY(xy);
-    return createPolygonRegion(xy.map(p => toLatLng(c.x + (p.x - c.x) * factor, c.y + (p.y - c.y) * factor)));
+    const hull = convexHull(region.outline.map(toXY));
+    const c = polygonCentroidXY(hull);
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const p of hull) {
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+    }
+    const mx = (minX + maxX) / 2, my = (minY + maxY) / 2;
+    const hx = (maxX - minX) / 2 * factor, hy = (maxY - minY) / 2 * factor;
+    const grown = convexHull([
+        ...hull.map(p => ({ x: c.x + (p.x - c.x) * factor, y: c.y + (p.y - c.y) * factor })),
+        { x: mx - hx, y: my - hy }, { x: mx + hx, y: my - hy }, { x: mx + hx, y: my + hy }, { x: mx - hx, y: my + hy }
+    ]);
+    return createPolygonRegion(grown.map(p => toLatLng(p.x, p.y)));
 }
 
 // Convex hull (monotone chain), counter-clockwise.

@@ -49,12 +49,15 @@ const CONFIG = {
     defaultPaceSecPerMile: 540,
 
     // Big searches. Up to fullDetailMaxSqMiles of road area, every road is
-    // loaded at once (a 10 mi loop). Larger searches go in two stages: a
-    // rough loop on major roads only, from coarser tiles (at most
-    // maxCoarseTiles of them), then all roads in a corridor along that loop
-    // to improve it.
+    // loaded at once (a 10 mi loop). So are larger areas with few roads
+    // (the countryside): up to maxFullTiles road tiles holding no more than
+    // maxFullVertices road points. Other searches go in two stages: a rough
+    // loop on major roads only, from coarser tiles (at most maxCoarseTiles
+    // of them), then all roads in a corridor along that loop to improve it.
     chunked: {
         fullDetailMaxSqMiles: 80,
+        maxFullTiles: 2500,
+        maxFullVertices: 800000,
         maxCoarseTiles: 150,
         coarseRoadTypes: [
             "motorway", "motorway_link", "trunk", "trunk_link",
@@ -70,7 +73,10 @@ const CONFIG = {
         // the start, but the roundest loops stay within about L/π. The rough
         // stage loads roads within this fraction of L.
         startRadiusFraction: 0.4,
-        corridorRadiusM: 1000
+        // The corridor reaches this share of the rough loop's size (its
+        // length / π) to either side, and at least corridorMinM.
+        corridorFraction: 0.03,
+        corridorMinM: 1000
     },
 
     // Ask for confirmation before downloading areas larger than this.
@@ -126,11 +132,18 @@ const CONFIG = {
         cacheMaxWays: 400000
     },
 
+    // Elevation profile: terrain tiles (Terrarium-encoded PNGs), read at the
+    // most detailed zoom (up to maxTileZoom) that needs at most maxTiles
+    // tiles; Open-Meteo if they can't be loaded.
     elevation: {
+        tileUrl: "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png",
+        maxTileZoom: 14,
+        maxTiles: 48,
+        cacheTiles: 96,
         url: "https://api.open-meteo.com/v1/elevation",
         batchSize: 100,          // coordinates per request (API limit)
-        maxSamples: 200,
-        minSpacingM: 40,
+        maxSamples: 1000,
+        minSpacingM: 20,
         climbThresholdM: 2       // ignore up/down wiggles smaller than this
     },
 
@@ -146,6 +159,7 @@ const CONFIG = {
         network: "#64748b",
         route: "#e11d48",
         routeMuted: "#7c3aed",
-        start: "#16a34a"
+        start: "#16a34a",
+        flag: "#d97706"
     }
 };

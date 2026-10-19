@@ -45,22 +45,30 @@ async function searchLoop(job, options) {
 }
 
 async function searchRegion(job, options) {
-    const sqMiles = sqKmToSqMiles(job.region.areaSqKm);
-    if (sqMiles <= CONFIG.chunked.fullDetailMaxSqMiles) {
+    const small = sqKmToSqMiles(job.region.areaSqKm) <= CONFIG.chunked.fullDetailMaxSqMiles;
+    if (small || fewTiles(job.region)) {
         try {
-            return await searchFullDetail(job, options);
+            return await searchFullDetail(job, options, small ? Infinity : CONFIG.chunked.maxFullVertices);
         } catch (err) {
-            // Too many roads for one Overpass download: fall back to stages.
-            if (!isTooBig(err)) throw err;
+            // Too many roads for one download: fall back to stages.
+            if (!isTooBig(err) && !err.tooManyRoads) throw err;
             options.onStatus("Too many roads for one download. Switching to a staged search…", 0);
         }
     }
     return searchStaged(job, options);
 }
 
-async function searchFullDetail(job, { signal, onStatus, onLoop, onNetwork }) {
+// Whether all roads in a region come in few enough tiles to load at once
+// (if they don't hold too many roads, see CONFIG.chunked).
+function fewTiles(region) {
+    const max = CONFIG.chunked.maxFullTiles;
+    return tileRange(region.bbox, CONFIG.roadTiles.zoom).count <= 4 * max &&
+        tilesCovering(region, CONFIG.roadTiles.zoom).length <= max;
+}
+
+async function searchFullDetail(job, { signal, onStatus, onLoop, onNetwork }, maxVertices = Infinity) {
     const osm = await loadRoads(job.region, job.roads, signal, (done, total) =>
-        onStatus(total > 1 ? `Loading roads (${done} of ${total} tiles)…` : "Loading roads…", 0));
+        onStatus(total > 1 ? `Loading roads (${done} of ${total} tiles)…` : "Loading roads…", 0), maxVertices);
     onStatus("Building road network…", 0);
     await nextFrame();
     const network = buildRoadNetwork(osm, job.region);
@@ -108,7 +116,8 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
     try {
         let line = rough.coords.map(([lat, lng]) => ({ lat, lng }));
         if (objective.mode === "start") line = [objective.start, ...line];
-        const corridor = createCorridorRegion(simplifyLine(line, 400), settings.corridorRadiusM);
+        const radius = Math.max(settings.corridorMinM, settings.corridorFraction * rough.lengthM / Math.PI);
+        const corridor = createCorridorRegion(simplifyLine(line, 400), radius);
         const local = buildRoadNetwork(await loadRoads(corridor, job.roads, signal, (done, total) =>
             onStatus(`Loading all roads along the rough loop (${done} of ${total} tiles)…`, 0.4)), corridor);
         if (local.edges.length === 0) return rough;
@@ -139,7 +148,7 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
 // Failures are ignored; the search itself will try again.
 function prefetchRoads(job) {
     const settings = CONFIG.chunked;
-    if (sqKmToSqMiles(job.region.areaSqKm) <= settings.fullDetailMaxSqMiles) {
+    if (sqKmToSqMiles(job.region.areaSqKm) <= settings.fullDetailMaxSqMiles || fewTiles(job.region)) {
         prefetchTiles(job.region, CONFIG.roadTiles.zoom).catch(() => {});
         return;
     }
@@ -151,13 +160,14 @@ function prefetchRoads(job) {
 
 // All roads in a region: vector tiles, or Overpass if the tile server
 // can't be reached (without fence hops there). onProgress(done, total)
-// counts tiles.
-async function loadRoads(region, roads, signal, onProgress) {
+// counts tiles. Fails with err.tooManyRoads if the tiles hold more than
+// maxVertices road points.
+async function loadRoads(region, roads, signal, onProgress, maxVertices = Infinity) {
     const roadTypes = roadTypesFor(roads);
     try {
-        return await fetchRoadsFromTiles(region, signal, { roadTypes, noExpressways: Boolean(roads?.noMotorways), hops: Boolean(roads?.hops), onProgress });
+        return await fetchRoadsFromTiles(region, signal, { roadTypes, noExpressways: Boolean(roads?.noMotorways), hops: Boolean(roads?.hops), onProgress, maxVertices });
     } catch (err) {
-        if (err.name === "AbortError") throw err;
+        if (err.name === "AbortError" || err.tooManyRoads) throw err;
         console.warn("[Roads] Tiles unavailable, using Overpass:", err);
         onProgress(0, 1);
         return fetchRoads(region, signal, roadTypes);
