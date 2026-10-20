@@ -101,7 +101,7 @@ const workerPool = [];
 let nextRun = 1;
 
 function poolWorkers(count) {
-    while (workerPool.length < count) workerPool.push(new Worker("js/solver-worker.js"));
+    while (workerPool.length < count) workerPool.push(new Worker(`js/solver-worker.js?v=${CONFIG.release}`));
     return workerPool.slice(0, count);
 }
 

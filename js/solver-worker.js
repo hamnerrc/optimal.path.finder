@@ -3,7 +3,8 @@
 // best, index } after every sweep (`best` is this search's best loop when it
 // improved, otherwise null; `index` the sweep's number in the shared
 // sequence) until told { type: "stop" } or given another run.
-importScripts("geometry.js", "solver.js");
+// (With the page's release number, see index.html.)
+importScripts(...["geometry.js", "solver.js"].map(f => f + self.location.search));
 
 const SLICE_MS = 50;
 let current = 0;

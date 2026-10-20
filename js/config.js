@@ -3,6 +3,9 @@
 // ==========================================================================
 
 const CONFIG = {
+    // Release number, as in index.html's ?v= (for the worker's scripts).
+    release: 11,
+
     map: {
         initialCenter: [20, 0],
         initialZoom: 2,
