@@ -143,7 +143,7 @@ async function addRoadClimb(network, signal) {
     while (z > 1 && tilesAt(z, fn => nodes.forEach(p => fn(p.lat, p.lng))).length > searchMaxTiles) z--;
     // Every tile a road passes through (roads can leave the junctions' tiles).
     const keys = tilesAt(z, fn => {
-        for (const edge of network.edges) for (const [lat, lng] of edge.coords) fn(lat, lng);
+        for (const { pts } of network.edges) for (let i = 0; i < pts.length; i += 2) fn(pts[i], pts[i + 1]);
     });
     const tiles = new Map();
     try {
@@ -161,15 +161,15 @@ async function addRoadClimb(network, signal) {
     const spacing = Math.max(CONFIG.elevation.minSpacingM, EARTH_RADIUS_M * 2 * Math.PI * Math.cos(lat0 * DEG) / (256 * 2 ** z));
     const threshold = CONFIG.elevation.climbThresholdM;
     for (const edge of network.edges) {
-        const c = edge.coords;
+        const c = edge.pts, last = c.length - 2;
         if (edge.level) {
-            edge.climb = Math.abs(height(c[c.length - 1][0], c[c.length - 1][1]) - height(c[0][0], c[0][1])) / 2 || 0;
+            edge.climb = Math.abs(height(c[last], c[last + 1]) - height(c[0], c[1])) / 2 || 0;
             continue;
         }
         // Ups and downs, ignoring wiggles under climbThresholdM (data noise).
-        let total = 0, anchor = height(c[0][0], c[0][1]), h = anchor;
-        for (let i = 1; i < c.length; i++) {
-            const [aLat, aLng] = c[i - 1], [bLat, bLng] = c[i];
+        let total = 0, anchor = height(c[0], c[1]), h = anchor;
+        for (let i = 2; i < c.length; i += 2) {
+            const aLat = c[i - 2], aLng = c[i - 1], bLat = c[i], bLng = c[i + 1];
             const steps = Math.ceil(haversine(aLat, aLng, bLat, bLng) / spacing);
             for (let k = 1; k <= steps; k++) {
                 h = height(aLat + (bLat - aLat) * k / steps, aLng + (bLng - aLng) * k / steps);

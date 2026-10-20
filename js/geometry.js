@@ -279,6 +279,9 @@ function createCorridorRegion(points, radiusMeters) {
         }
     }
 
+    const sub = radiusMeters / 4, halfDiagonal = sub * Math.SQRT1_2;
+    const squares = new Map();
+
     return {
         type: "corridor",
         points,
@@ -290,7 +293,18 @@ function createCorridorRegion(points, radiusMeters) {
             const p = toXY({ lat, lng });
             if (xy.length === 1) return (p.x - xy[0].x) ** 2 + (p.y - xy[0].y) ** 2 <= r2;
             const near = grid.get(key(Math.floor(p.x / cell), Math.floor(p.y / cell)));
-            return Boolean(near) && near.some(i => distanceToSegmentSq(p, xy[i - 1], xy[i]) <= r2);
+            if (!near) return false;
+            // Small squares (a quarter radius wide) wholly inside or outside
+            // are remembered, so most points need no distance test.
+            const sx = Math.floor(p.x / sub), sy = Math.floor(p.y / sub), k = sx * 1e7 + sy;
+            let known = squares.get(k);
+            if (known === undefined) {
+                const c = { x: (sx + 0.5) * sub, y: (sy + 0.5) * sub };
+                const d = Math.sqrt(Math.min(...near.map(i => distanceToSegmentSq(c, xy[i - 1], xy[i]))));
+                known = d + halfDiagonal <= radiusMeters ? 1 : d - halfDiagonal > radiusMeters ? 0 : -1;
+                squares.set(k, known);
+            }
+            return known >= 0 ? known === 1 : near.some(i => distanceToSegmentSq(p, xy[i - 1], xy[i]) <= r2);
         },
         // Overpass accepts a polyline for "around".
         overpassFilter: `(around:${radiusMeters.toFixed(0)},${points.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(",")})`

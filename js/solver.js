@@ -83,6 +83,12 @@ const SOLVER = {
     // Improving a rough loop (SweepSearch.refine): rounds are whole passes
     // along the loop, so far fewer are needed.
     refineSweeps: 8,
+    // The rough loop of a staged search only sets the shape, so its search
+    // settles sooner too.
+    roughSweeps: 20,
+    // ...and the shortest stretch rerouted is at least 1/refineWindows of
+    // the loop (see refine).
+    refineWindows: 400,
     // What the search adds to a road's cost on top of its length (the
     // loop's real length and area are still what's shown): this many
     // meters per meter of climb along it with "prefer flatter loops", and
@@ -121,12 +127,14 @@ const SOLVER = {
 //   lat0, lng0, kx, ky          the projection
 //   startX, startY              start mode: the start node
 //   faces                       the planar map and its faces (buildFaces)
-//   ePen                        start mode: area lost to each merged edge's
+//   ePen                        start mode, or area mode with a length
+//                               limit: area lost to each merged edge's
 //                               extra cost (see SOLVER.climbCost); also
-//                               faces.pPen per piece. In area mode the
-//                               extra cost is part of eLen and pLen.
+//                               faces.pPen per piece. Otherwise the extra
+//                               cost is part of eLen and pLen.
 // params.preferSmall: count big roads as a little longer (bigRoadCost).
-// params.preferFlat: count the climb along roads as extra length (climbCost).
+// params.preferFlat: count the climb along roads as extra length
+// (params.climbCost meters per meter, or SOLVER.climbCost).
 // params.avoidMotorways: count motorways as much longer (avoidedRoadCost).
 // The rest (chains of original edges, stem paths) stays on the main thread
 // to turn results back into road geometry (expandLoop).
@@ -170,13 +178,13 @@ function prepareGraph(network, params) {
         oFrom[e] = index.get(edge.from);
         oTo[e] = index.get(edge.to);
         oLen[e] = edge.distance;
-        oExtra[e] = (params.preferFlat ? SOLVER.climbCost * (edge.climb || 0) : 0) +
+        oExtra[e] = (params.preferFlat ? (params.climbCost ?? SOLVER.climbCost) * (edge.climb || 0) : 0) +
             (params.preferSmall ? (SOLVER.bigRoadCost[edge.highway] || 0) * edge.distance : 0) +
             (params.avoidMotorways && SOLVER.avoidedRoads.includes(edge.highway) ? SOLVER.avoidedRoadCost * edge.distance : 0);
         let cross = 0;
-        for (let i = 1; i < edge.coords.length; i++) {
-            const [aLat, aLng] = edge.coords[i - 1];
-            const [bLat, bLng] = edge.coords[i];
+        const c = edge.pts;
+        for (let i = 2; i < c.length; i += 2) {
+            const aLat = c[i - 2], aLng = c[i - 1], bLat = c[i], bLng = c[i + 1];
             const ax = (aLng - lng0) * kx, ay = (aLat - lat0) * ky;
             const bx = (bLng - lng0) * kx, by = (bLat - lat0) * ky;
             cross += ax * by - bx * ay;
@@ -317,11 +325,11 @@ function prepareGraph(network, params) {
         const pts = [];
         let at = chain.from;
         for (const oe of chain.edges) {
-            const coords = source[oe].coords;
+            const c = source[oe].pts, n = c.length / 2;
             const forward = oFrom[oe] === at;
-            for (let k = pts.length ? 1 : 0; k < coords.length; k++) {
-                const [lat, lng] = coords[forward ? k : coords.length - 1 - k];
-                pts.push((lng - lng0) * kx, (lat - lat0) * ky);
+            for (let k = pts.length ? 1 : 0; k < n; k++) {
+                const j = 2 * (forward ? k : n - 1 - k);
+                pts.push((c[j + 1] - lng0) * kx, (c[j] - lat0) * ky);
             }
             at = other(oe, at);
         }
@@ -333,9 +341,12 @@ function prepareGraph(network, params) {
         return pts;
     });
     const targetXY = params.mode === "area" ? params.target.map(p => project(p.lat, p.lng)) : null;
-    // Extra cost (SOLVER.climbCost): area mode, as length.
+    // Extra cost (SOLVER.climbCost): area mode, as length; with a length
+    // limit (and in start mode) as lost area instead, so it doesn't use up
+    // the limit (see below).
+    const costAsArea = params.mode === "start" || params.maxLengthM > 0;
     const realLen = eLen.slice();
-    if (params.mode === "area") for (let e = 0; e < E; e++) eLen[e] += eExtra[e];
+    if (!costAsArea) for (let e = 0; e < E; e++) eLen[e] += eExtra[e];
 
     const data = {
         N: M, E, x, y, eFrom, eTo, eLen, eCross,
@@ -344,9 +355,10 @@ function prepareGraph(network, params) {
         lat0, lng0, kx, ky,
         faces: buildFaces(M, eFrom, eTo, eLen, lines, targetXY)
     };
-    if (params.mode === "start") {
-        // Start mode, as area: each meter costs what one more meter of a
-        // round loop of the length limit would enclose.
+    if (costAsArea) {
+        // As area: each meter costs what one more meter of a round loop of
+        // the length limit would enclose. (For a round loop that lowers its
+        // roundness as much as the same extra length would.)
         const perMeter = 0.8 * params.maxLengthM / (2 * Math.PI);
         const { P, pEdge, pLen } = data.faces;
         data.ePen = Float64Array.from(eExtra, extra => perMeter * extra);
@@ -647,28 +659,61 @@ function buildFaces(N, eFrom, eTo, eLen, lines, target) {
 // themselves.
 function findCrossings(N, eFrom, eTo, lines) {
     const E = lines.length;
-    const CELL = 100;
-    const grid = new Map();
+    // Cells about as wide as the average segment is long (at least 100 m),
+    // and few enough that cell and segment numbers fit in one number.
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity, S = 0, total = 0;
+    for (const p of lines) {
+        S += p.length / 2 - 1;
+        for (let i = 0; i < p.length; i += 2) {
+            if (i > 0) total += Math.abs(p[i] - p[i - 2]) + Math.abs(p[i + 1] - p[i - 1]);
+            if (p[i] < minX) minX = p[i];
+            if (p[i] > maxX) maxX = p[i];
+            if (p[i + 1] < minY) minY = p[i + 1];
+            if (p[i + 1] > maxY) maxY = p[i + 1];
+        }
+    }
+    const CELL = Math.max(100, total / Math.max(1, S), Math.sqrt((maxX - minX + 1) * (maxY - minY + 1) * S / 2 ** 50));
+    // (cell, segment) pairs packed into numbers and sorted, which groups
+    // them by cell without a Map of lists (see nodeLines).
+    const H = Math.floor((maxY - minY) / CELL) + 1;
+    const cellOf = (x, y) => Math.floor((x - minX) / CELL) * H + Math.floor((y - minY) / CELL);
+    const segLine = new Int32Array(S), segIndex = new Int32Array(S);
+    let pairs = new Float64Array(Math.max(16, Math.ceil(S * 1.5)));
+    let np = 0, sg = 0;
     for (let e = 0; e < E; e++) {
         const p = lines[e];
-        for (let i = 0; i + 3 < p.length; i += 2) {
-            const x0 = Math.floor(Math.min(p[i], p[i + 2]) / CELL), x1 = Math.floor(Math.max(p[i], p[i + 2]) / CELL);
-            const y0 = Math.floor(Math.min(p[i + 1], p[i + 3]) / CELL), y1 = Math.floor(Math.max(p[i + 1], p[i + 3]) / CELL);
+        for (let i = 0; i + 3 < p.length; i += 2, sg++) {
+            segLine[sg] = e;
+            segIndex[sg] = i;
+            const x0 = Math.floor((Math.min(p[i], p[i + 2]) - minX) / CELL), x1 = Math.floor((Math.max(p[i], p[i + 2]) - minX) / CELL);
+            const y0 = Math.floor((Math.min(p[i + 1], p[i + 3]) - minY) / CELL), y1 = Math.floor((Math.max(p[i + 1], p[i + 3]) - minY) / CELL);
             for (let cx = x0; cx <= x1; cx++) {
                 for (let cy = y0; cy <= y1; cy++) {
-                    const key = cx * 65536 + cy;
-                    let cell = grid.get(key);
-                    if (!cell) grid.set(key, cell = []);
-                    cell.push(e, i);
+                    if (np === pairs.length) {
+                        const grown = new Float64Array(2 * np);
+                        grown.set(pairs);
+                        pairs = grown;
+                    }
+                    pairs[np++] = (cx * H + cy) * S + sg;
                 }
             }
         }
     }
+    pairs = pairs.subarray(0, np).sort();
+
     const cuts = Array.from({ length: E }, () => []);   // [position, vertex]
     const vx = [], vy = [];
     const tangled = new Set();
     const seenCut = new Set();
-    for (const [key, cell] of grid) {
+    const cell = [];
+    for (let k = 0; k < np;) {
+        const key = Math.floor(pairs[k] / S);
+        cell.length = 0;
+        for (; k < np && Math.floor(pairs[k] / S) === key; k++) {
+            const sgi = pairs[k] - key * S;
+            cell.push(segLine[sgi], segIndex[sgi]);
+        }
+        if (cell.length < 4) continue;
         for (let a = 0; a < cell.length; a += 2) {
             const ea = cell[a], ia = cell[a + 1], pa = lines[ea];
             const ax = pa[ia], ay = pa[ia + 1], rx = pa[ia + 2] - ax, ry = pa[ia + 3] - ay;
@@ -689,7 +734,7 @@ function findCrossings(N, eFrom, eTo, lines) {
                 if (t < 0 || t > 1 || u < 0 || u > 1) continue;
                 const px = ax + t * rx, py = ay + t * ry;
                 // Count each crossing once: in the cell that holds it.
-                if (Math.floor(px / CELL) * 65536 + Math.floor(py / CELL) !== key) continue;
+                if (cellOf(px, py) !== key) continue;
                 const posA = ia / 2 + t, posB = ib / 2 + u;
                 const endA = posA < 1e-6 ? eFrom[ea] : posA > pa.length / 2 - 1 - 1e-6 ? eTo[ea] : -1;
                 const endB = posB < 1e-6 ? eFrom[eb] : posB > pb.length / 2 - 1 - 1e-6 ? eTo[eb] : -1;
@@ -1133,7 +1178,7 @@ function polarTarget(target, cx, cy, theta0, bins) {
 
 // objective:
 //   mode        "start" | "area"
-//   maxLengthM  (start)  the loop may not be longer
+//   maxLengthM  the loop may not be longer (start; area: optional)
 //   coverage    (area)   0..1 share of the target the loop must enclose
 //   targetArea  (area)   m², for the tiebreak
 // metrics: { length, area, repeats, coverage? }
@@ -1142,7 +1187,8 @@ function polarTarget(target, cx, cy, theta0, bins) {
 // a small bonus for enclosing more area, so that of two equally round loops
 // the bigger one wins. Unmet requirements shrink the score steeply instead of
 // ruling the loop out, so the best loop so far can be shown even if none
-// meets them.
+// meets them. In area mode the length limit comes first: a loop over it
+// scores below one that covers less within it.
 function scoreLoop(metrics, objective) {
     const repeatFactor = 0.8 ** metrics.repeats;
     if (objective.mode === "start") {
@@ -1154,10 +1200,11 @@ function scoreLoop(metrics, objective) {
     }
     const iq = 4 * Math.PI * metrics.area / metrics.length ** 2;
     const short = metrics.coverage / objective.coverage;
+    const over = objective.maxLengthM ? metrics.length / objective.maxLengthM : 0;
     const sizeBonus = SOLVER.areaTiebreak * Math.min(metrics.area / objective.targetArea, 2);
     return {
-        score: (iq + sizeBonus) * (short < 1 ? short ** 6 : 1) * repeatFactor,
-        feasible: short >= 1 && metrics.repeats === 0
+        score: (iq + sizeBonus) * (short < 1 ? short ** 6 : 1) * (over > 1 ? over ** -40 : 1) * repeatFactor,
+        feasible: short >= 1 && over <= 1 && metrics.repeats === 0
     };
 }
 
@@ -1953,8 +2000,12 @@ class SweepSearch {
             let perimeter = 0;
             hull.forEach((p, i) => { perimeter += Math.hypot(hull[(i + 1) % hull.length].x - p.x, hull[(i + 1) % hull.length].y - p.y); });
             // Loops longer than this can't be rounder than ones that are
-            // shorter and still cover enough.
-            this.budget = Math.max(1.5 * perimeter, 2.5 * Math.PI * this.radius);
+            // shorter and still cover enough (or are over the limit).
+            this.budget = Math.min(Math.max(1.5 * perimeter, 2.5 * Math.PI * this.radius), params.maxLengthM || Infinity);
+            // How far out from the middle loops reach, as a share of the
+            // target's size: enough to cover the target, or as far as the
+            // length limit allows.
+            this.reach = Math.min(Math.sqrt(params.coverage), (params.maxLengthM || Infinity) / (2 * Math.PI * this.radius));
             this.anchor = params.anchor ? project(params.anchor) : null;
         }
     }
@@ -1983,11 +2034,12 @@ class SweepSearch {
             // (If it can't be polished, e.g. as it crosses itself on a
             // bridge, it is still a loop on the real roads.)
             const loop = traced && (this.polishLoop(traced, true) || this.measureLoop(traced));
-            if (loop) {
-                const cand = this.candidate(loop, loop.join, loop.stem, this.fixedCenter);
-                cand.centroid = loopCentroid(g, cand.edges, cand.dirs);
-                this.best = cand;
-            }
+            // (Then the roads along it are broken somewhere: searching them
+            // blindly would only find small loops, slowly.)
+            if (!loop) throw new Error("Couldn't follow the rough loop on these roads.");
+            const cand = this.candidate(loop, loop.join, loop.stem, this.fixedCenter);
+            cand.centroid = loopCentroid(g, cand.edges, cand.dirs);
+            this.best = cand;
         }
         // Improving a rough loop: after the first sweep, mostly reroute the
         // best loop stretch by stretch.
@@ -2039,7 +2091,7 @@ class SweepSearch {
             const phi = 2 * Math.PI * w;
             // (On the outline shrunk to the coverage, or as far out as a
             // little beyond it.)
-            const k = Math.sqrt(this.params.coverage);
+            const k = this.reach;
             const scale = k + (1.05 - k) * ((i * 0.6180339887) % 1);
             const at = this.anchor && (this.fixedCenter || i % 2 === 0) ? this.anchor : outlinePoint(this.targetXY, center, phi, scale);
             s = nearestJunction(g, at.x, at.y, n => !g.faces.vCut[n]);
@@ -2054,7 +2106,7 @@ class SweepSearch {
             ? (area, covered, length) => scoreLoop({ length: length + 2 * stem, area, repeats: 0 }, objective)
             : (area, covered, length) => scoreLoop({ length, area, coverage: covered / this.targetArea, repeats: 0 }, objective);
         // Marginal area per meter of length for a round loop of this size.
-        const lambda = 0.8 * (isStart ? budget : 2 * Math.PI * this.radius) / (2 * Math.PI) * (1 + mu);
+        const lambda = 0.8 * (isStart ? budget : Math.min(2 * Math.PI * this.radius, this.budget)) / (2 * Math.PI) * (1 + mu);
         // Improving a rough loop: the first sweep goes in order along it
         // rather than around the centre, so it can follow its every wiggle.
         const along = this.along && i === 1 ? this.along : null;
@@ -2152,9 +2204,11 @@ class SweepSearch {
             }
             return out;
         };
-        // Window length: from 3 km up to 25 km or a twelfth of the loop
-        // (spread evenly on a log scale), at most a third of the loop.
-        const W = Math.min(3000 * Math.max(25 / 3, total() / 36000) ** u, total() / 3);
+        // Window length: from 3 km (or a 400th of a very long loop) up to
+        // 25 km or a twelfth of the loop (spread evenly on a log scale), at
+        // most a third of the loop.
+        const wMin = Math.max(3000, total() / SOLVER.refineWindows), wMax = Math.max(25000, total() / 12);
+        const W = Math.min(wMin * Math.max(1, wMax / wMin) ** u, total() / 3);
         const isEnd = (vtx) => vtx < g.N && !F.vCut[vtx] && !(isStart && vtx === loop.s);
         const sum = (arr, a, b) => b >= a ? arr[b] - arr[a] : arr[L.n] - arr[a] + arr[b];
 
@@ -2257,7 +2311,7 @@ class SweepSearch {
     polishLoop(loop, keep = false) {
         if (!this.polish) {
             const { isStart, objective, targetArea } = this;
-            const maxLength = objective.maxLengthM, need = objective.coverage * targetArea;
+            const maxLength = objective.maxLengthM || Infinity, need = objective.coverage * targetArea;
             const logScore = isStart
                 ? (area, length, covered, stem) => {
                     if (!(area > 0)) return -Infinity;
@@ -2269,11 +2323,12 @@ class SweepSearch {
                     const iq = 4 * Math.PI * area / (length * length);
                     const short = covered / need;
                     const reward = SOLVER.polishLinear ? SOLVER.polishLinear * Math.min(short, 1.01) : (short < 1 ? SOLVER.polishShortfall * Math.log(short) : 0);
-                    return Math.log(iq + SOLVER.areaTiebreak * Math.min(area / targetArea, 2)) + reward;
+                    const over = length / maxLength;
+                    return Math.log(iq + SOLVER.areaTiebreak * Math.min(area / targetArea, 2)) + reward - (over > 1 ? 40 * Math.log(over) : 0);
                 };
             const feasible = isStart
                 ? (area, length, covered, stem) => length + 2 * stem <= maxLength
-                : (area, length, covered) => covered >= need;
+                : (area, length, covered) => covered >= need && length <= maxLength;
             this.polish = new FacePolish(this.g, logScore, feasible);
         }
         if (!this.polish.load(loop.edges, loop.dirs)) return null;
@@ -2584,8 +2639,9 @@ function loopCentroid(g, edges, dirs) {
 // sequence order, whichever search finishes first, so the same search
 // always ends at the same sweep with the same loop.
 class SearchTracker {
-    constructor(workers, refining = false) {
-        this.minStale = refining ? SOLVER.refineSweeps + 2 * workers : SOLVER.convergeSweeps + 4 * workers;
+    constructor(workers, refining = false, rough = false) {
+        this.minStale = refining ? SOLVER.refineSweeps + 2 * workers
+            : rough ? SOLVER.roughSweeps + 2 * workers : SOLVER.convergeSweeps + 4 * workers;
         this.needed = this.minStale;
         this.stale = 0;
         this.rounds = 0;
@@ -2718,7 +2774,8 @@ function expandLoop(prep, res, params, exact) {
         else if (kind === "rail") railM += edge.distance;
         else if (kind === "motorway") motorwayM += edge.distance;
         else if (kind === "private") privateM += edge.distance;
-        const line = dir === 1 ? edge.coords : [...edge.coords].reverse();
+        const line = edgeCoords(edge);
+        if (dir !== 1) line.reverse();
         if (kind) {
             const last = flags[flags.length - 1];
             if (last && last.kind === kind && last.end === coords.length - 1) last.coords.push(...line.slice(1));

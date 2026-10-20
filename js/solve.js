@@ -38,7 +38,7 @@ async function runSolver(network, params, { signal, onProgress }) {
 // Collects round reports from the engines and stops them once the search
 // has settled. Each engine: { start(onMessage), stop() }.
 function coordinate(prep, params, engines, { signal, onProgress }) {
-    const tracker = new SearchTracker(engines.length, Boolean(params.reference));
+    const tracker = new SearchTracker(engines.length, Boolean(params.reference), Boolean(params.rough));
     return new Promise((resolve, reject) => {
         let finished = false;
         let reported = false;
@@ -105,8 +105,12 @@ function poolWorkers(count) {
     return workerPool.slice(0, count);
 }
 
+// Each worker holds its own copy of the graph and its own buffers, so a
+// very big graph (a loop around a country) gets fewer of them.
+const BIG_GRAPH_PIECES = 200000;
+
 function startWorkers(data, params) {
-    const workers = workerCount();
+    const workers = Math.min(workerCount(), data.faces.P > BIG_GRAPH_PIECES ? 2 : MAX_WORKERS);
     const run = nextRun++;
     return poolWorkers(workers).map((worker, k) => ({
         start(onMessage) {

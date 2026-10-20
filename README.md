@@ -13,8 +13,12 @@ Three ways to plan:
   counts twice toward the length.
 - **Area**: draw a circle, ellipse, rectangle (any angle) or freehand shape.
   The app finds the roundest loop (highest isoperimetric quotient,
-  4π·area ÷ length²) that encloses at least a chosen percentage of the shape.
-  Between equally round loops, the one enclosing more area wins.
+  4π·area ÷ length²) that encloses at least a chosen share of the shape,
+  typed as a percentage of it or as an area in sq mi or sq km. Between
+  equally round loops, the one enclosing more area wins. An optional
+  maximum loop length overrides the target: the loop stays within it, and
+  if the target can't be reached that way, it is the loop within the limit
+  that encloses the most.
 - **Place**: search for a city, county, state, lake or park and use its real
   boundary (from OpenStreetMap via Nominatim) as the area.
 
@@ -40,9 +44,9 @@ bridge or tunnel; on by default); use railroad tracks (on by default);
 prefer smaller roads (on by default): while searching, motorways, trunk
 roads and railroad tracks count as 8% longer and primary roads as 3%, so a
 road right beside them is taken when it's about as good, but they are still
-used where they are clearly better; and prefer flatter loops (on by
-default): each meter of climb counts as 3 m of extra length while
-searching.
+used where they are clearly better; and a Hills slider from "No cost" to
+"Avoid hills avidly": each meter of climb counts as 0 to 10 m of extra
+length while searching (3 m by default).
 Paths, trails, sidewalks and rail trails are always used, and so are roads
 and paths marked private or no entry. A loop that uses fence hops, railroad
 tracks, motorways or private roads says so in a warning and marks those
@@ -165,16 +169,17 @@ arriving along each of the two roads.
 Area is computed exactly from the road geometry (shoelace formula). Coverage
 of the drawn shape is measured with scanlines.
 
-**Climb.** With "prefer flatter loops", every road first gets its climb
-from terrain tiles (`addRoadClimb` in `js/elevation.js`; at most 64 tiles,
-zoom 13 or coarser), and the search counts each meter of climb as 3 m of
-extra length (`SOLVER.climbCost`), so of two loops that are about as good,
+**Climb.** Unless the Hills slider is at "No cost", every road first gets
+its climb from terrain tiles (`addRoadClimb` in `js/elevation.js`; at most
+64 tiles, zoom 13 or coarser), and the search counts each meter of climb as
+the slider's 0.5 to 10 m of extra length (3 m by default), so of two loops
+that are about as good,
 the flatter one wins, while a much bigger or rounder loop still wins over a
 hill. With "prefer smaller roads", big roads get their extra length the
 same way. In area mode the extra length lowers roundness; in start point
-mode it counts as the area one more meter of loop would enclose, so a loop
-in the hills still uses its whole length. The length, area and roundness
-shown are always the real ones.
+mode (and in area mode with a length limit) it counts as the area one more
+meter of loop would enclose, so a loop in the hills still uses its whole
+length. The length, area and roundness shown are always the real ones.
 
 In area mode, roads are loaded 20% beyond the shape (`CONFIG.areaMargins`):
 its convex hull and its north-south bounding box, both enlarged by 20%, so
@@ -189,14 +194,18 @@ Up to about 80 sq mi (`CONFIG.chunked.fullDetailMaxSqMiles`, a 10 mi loop)
 every road is loaded at once. So are bigger areas with few roads (the
 countryside): up to 2,500 tiles holding at most 800,000 road points, which
 covers a 50 mi loop in rural Kansas (1,500 tiles, 67,000 points). Beyond
-that, `js/pipeline.js` searches in two stages:
+that, `js/pipeline.js` searches in stages:
 
 1. A rough loop on major roads only (motorway to tertiary; tertiary is
-   dropped above 5,000 sq mi), from coarser tiles (at most 150).
+   dropped above 5,000 sq mi), from coarser tiles (at most 150). A loop
+   expected to be over 2,000 km long (a share of a country) uses
+   motorways, trunk and primary roads from zoom 7 tiles instead (the US:
+   390 tiles). This stage settles sooner than other searches (it only sets
+   the shape).
 2. All roads within 3% of the rough loop's size (its length / π, at least
    1 km) to either side are loaded (just the tiles along it), the rough loop is traced onto them, and it is improved stretch by
    stretch (`SweepSearch.refine`): each stretch between two junctions, from
-   3 km up to a twelfth of the loop long, is replaced by the best path between its
+   3 km (or a 400th of the loop) up to a twelfth of the loop long, is replaced by the best path between its
    ends that keeps moving forward along the loop, if that makes the whole
    loop better. A stretch that can't be improved (or rerouted at all, e.g. a
    cloverleaf ramp that passes under its own bridge) stays as it is, so one
@@ -204,13 +213,35 @@ that, `js/pipeline.js` searches in two stages:
    a sweep around the loop's centre is tried too, and the result is
    polished block by block. The result always uses the real road shapes.
 3. The same again in a corridor along the improved loop, so each side can
-   move further (up to three passes, until a pass gains less than 0.5%).
+   move further (up to three passes, until a pass gains less than 0.5%;
+   one for loops over 2,000 km, where the climb isn't counted either:
+   terrain tiles for a whole country only show hills kilometers wide).
 
-A 30 mi loop in Chicago and a 100 mi loop around Denver take a few seconds
-plus the download. Kansas (a 1,000 mi loop) downloads about 17,700 tiles
-along the rough loop (about 2 minutes in Chrome on a 2015 dual-core
-laptop, which manages about 220 tile requests a second) and then searches
-for about 50 seconds, second pass included.
+A corridor takes at most about 1,500 tiles (`corridorPlan`). Tile servers
+answer about 150 requests a second whatever their size, so the number of
+tiles is what a download costs. If full-detail tiles (zoom 14) would need
+more, zoom 13 tiles (every road but paths and tracks) or zoom 12 tiles
+(also no service roads), which cover 4 and 16 times the area each, are used
+instead, and at zoom 12 the corridor is narrowed if needed (to no less
+than a quarter of a tile, about 2 km: a rough loop from zoom 7 tiles can
+be a kilometer off its roads). Once a stage's search begins to settle, the
+tiles along its best loop so far start downloading, so the next corridor
+is mostly loaded when it starts. Ends of a road cut at a tile edge are joined up to 15 m
+apart at zoom 12 (coarse tiles are simplified separately on each side).
+
+To keep memory low on such searches, road geometry is kept in flat arrays
+(not an array or object per point), coarse tiles skip the water layers
+(only fence hops need them), the road network is only drawn on the map
+when it's small enough (`CONFIG.maxDrawnRoadPoints`; otherwise just its
+major roads, or none), a very big graph gets two search workers instead of
+three (each holds a copy), and each stage's data is released as soon as
+it's done.
+
+Times in Chrome on a 2015 dual-core laptop, from a cold start (nothing
+downloaded yet): Kansas at 75% about 45 seconds (it was about 3 minutes,
+for a less round loop); the United States at 10% about 50 seconds, with
+the tab's memory peaking around 1.4 GB (the live data is under 1 GB; the
+rest is garbage the browser hasn't collected yet).
 
 ## External services
 

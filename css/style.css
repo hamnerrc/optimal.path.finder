@@ -928,26 +928,64 @@ h1 {
 }
 
 /* Coverage target */
-.coverage-row {
-    display: flex;
+.section > .coverage-row {
+    flex-direction: row;
     align-items: center;
-    gap: 12px;
+    gap: 8px;
 }
 
-.coverage-row input {
+.coverage-row .input-unit {
     flex: 1;
+}
+
+.coverage-row select {
+    height: 42px;
+    padding: 0 8px;
+    font: inherit;
+    font-size: 14px;
+    color: var(--text);
+    background: var(--surface-solid);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+}
+
+.coverage-row select:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.coverage-equivalent {
+    margin-top: -4px;
+    font-variant-numeric: tabular-nums;
+}
+
+.coverage-equivalent.is-warning {
+    color: var(--warning);
+}
+
+.optional {
+    font-weight: 400;
+    color: var(--text-faint);
+}
+
+/* Climb cost slider (Roads to use) */
+.climb-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.climb-field input {
+    width: 100%;
     accent-color: var(--accent);
 }
 
-.coverage-row output {
-    min-width: 48px;
-    padding: 4px 8px;
-    text-align: center;
-    font-weight: 700;
-    font-variant-numeric: tabular-nums;
-    color: var(--accent);
-    background: var(--accent-soft);
-    border-radius: 8px;
+.range-ends {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-faint);
 }
 
 /* Place search results */

@@ -13,7 +13,7 @@
 // are joined there, except where one of them is a bridge or tunnel.
 //
 // The result has the same shape as an Overpass response ({ elements: ways
-// with nodes, geometry and tags }), so buildRoadNetwork() works unchanged.
+// with nodes, points and tags }), so buildRoadNetwork() works unchanged.
 // ==========================================================================
 
 const TILE_EXTENT = 4096;   // tile coordinates are rescaled to this
@@ -91,14 +91,15 @@ async function fetchRoadsFromTiles(region, signal, { roadTypes = CONFIG.roadType
     return { elements: linesToWays(noded, zoom) };
 }
 
-// Loads the tiles covering a region into the tile store (no more than
-// CONFIG.roadTiles.prefetchMaxTiles), without a signal, so that a search
-// that needs them meanwhile can share the downloads.
-async function prefetchTiles(region, zoom) {
+// Loads the tiles covering a region into the tile store (if there are no
+// more than maxTiles), without a signal, so that a search that needs them
+// meanwhile can share the downloads. Setting run.cancelled stops it starting
+// more.
+async function prefetchTiles(region, zoom, { maxTiles = CONFIG.roadTiles.prefetchMaxTiles, run = null } = {}) {
     const template = await tileTemplate();
     const tiles = tilesCovering(region, zoom);
-    if (tiles.length > CONFIG.roadTiles.prefetchMaxTiles) return;
-    await forEachLimited(tiles, CONFIG.roadTiles.concurrency, ({ x, y }) => loadTile(template, zoom, x, y).catch(() => {}));
+    if (tiles.length > maxTiles) return;
+    await forEachLimited(tiles, CONFIG.roadTiles.concurrency, ({ x, y }) => run?.cancelled ? null : loadTile(template, zoom, x, y).catch(() => {}));
     trimTileStore();
 }
 
@@ -265,9 +266,11 @@ function tilesAlongCorridor(region, z) {
 // per tile), clipped to the tile's own square so neighbouring tiles' buffers
 // don't overlap, and what a fence hop may not cross (see hopLines): other
 // tracks (trams, subways above ground…), rivers, streams and the shores of
-// lakes and the sea.
+// lakes and the sea. (Fence hops are only made from full-detail tiles, so
+// coarser ones skip what they may not cross.)
 function tileContents(buffer, z, tx, ty) {
-    const layers = decodeTileLayers(buffer, ["transportation", "waterway", "water"], ["water"]);
+    const hops = z === CONFIG.roadTiles.zoom;
+    const layers = decodeTileLayers(buffer, hops ? ["transportation", "waterway", "water"] : ["transportation"], hops ? ["water"] : []);
     const ox = tx * TILE_EXTENT, oy = ty * TILE_EXTENT;
     const clipped = (layer, line) => clipLine(line, TILE_EXTENT / layer.extent, 0, TILE_EXTENT).map(pts => {
         for (let i = 0; i < pts.length; i += 2) {
@@ -282,7 +285,7 @@ function tileContents(buffer, z, tx, ty) {
         const highway = tileHighway(props);
         const tunnel = props.brunnel === "tunnel";
         if (!highway) {
-            if ((props.class === "rail" || props.class === "transit") && !tunnel) {
+            if (hops && (props.class === "rail" || props.class === "transit") && !tunnel) {
                 for (const line of geometry) barriers.push(...clipped(roads, line));
             }
             continue;
@@ -296,7 +299,7 @@ function tileContents(buffer, z, tx, ty) {
             for (const pts of clipped(roads, line)) lines.push({ highway, brunnel, oneway, expressway, driveway, restricted, pts });
         }
     }
-    for (const name of ["waterway", "water"]) {
+    for (const name of hops ? ["waterway", "water"] : []) {
         const layer = layers[name];
         for (const { props, lines: geometry } of layer.features) {
             if (props.brunnel === "tunnel") continue;
@@ -381,6 +384,10 @@ const NODE_CELL = 64;
 // several features (at a bridge, or where its tags change), and their ends
 // can be a few units apart instead of equal.
 const END_SNAP_M = 2.5;
+// Ends cut at a tile edge, by another such end on the same edge, this much
+// further apart per zoom level below 14: coarser tiles are simplified more,
+// and each tile on its own (zoom 12: tens of meters).
+const EDGE_SNAP_M = 7.5;
 
 // Splits lines wherever they meet another line, so every junction is a
 // shared vertex. Rules: a line end (or tile-edge cut) touching another line
@@ -500,6 +507,7 @@ function snapEnds(lines, z) {
     const midY = lines.length ? lines[0].pts[1] : n / 2;
     const unitM = 40075016.7 * Math.cos(tileYToLat(midY, n) * Math.PI / 180) / n;
     const reach = Math.max(SNAP_UNITS, END_SNAP_M / unitM);
+    const edgeReach = z >= CONFIG.roadTiles.zoom ? reach : Math.max(reach, EDGE_SNAP_M * 2 ** (CONFIG.roadTiles.zoom - z - 1) / unitM);
     const cell = Math.max(2, Math.ceil(reach));
     // Ends kept so far, chained per cell.
     const E = 2 * lines.length;
@@ -507,15 +515,19 @@ function snapEnds(lines, z) {
     const head = new Map();
     let count = 0;
     // Returns the point to use for an end: an earlier end close by, or
-    // this one (then kept).
+    // this one (then kept). An end on a tile edge also takes an end on the
+    // same edge up to edgeReach away.
     const snap = (x, y) => {
         const cx = Math.floor(x / cell), cy = Math.floor(y / cell);
+        const onX = x % TILE_EXTENT === 0, onY = y % TILE_EXTENT === 0;
+        const span = onX || onY ? Math.ceil(edgeReach / cell) : 1;
         let best = -1, bestD = Infinity;
-        for (let dx = -1; dx <= 1; dx++) {
-            for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -span; dx <= span; dx++) {
+            for (let dy = -span; dy <= span; dy++) {
                 for (let k = head.get((cx + dx) * 2 ** 26 + cy + dy) ?? -1; k >= 0; k = next[k]) {
                     const d = Math.max(Math.abs(endX[k] - x), Math.abs(endY[k] - y));
-                    if (d <= reach && d < bestD) {
+                    const sameEdge = (onX && endX[k] === x) || (onY && endY[k] === y);
+                    if ((d <= reach || (sameEdge && d <= edgeReach)) && d < bestD) {
                         bestD = d;
                         best = k;
                     }
@@ -757,24 +769,26 @@ function hopLines(lines, barriers, z) {
 }
 
 // Overpass-style ways: node IDs from the (whole-unit) coordinates, so lines
-// sharing a point share a node.
+// sharing a point share a node. Their points are lats and lons arrays
+// rather than Overpass's geometry objects (much less memory).
 function linesToWays(lines, z) {
     const n = 2 ** z * TILE_EXTENT;
     const ways = [];
     lines.forEach((line, k) => {
         const p = line.pts;
-        const nodes = [], geometry = [];
+        const nodes = [], lats = [], lons = [];
         for (let i = 0; i < p.length; i += 2) {
             const x = Math.round(p[i]), y = Math.round(p[i + 1]);
             nodes.push(x * n + y);
-            geometry.push({ lat: tileYToLat(y, n), lon: tileXToLng(x, n) });
+            lats.push(tileYToLat(y, n));
+            lons.push(tileXToLng(x, n));
         }
         const tags = { highway: line.highway };
         if (line.oneway) tags.oneway = line.oneway === 1 ? "yes" : "-1";
         if (line.restricted && !line.highway.startsWith("motorway")) tags.access = "no";
         // (A bridge or a tunnel: the elevation under it doesn't count.)
         if (line.brunnel) tags.bridge = "yes";
-        ways.push({ type: "way", id: k + 1, nodes, geometry, tags });
+        ways.push({ type: "way", id: k + 1, nodes, lats, lons, tags });
     });
     return ways;
 }

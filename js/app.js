@@ -54,14 +54,17 @@ const ui = {
 
     coverageSection: $("coverageSection"),
     coverageInput: $("coverageInput"),
-    coverageOutput: $("coverageOutput"),
+    coverageUnitSelect: $("coverageUnitSelect"),
+    coverageEquivalent: $("coverageEquivalent"),
+    areaMaxLengthInput: $("areaMaxLengthInput"),
 
     roadOptionsCount: $("roadOptionsCount"),
     noMotorwaysInput: $("noMotorwaysInput"),
     hopsInput: $("hopsInput"),
     railwaysInput: $("railwaysInput"),
     preferSmallInput: $("preferSmallInput"),
-    preferFlatInput: $("preferFlatInput"),
+    climbCostInput: $("climbCostInput"),
+    climbCostOutput: $("climbCostOutput"),
 
     routesSection: $("routesSection"),
     routeList: $("routeList"),
@@ -94,6 +97,7 @@ const ui = {
     statSegments: $("statSegments"),
     statRoadLength: $("statRoadLength"),
     showNetworkInput: $("showNetworkInput"),
+    networkNote: $("networkNote"),
 
     searchProgress: $("searchProgress"),
     progressFill: $("progressFill"),
@@ -126,20 +130,28 @@ const storedPrefs = loadPrefs();
 const prefs = {
     units: storedPrefs.units === "km" ? "km" : "mi",
     defaultDistanceM: storedPrefs.defaultDistanceM > 0 ? storedPrefs.defaultDistanceM : milesToMeters(CONFIG.defaultDistanceMiles),
-    coveragePercent: storedPrefs.coveragePercent > 0 ? storedPrefs.coveragePercent : CONFIG.defaultCoveragePercent,
+    // Area mode target: a share of the area (percent), or an area in sq mi
+    // or sq km (see coverageShare); and an optional length limit.
+    coverageValue: storedPrefs.coverageValue > 0 ? storedPrefs.coverageValue
+        : storedPrefs.coveragePercent > 0 ? storedPrefs.coveragePercent : CONFIG.defaultCoveragePercent,
+    coverageUnit: ["percent", "sqmi", "sqkm"].includes(storedPrefs.coverageUnit) ? storedPrefs.coverageUnit : "percent",
+    areaMaxLengthM: storedPrefs.areaMaxLengthM > 0 ? storedPrefs.areaMaxLengthM : null,
+    // Meters of extra length each meter of climb counts as (0: hills cost
+    // nothing). Before the slider, "prefer flatter loops" was a checkbox.
+    climbCost: storedPrefs.climbCost >= 0 && storedPrefs.climbCost <= CONFIG.maxClimbCost ? storedPrefs.climbCost
+        : storedPrefs.roads?.preferFlat === false ? 0 : CONFIG.defaultClimbCost,
     // Pace is stored as a speed (m/s) and shown in the chosen format.
     paceFormat: PACE_FORMATS[storedPrefs.paceFormat] ? storedPrefs.paceFormat : (storedPrefs.units === "km" ? "min/km" : "min/mi"),
     speedMps: storedPrefs.speedMps > 0 ? storedPrefs.speedMps : METERS_PER_MILE / CONFIG.defaultPaceSecPerMile,
     // Road options (see roadTypesFor and solverParams in js/pipeline.js).
-    // Fence hops, railroad tracks and preferring smaller roads and flatter
-    // loops are on by default (loops that use hops or tracks say so); the choices stored
+    // Fence hops, railroad tracks and preferring smaller roads are on by
+    // default (loops that use hops or tracks say so); the choices stored
     // before that default (roadsVersion 2) are not kept.
     roads: {
         noMotorways: storedPrefs.roads?.noMotorways === true,
         hops: storedPrefs.roadsVersion === 2 ? storedPrefs.roads?.hops !== false : true,
         railways: storedPrefs.roadsVersion === 2 ? storedPrefs.roads?.railways !== false : true,
-        preferSmall: storedPrefs.roads?.preferSmall !== false,
-        preferFlat: storedPrefs.roads?.preferFlat !== false
+        preferSmall: storedPrefs.roads?.preferSmall !== false
     },
     roadsVersion: 2
 };
@@ -186,6 +198,7 @@ function render() {
     ui.shapeSection.hidden = mode !== "shape";
     ui.placeSection.hidden = mode !== "place";
     ui.coverageSection.hidden = mode === "distance";
+    if (mode !== "distance") renderCoverage();
 
     // Distance mode
     ui.pickButton.classList.toggle("is-active", interaction === "pick");
@@ -235,6 +248,7 @@ function render() {
         ui.statIntersections.textContent = formatNumber(stats.intersections);
         ui.statSegments.textContent = formatNumber(stats.segments);
         ui.statRoadLength.textContent = formatDistance(milesToMeters(stats.totalMiles), 0);
+        ui.networkNote.hidden = state.network.complete;
     }
 
     renderRoutes();
@@ -304,6 +318,7 @@ function applyUnits(name) {
     ui.unitButtons.forEach(b => b.setAttribute("aria-pressed", String(b.dataset.units === name)));
     ui.unitDistanceLabels.forEach(el => { el.textContent = units().distance.label; });
     ui.distanceInput.value = roundForInput(toDistanceUnit(prefs.defaultDistanceM));
+    renderAreaMaxLength();
     setScaleUnits(name);
     renderPaceInput();
     renderStartList();
@@ -580,9 +595,9 @@ ui.deleteShapeButton.addEventListener("click", deleteShape);
 ui.cancelEditButton.addEventListener("click", cancelEditing);
 ui.doneEditButton.addEventListener("click", finishEditing);
 
-const ROAD_OPTION_INPUTS = { noMotorways: ui.noMotorwaysInput, hops: ui.hopsInput, railways: ui.railwaysInput, preferSmall: ui.preferSmallInput, preferFlat: ui.preferFlatInput };
+const ROAD_OPTION_INPUTS = { noMotorways: ui.noMotorwaysInput, hops: ui.hopsInput, railways: ui.railwaysInput, preferSmall: ui.preferSmallInput };
 const showRoadOptionsCount = () => {
-    const on = Object.values(prefs.roads).filter(Boolean).length;
+    const on = Object.values(prefs.roads).filter(Boolean).length + (prefs.climbCost > 0 ? 1 : 0);
     ui.roadOptionsCount.textContent = `${on} on`;
     ui.roadOptionsCount.hidden = on === 0;
 };
@@ -595,19 +610,124 @@ for (const [name, input] of Object.entries(ROAD_OPTION_INPUTS)) {
         render();
     });
 }
-showRoadOptionsCount();
-const roadsKey = () => Object.keys(ROAD_OPTION_INPUTS).filter(name => prefs.roads[name]).join("+");
 
-ui.coverageInput.value = prefs.coveragePercent;
-ui.coverageOutput.textContent = `${prefs.coveragePercent}%`;
+// Hills: how many meters of extra length a meter of climb counts as.
+ui.climbCostInput.max = CONFIG.maxClimbCost;
+ui.climbCostInput.value = prefs.climbCost;
+const showClimbCost = () => {
+    const c = prefs.climbCost;
+    ui.climbCostOutput.textContent = c === 0 ? "Hills cost nothing: the climb isn't considered."
+        : `Each meter of climb counts as ${formatNumber(c, c % 1 ? 1 : 0)} m of extra length, so a flatter loop wins when it's about as good.`;
+};
+ui.climbCostInput.addEventListener("input", () => {
+    prefs.climbCost = Number(ui.climbCostInput.value);
+    rememberPrefs();
+    showClimbCost();
+    showRoadOptionsCount();
+    render();
+});
+showClimbCost();
+showRoadOptionsCount();
+const roadsKey = () => [...Object.keys(ROAD_OPTION_INPUTS).filter(name => prefs.roads[name]), `climb${prefs.climbCost}`].join("+");
+// Road options for a search (see roadTypesFor and solverParams).
+const roadOptions = () => ({ ...prefs.roads, preferFlat: prefs.climbCost > 0, climbCost: prefs.climbCost });
+
+// --------------------------------------------------------------------------
+// Area mode: coverage target and length limit
+// --------------------------------------------------------------------------
+
+const COVERAGE_UNITS = { sqmi: 2589988.11, sqkm: 1e6 };
+
+// Share of a target area (m²) the loop must surround, 0..1: the coverage
+// field as a percentage, or as an area (capped at all of it).
+function coverageShare(targetM2) {
+    const { coverageValue: value, coverageUnit: unit } = prefs;
+    if (unit === "percent") return Math.min(1, value / 100);
+    return Math.min(1, value * COVERAGE_UNITS[unit] / targetM2);
+}
+
+// The area or place being searched, if any (a region, see geometry.js).
+function currentTarget() {
+    if (state.mode === "shape" && state.shape) return createShapeRegion(state.shape);
+    if (state.mode === "place" && state.place) return createPolygonRegion(state.place.outline, "place");
+    return null;
+}
+
+// Under the coverage field: the same target in the other terms.
+function renderCoverage() {
+    const target = currentTarget();
+    const el = ui.coverageEquivalent;
+    el.classList.remove("is-warning");
+    if (!target) {
+        el.textContent = prefs.coverageUnit === "percent" ? "" : "Draw an area or choose a place to compare.";
+        return;
+    }
+    const totalM2 = target.areaSqKm * 1e6;
+    const share = coverageShare(totalM2);
+    let text;
+    if (prefs.coverageUnit === "percent") {
+        text = `About ${formatArea(share * totalM2)} of its ${formatArea(totalM2)}.`;
+    } else if (prefs.coverageValue * COVERAGE_UNITS[prefs.coverageUnit] > totalM2) {
+        text = `That's more than the whole area (${formatArea(totalM2)}): the loop will go around all of it.`;
+        el.classList.add("is-warning");
+    } else {
+        text = `${formatCoverage(share)} of its ${formatArea(totalM2)}.`;
+    }
+    // The shortest loop that can surround that much is a circle.
+    const shortest = 2 * Math.sqrt(Math.PI * share * totalM2);
+    const digits = toDistanceUnit(shortest) < 100 ? 1 : 0;
+    if (prefs.areaMaxLengthM && prefs.areaMaxLengthM < shortest) {
+        text += ` Even a perfect circle around that is ${formatDistance(shortest, digits)} long, so your length limit will keep the loop smaller.`;
+    } else {
+        text += ` The loop will be at least ${formatDistance(shortest, digits)} long.`;
+    }
+    el.textContent = text;
+}
+
+ui.coverageInput.value = prefs.coverageValue;
+ui.coverageUnitSelect.value = prefs.coverageUnit;
 ui.coverageInput.addEventListener("input", () => {
     const value = parseFloat(ui.coverageInput.value);
-    if (value > 0 && value <= 100) {
-        prefs.coveragePercent = value;
-        ui.coverageOutput.textContent = `${value}%`;
-        rememberPrefs();
-        render();
+    const valid = value > 0 && (prefs.coverageUnit !== "percent" || value <= 100);
+    ui.coverageInput.setCustomValidity(valid ? "" : prefs.coverageUnit === "percent" ? "Enter a percentage from 0 to 100." : "Enter an area above 0.");
+    if (!valid) return;
+    prefs.coverageValue = value;
+    rememberPrefs();
+    render();
+});
+// Switching the unit converts the value, so the target stays the same.
+ui.coverageUnitSelect.addEventListener("change", () => {
+    const unit = ui.coverageUnitSelect.value;
+    const target = currentTarget();
+    if (target) {
+        const m2 = coverageShare(target.areaSqKm * 1e6) * target.areaSqKm * 1e6;
+        const value = unit === "percent" ? m2 / (target.areaSqKm * 1e6) * 100 : m2 / COVERAGE_UNITS[unit];
+        prefs.coverageValue = Number(value.toPrecision(value < 1 ? 2 : 3));
+    } else if (prefs.coverageUnit !== "percent" || unit !== "percent") {
+        // Nothing to convert against: sq mi <-> sq km only.
+        if (prefs.coverageUnit !== "percent" && unit !== "percent") {
+            prefs.coverageValue = Number((prefs.coverageValue * COVERAGE_UNITS[prefs.coverageUnit] / COVERAGE_UNITS[unit]).toPrecision(3));
+        } else if (unit === "percent") {
+            prefs.coverageValue = CONFIG.defaultCoveragePercent;
+        }
     }
+    prefs.coverageUnit = unit;
+    ui.coverageInput.value = prefs.coverageValue;
+    ui.coverageInput.setCustomValidity("");
+    rememberPrefs();
+    render();
+});
+
+const renderAreaMaxLength = () => {
+    ui.areaMaxLengthInput.value = prefs.areaMaxLengthM ? roundForInput(toDistanceUnit(prefs.areaMaxLengthM)) : "";
+};
+ui.areaMaxLengthInput.addEventListener("input", () => {
+    const text = ui.areaMaxLengthInput.value.trim();
+    const value = parseFloat(text);
+    if (text && !(value > 0)) return;
+    prefs.areaMaxLengthM = text ? fromDistanceUnit(value) : null;
+    rememberPrefs();
+    render();
 });
 
 // ==========================================================================
@@ -668,33 +788,33 @@ function searchJobs() {
                 key: `start:${start.id}:${lat.toFixed(6)},${lng.toFixed(6)}:${Math.round(start.maxDistanceM)}:${roadsKey()}`,
                 networkKey: `start:${start.id}`,
                 region: startRegion(start),
-                roads: { ...prefs.roads },
+                roads: roadOptions(),
                 objective: { mode: "start", start: { lat, lng }, maxLengthM: start.maxDistanceM }
             };
         });
     }
 
-    let target, label;
-    if (state.mode === "shape" && state.shape) {
-        target = createShapeRegion(state.shape);
+    const target = currentTarget();
+    if (!target) return [];
+    let label;
+    if (state.mode === "shape") {
         const name = SHAPES[state.shape.type].label;
         label = `${name[0].toUpperCase()}${name.slice(1)} area`;
-    } else if (state.mode === "place" && state.place) {
-        target = createPolygonRegion(state.place.outline, "place");
-        label = state.place.name;
     } else {
-        return [];
+        label = state.place.name;
     }
     const outline = target.outline.map(p => ({ lat: p.lat, lng: p.lng }));
+    const coverage = coverageShare(target.areaSqKm * 1e6);
+    const maxLengthM = prefs.areaMaxLengthM;
     return [{
         kind: "area",
         label,
-        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${prefs.coveragePercent}:${roadsKey()}`,
+        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${coverage.toFixed(5)}:${Math.round(maxLengthM || 0)}:${roadsKey()}`,
         networkKey: "area",
         region: marginRegion(target, CONFIG.areaMargins[0]),
         target,
-        roads: { ...prefs.roads },
-        objective: { mode: "area", target: outline, coverage: prefs.coveragePercent / 100 }
+        roads: roadOptions(),
+        objective: { mode: "area", target: outline, coverage, ...(maxLengthM ? { maxLengthM } : {}) }
     }];
 }
 
@@ -720,8 +840,15 @@ async function findLoops() {
 
     const controller = new AbortController();
     const control = { stop: false };
-    state.loading = { controller, control };
+    const started = Date.now();
+    // The button counts the time while the search runs.
+    const showElapsed = () => {
+        const s = Math.floor((Date.now() - started) / 1000);
+        ui.getRouteLabel.textContent = `Searching… ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    };
+    state.loading = { controller, control, timer: setInterval(showElapsed, 1000) };
     render();
+    showElapsed();
 
     const found = [];
     let stopped = false;
@@ -747,13 +874,14 @@ async function findLoops() {
                 onStatus: (text, fraction) => showProgress(fraction, `${prefix}${text}${route ? ` Best so far: ${formatDistance(route.lengthM)}, ${formatArea(route.areaM2)}.` : ""}`),
                 onLoop: show,
                 onNetwork: (network) => {
-                    state.network = network;
+                    // (Only what the panel shows: a big network takes a lot
+                    // of memory.)
                     removeNetworkLayer(job.networkKey);
                     const group = L.layerGroup();
-                    drawNetwork(network, group);
+                    state.network = { stats: network.stats, complete: drawNetwork(network, group) };
                     state.networkLayers.set(job.networkKey, group);
                     refreshNetworkLayers();
-                    console.log("[Network]", network);
+                    console.log("[Network]", network.stats);
                 }
             });
             show(result);
@@ -771,6 +899,7 @@ async function findLoops() {
         }
     }
 
+    clearInterval(state.loading.timer);
     state.loading = null;
     render();
     if (!found.length) {
@@ -795,7 +924,6 @@ async function findLoops() {
 function showProgress(fraction, text) {
     ui.progressFill.style.width = `${Math.round(fraction * 100)}%`;
     ui.progressText.textContent = text;
-    ui.getRouteLabel.textContent = "Searching…";
 }
 
 // Stopping keeps every loop found so far, including the one being improved.
@@ -866,13 +994,18 @@ function showLoop(route, loop, job) {
         areaM2: loop.areaM2,
         iq: loop.iq,
         coverage: loop.coverage ?? null,
-        feasible: loop.feasible,
+        // (Within the length limit, falling short of the coverage is
+        // expected: see lengthLimitNote. The search's coverage is measured
+        // on a simplified outline, so a hair short counts as met, as in
+        // routeWarning.)
+        feasible: loop.feasible || (job.kind === "area" && loop.repeats === 0 && loop.lengthM <= (job.objective.maxLengthM || Infinity) * 1.005 &&
+            (lengthLimited(loop, job) || loop.coverage >= job.objective.coverage - 0.005)),
         flags: loop.flags || []
     });
     // Start where the loop passes closest to the pin.
     if (job.kind === "start") route.startOffsetM = nearestOffset(route, job.start.latlng);
     route.warning = routeWarning(route, loop, job);
-    route.note = routeNote(loop);
+    route.note = [routeNote(loop), lengthLimitNote(loop, job)].filter(Boolean).join(" ");
 
     if (route.id === state.activeRouteId) {
         drawRouteDecor();
@@ -935,11 +1068,26 @@ function routeWarning(route, result, job) {
     }
     // The search measures coverage on a simplified outline; allow for the
     // small difference from the exact figure.
-    if (job.kind === "area" && result.coverage < job.objective.coverage - 0.005) {
-        notes.push(`It only encloses ${Math.round(result.coverage * 100)}% of the area (target ${Math.round(job.objective.coverage * 100)}%). ` +
+    if (job.kind === "area" && result.lengthM > (job.objective.maxLengthM || Infinity) * 1.005) {
+        notes.push(`It's longer than your ${formatDistance(job.objective.maxLengthM)} limit.`);
+    }
+    if (job.kind === "area" && result.coverage < job.objective.coverage - 0.005 && !lengthLimited(result, job)) {
+        notes.push(`It only encloses ${formatCoverage(result.coverage)} of the area (target ${formatCoverage(job.objective.coverage)}). ` +
             `Try a lower target.`);
     }
     return notes.join(" ");
+}
+
+// An area loop that falls short of the coverage target because of the
+// length limit (which wins, see the coverage hint): not a problem, a note.
+const lengthLimited = (result, job) => Boolean(job.objective.maxLengthM) && result.lengthM >= 0.9 * job.objective.maxLengthM;
+
+const formatCoverage = (share) => `${formatNumber(share * 100, share < 0.1 ? 1 : 0)}%`;
+
+function lengthLimitNote(result, job) {
+    if (job.kind !== "area" || !(result.coverage < job.objective.coverage - 0.005) || !lengthLimited(result, job)) return "";
+    return `Your ${formatDistance(job.objective.maxLengthM)} limit keeps it to ${formatCoverage(result.coverage)} of the area ` +
+        `(target ${formatCoverage(job.objective.coverage)}): it's the loop within the limit that surrounds the most.`;
 }
 
 const activeRoute = () => state.routes.find(r => r.id === state.activeRouteId) || null;
@@ -1020,7 +1168,7 @@ function renderRouteDetail() {
     ui.statArea.textContent = formatArea(route.areaM2);
     ui.statIq.textContent = route.iq.toFixed(2);
     ui.statCoverageBox.hidden = route.coverage === null;
-    if (route.coverage !== null) ui.statCoverage.textContent = `${Math.round(route.coverage * 100)}%`;
+    if (route.coverage !== null) ui.statCoverage.textContent = formatCoverage(route.coverage);
     ui.statTime.textContent = formatDuration(estimatedSeconds(route));
     ui.routeWarning.textContent = route.warning || "";
     ui.routeWarning.hidden = !route.warning;

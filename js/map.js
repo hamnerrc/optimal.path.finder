@@ -104,15 +104,28 @@ function updateRegionLayer(layer, region) {
 // --------------------------------------------------------------------------
 
 // Two multi-polylines (major / minor roads) instead of one layer per segment,
-// added to `group`.
+// added to `group`. A huge network (a loop around a state) would take
+// gigabytes to draw: then only its major roads are drawn, or none if even
+// those are too many. Returns whether every road was drawn.
 function drawNetwork(network, group) {
     const major = new Set(CONFIG.majorRoadTypes);
     const majorLines = [];
     const minorLines = [];
+    const limit = CONFIG.maxDrawnRoadPoints;
+    let majorPoints = 0, minorPoints = 0;
 
     for (const edge of network.edges) {
-        (major.has(edge.highway) ? majorLines : minorLines).push(edge.coords);
+        if (major.has(edge.highway)) {
+            majorLines.push(edge);
+            majorPoints += edge.pts.length / 2;
+        } else {
+            minorLines.push(edge);
+            minorPoints += edge.pts.length / 2;
+        }
     }
+    if (majorPoints + minorPoints > limit) minorLines.length = 0;
+    if (majorPoints > limit) majorLines.length = 0;
+    for (const lines of [majorLines, minorLines]) lines.forEach((edge, i) => { lines[i] = edgeCoords(edge); });
 
     const style = { color: CONFIG.colors.network, interactive: false, smoothFactor: 1.5 };
     if (minorLines.length) L.polyline(minorLines, { ...style, weight: 1.5, opacity: 0.45 }).addTo(group);
@@ -120,6 +133,7 @@ function drawNetwork(network, group) {
 
     // (A corridor along a rough loop has no outline to draw.)
     if (network.region.type === "circle" || network.region.outline) createRegionLayer(network.region, "muted").addTo(group);
+    return majorPoints + minorPoints <= limit;
 }
 
 // --------------------------------------------------------------------------

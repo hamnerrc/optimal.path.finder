@@ -45,6 +45,11 @@ const CONFIG = {
     defaultCoveragePercent: 90,
     areaMargins: [1.2, 1.4],
 
+    // "Hills" slider: meters of extra length a meter of climb counts as
+    // while searching (0 to maxClimbCost; see SOLVER.climbCost).
+    defaultClimbCost: 3,
+    maxClimbCost: 10,
+
     // Default pace for time estimates, in seconds per mile.
     defaultPaceSecPerMile: 540,
 
@@ -79,12 +84,32 @@ const CONFIG = {
         // length / π) to either side, and at least corridorMinM.
         corridorFraction: 0.03,
         corridorMinM: 1000,
+        // At most this many tiles per corridor (see corridorPlan): a
+        // narrower corridor, or coarser tiles (down to corridorMinZoom), if
+        // needed. Keeps a loop around a whole country quick and its road
+        // network small enough for the browser.
+        maxCorridorTiles: 1500,
+        corridorMinZoom: 12,
+        corridorMinTiles: 0.25,
+        // Loops expected to be longer than this (2,000 km) start from
+        // motorways, trunk and primary roads of zoom hugeZoom tiles, get at
+        // most hugePasses corridor passes, and don't count the climb (the
+        // terrain tiles for a whole country show only hills kilometers
+        // wide).
+        hugeLoopM: 2000000,
+        hugeZoom: 7,
+        hugePasses: 1,
+        hugeRoadTypes: ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link"],
         corridorPasses: 3,
         passMinGain: 0.005
     },
 
+    // Road networks with more points than this aren't drawn in full (see
+    // drawNetwork): only their major roads, or none.
+    maxDrawnRoadPoints: 150000,
+
     // Ask for confirmation before downloading areas larger than this.
-    largeAreaSqMiles: 300,
+    largeAreaSqMiles: 500,
 
     // OSM highway types that make up the routable network. Deliberately broad:
     // unsuitable roads are easier to weed out by hand once a route exists.
@@ -117,7 +142,7 @@ const CONFIG = {
         cacheMaxVertices: 4000000,
         // Tiles loaded ahead of a search, as soon as its pin, shape or
         // place is set.
-        prefetchMaxTiles: 400,
+        prefetchMaxTiles: 600,
         attribution: 'Roads <a href="https://openfreemap.org">OpenFreeMap</a> &copy; <a href="https://www.openmaptiles.org/">OpenMapTiles</a> ' +
             '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
     },

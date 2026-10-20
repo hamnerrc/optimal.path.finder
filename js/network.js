@@ -7,8 +7,9 @@
 // and dead ends. Each edge keeps its full geometry for drawing routes.
 //
 //   nodes      Map<osmNodeId, { id, lat, lng }>
-//   edges      [{ id, from, to, distance, coords: [[lat, lng], …],
+//   edges      [{ id, from, to, distance, pts: [lat, lng, lat, lng, …],
 //                 wayId, highway, name, oneway, restricted, level }]
+//              (see edgeCoords)
 //              (restricted: marked private or no entry on foot; level: a
 //              bridge or tunnel)
 //   stats      { intersections, segments, totalMiles, ways }
@@ -24,12 +25,15 @@ function buildRoadNetwork(osmData, region) {
 
     // 1. Clip ways to the region, splitting them where they leave it.
     for (const way of osmData.elements || []) {
-        if (way.type !== "way" || !way.nodes || !way.geometry) continue;
+        // (Ways from tiles carry their points as lats and lons arrays,
+        // Overpass ways as geometry objects.)
+        if (way.type !== "way" || !way.nodes || !(way.geometry || way.lats)) continue;
 
         let run = null;
         for (let i = 0; i < way.nodes.length; i++) {
-            const g = way.geometry[i];
-            if (!g || !region.contains(g.lat, g.lon)) {
+            const g = way.geometry?.[i];
+            const lat = g ? g.lat : way.lats?.[i], lon = g ? g.lon : way.lons?.[i];
+            if (lat === undefined || !region.contains(lat, lon)) {
                 if (run && run.pts.length > 1) runs.push(run);
                 run = null;
                 continue;
@@ -41,8 +45,8 @@ function buildRoadNetwork(osmData, region) {
                 k = ids.length;
                 index.set(id, k);
                 ids.push(id);
-                lats.push(g.lat);
-                lngs.push(g.lon);
+                lats.push(lat);
+                lngs.push(lon);
             }
             if (!run) run = { way, pts: [] };
             if (run.pts[run.pts.length - 1] !== k) run.pts.push(k);
@@ -89,24 +93,24 @@ function buildRoadNetwork(osmData, region) {
         const restricted = tags.highway !== "motorway" && tags.highway !== "motorway_link" &&
             isRestricted(tags.access, tags.foot);
         const level = (tags.bridge !== undefined && tags.bridge !== "no") || (tags.tunnel !== undefined && tags.tunnel !== "no");
-        let start = pts[0];
-        let prev = start;
-        let coords = [[lats[start], lngs[start]]];
+        let start = 0;
         let distance = 0;
 
         for (let i = 1; i < pts.length; i++) {
             const k = pts[i];
-            distance += haversine(lats[prev], lngs[prev], lats[k], lngs[k]);
-            coords.push([lats[k], lngs[k]]);
-            prev = k;
+            distance += haversine(lats[pts[i - 1]], lngs[pts[i - 1]], lats[k], lngs[k]);
 
             if (kept[k]) {
+                // (One flat array: far less memory than a small array per
+                // point, or a typed array per edge.)
+                const coords = [];
+                for (let j = start; j <= i; j++) coords.push(lats[pts[j]], lngs[pts[j]]);
                 edges.push({
                     id: edges.length,
-                    from: ids[start],
+                    from: ids[pts[start]],
                     to: ids[k],
                     distance,
-                    coords,
+                    pts: coords,
                     wayId: way.id,
                     highway: tags.highway || (tags.railway ? "railway" : undefined),
                     name: tags.name || null,
@@ -115,8 +119,7 @@ function buildRoadNetwork(osmData, region) {
                     level
                 });
                 totalMeters += distance;
-                start = k;
-                coords = [[lats[k], lngs[k]]];
+                start = i;
                 distance = 0;
             }
         }
@@ -135,6 +138,13 @@ function buildRoadNetwork(osmData, region) {
     };
 }
 
+// An edge's points as [[lat, lng], …].
+function edgeCoords(edge) {
+    const out = [];
+    for (let i = 0; i < edge.pts.length; i += 2) out.push([edge.pts[i], edge.pts[i + 1]]);
+    return out;
+}
+
 // 1 = one-way in drawing direction, -1 = reversed, 0 = two-way.
 function parseOneway(tags) {
     const v = tags.oneway;
@@ -145,5 +155,5 @@ function parseOneway(tags) {
 }
 
 if (typeof module !== "undefined") {
-    module.exports = { buildRoadNetwork, parseOneway };
+    module.exports = { buildRoadNetwork, parseOneway, edgeCoords };
 }

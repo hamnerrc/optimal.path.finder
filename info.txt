@@ -4,6 +4,82 @@ Live site: https://hamnerrc.github.io/optimal.path.finder/ (updates on push)
 =============================================================================
 
 -----------------------------------------------------------------------------
+ROUND 10 (2026-10-19): AREA LENGTH LIMIT, COVERAGE UNITS, HILLS SLIDER, SPEED
+-----------------------------------------------------------------------------
+Asked for: a max loop length in area mode that overrides the coverage
+target; the coverage slider as a text box taking a percentage, sq mi or
+sq km; a Hills slider from "No cost" to "Avoid hills avidly" (10x); USA at
+10% in under a minute without straining the browser's memory; and other
+sensible improvements.
+
+Area and Place
+- Coverage is a text box with a unit menu: "% of the area", "sq mi" or
+  "sq km". Switching the unit converts the number, so the target stays the
+  same. Under it: the same target in the other terms, and how long the
+  loop must be at least (a perfect circle around that much). An area
+  bigger than the whole place is capped at all of it, and says so.
+- "Max loop length (optional)". The limit always wins: the loop stays
+  within it, and if the target can't be reached that way, you get the loop
+  within the limit that surrounds the most. That's shown as a note, not a
+  warning ("Your 4 mi limit keeps it to 28% of the area ..."), and the hint
+  warns before searching when the limit is too short for the target.
+  E.g. Kansas at 75% with a 600 mi limit: 599 mi, 29% (a perfect circle of
+  600 mi would cover 35%), 23 s.
+
+Roads to use
+- "Prefer flatter loops" is now a Hills slider: No cost (0) ... Avoid hills
+  avidly (each meter of climb counts as 10 m of extra length), default 3
+  as before. At "No cost" the climb isn't read at all.
+
+Speed and memory (Chrome, this 2015 laptop, nothing downloaded beforehand)
+  United States at 10%   failed before (an error in the first stage:
+                         too many roads for one map); now about 50 s, roundness 0.69
+                         to 0.72 depending on the run's rough loop, tab
+                         peaking around 1.4-1.6 GB (under 1 GB of live
+                         data). About 40 s if the place was picked 10 s
+                         before pressing Find (tiles start downloading).
+  Kansas at 75%          about 3 min -> 42-46 s, and rounder: 0.713 -> 0.73
+  Kansas at 63%          0.750 -> 0.749, 49 s -> 12 s (cached roads)
+  Everything else in the test set gives the same loops (Denver 100 mi:
+  583 instead of 584 sq mi).
+How:
+- Tile servers answer about 150 requests a second, whatever the tile size,
+  so the number of tiles is the cost. A corridor now takes at most about
+  1,500 tiles: if full-detail (zoom 14) tiles would need more, zoom 13 or
+  12 tiles (every road but paths/tracks, or also no service roads), which
+  cover 4 or 16 times the area each. For Kansas that's 900 zoom 12 tiles
+  instead of 17,700 zoom 14 ones, and since the corridor can then stay
+  wide, the loop got rounder.
+- Loops expected to be over 2,000 km (a share of a country): the rough
+  loop uses motorways, trunk and primary roads from 390 zoom 7 tiles, one
+  corridor pass, and no climb (country-wide terrain tiles only show hills
+  kilometers wide).
+- While a search settles, the tiles along its best loop start downloading
+  in the background, so the next corridor is mostly there already.
+- Fixed: road pieces cut at a tile edge in coarse tiles could end ~10 m
+  apart and weren't joined, which broke corridors in two (the US loop
+  failed at the Idaho border); and a corridor followed the loop simplified
+  to 400 points, kilometers off a 5,000 mi loop.
+- Memory: road geometry in flat arrays instead of an object per point,
+  water layers skipped in coarse tiles, the road network only drawn when
+  small enough (else just major roads, or none: the Road network section
+  says so), two search workers instead of three for very big graphs, and
+  each stage's data released when it's done.
+- The rough stage of a staged search settles sooner (it only sets the
+  shape), and very long loops refine stretches of at least 1/400 of the
+  loop.
+
+Also
+- "Find loop" shows the time while searching (Searching... 0:42).
+- A loop that misses the coverage target by a rounding hair (89.7% of 90%)
+  no longer pops up "doesn't meet every requirement".
+
+Known limits: on a 2015 laptop the US search is just under a minute; the
+roundness of country-sized loops varies a few percent between runs with
+different numbers of CPU cores (the rough loop differs).
+
+
+-----------------------------------------------------------------------------
 ROUNDS 2-7 (2026-10-18), IN SHORT
 -----------------------------------------------------------------------------
 Modes
