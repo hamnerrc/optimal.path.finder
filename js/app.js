@@ -9,6 +9,8 @@ const ui = {
     modeTabs: document.querySelectorAll(".segmented [data-mode]"),
     unitButtons: document.querySelectorAll("[data-units]"),
     unitDistanceLabels: document.querySelectorAll(".unit-distance"),
+    unitAreaLabels: document.querySelectorAll(".unit-area"),
+    unitElevationLabels: document.querySelectorAll(".unit-elevation"),
 
     searchForm: $("searchForm"),
     searchInput: $("searchInput"),
@@ -56,7 +58,10 @@ const ui = {
     coverageInput: $("coverageInput"),
     coverageUnitSelect: $("coverageUnitSelect"),
     coverageEquivalent: $("coverageEquivalent"),
-    areaMaxLengthInput: $("areaMaxLengthInput"),
+    limitsSection: $("limitsSection"),
+    limitsCount: $("limitsCount"),
+    limitsNote: $("limitsNote"),
+    limitInputs: document.querySelectorAll("[data-limit]"),
 
     roadOptionsCount: $("roadOptionsCount"),
     noMotorwaysInput: $("noMotorwaysInput"),
@@ -127,6 +132,7 @@ const SHAPES = {
 const shapeReady = (type, count) => SHAPES[type].points === Infinity ? count >= SHAPES[type].minPoints : count === SHAPES[type].points;
 
 const storedPrefs = loadPrefs();
+const LIMIT_NAMES = ["minLengthM", "maxLengthM", "minAreaM2", "maxAreaM2", "minClimbM", "maxClimbM"];
 const prefs = {
     units: storedPrefs.units === "km" ? "km" : "mi",
     defaultDistanceM: storedPrefs.defaultDistanceM > 0 ? storedPrefs.defaultDistanceM : milesToMeters(CONFIG.defaultDistanceMiles),
@@ -135,7 +141,13 @@ const prefs = {
     coverageValue: storedPrefs.coverageValue > 0 ? storedPrefs.coverageValue
         : storedPrefs.coveragePercent > 0 ? storedPrefs.coveragePercent : CONFIG.defaultCoveragePercent,
     coverageUnit: ["percent", "sqmi", "sqkm"].includes(storedPrefs.coverageUnit) ? storedPrefs.coverageUnit : "percent",
-    areaMaxLengthM: storedPrefs.areaMaxLengthM > 0 ? storedPrefs.areaMaxLengthM : null,
+    // Limits on the loop, in meters and m² (null: none). maxLengthM is for
+    // Area and Place (start points each have their own); before the Limits
+    // section it was areaMaxLengthM.
+    limits: Object.fromEntries(LIMIT_NAMES.map(name => {
+        const stored = name === "maxLengthM" && storedPrefs.limits?.maxLengthM === undefined ? storedPrefs.areaMaxLengthM : storedPrefs.limits?.[name];
+        return [name, stored >= 0 && stored !== null ? stored : null];
+    })),
     // Meters of extra length each meter of climb counts as (0: hills cost
     // nothing). Before the slider, "prefer flatter loops" was a checkbox.
     climbCost: storedPrefs.climbCost >= 0 && storedPrefs.climbCost <= CONFIG.maxClimbCost ? storedPrefs.climbCost
@@ -199,6 +211,7 @@ function render() {
     ui.placeSection.hidden = mode !== "place";
     ui.coverageSection.hidden = mode === "distance";
     if (mode !== "distance") renderCoverage();
+    renderLimits();
 
     // Distance mode
     ui.pickButton.classList.toggle("is-active", interaction === "pick");
@@ -317,8 +330,10 @@ function applyUnits(name) {
 
     ui.unitButtons.forEach(b => b.setAttribute("aria-pressed", String(b.dataset.units === name)));
     ui.unitDistanceLabels.forEach(el => { el.textContent = units().distance.label; });
+    ui.unitAreaLabels.forEach(el => { el.textContent = units().area.label; });
+    ui.unitElevationLabels.forEach(el => { el.textContent = units().elevation.label; });
     ui.distanceInput.value = roundForInput(toDistanceUnit(prefs.defaultDistanceM));
-    renderAreaMaxLength();
+    renderLimitInputs();
     setScaleUnits(name);
     renderPaceInput();
     renderStartList();
@@ -676,7 +691,7 @@ function renderCoverage() {
     // The shortest loop that can surround that much is a circle.
     const shortest = 2 * Math.sqrt(Math.PI * share * totalM2);
     const digits = toDistanceUnit(shortest) < 100 ? 1 : 0;
-    if (prefs.areaMaxLengthM && prefs.areaMaxLengthM < shortest) {
+    if (prefs.limits.maxLengthM && prefs.limits.maxLengthM < shortest) {
         text += ` Even a perfect circle around that is ${formatDistance(shortest, digits)} long, so your length limit will keep the loop smaller.`;
     } else {
         text += ` The loop will be at least ${formatDistance(shortest, digits)} long.`;
@@ -718,16 +733,67 @@ ui.coverageUnitSelect.addEventListener("change", () => {
     render();
 });
 
-const renderAreaMaxLength = () => {
-    ui.areaMaxLengthInput.value = prefs.areaMaxLengthM ? roundForInput(toDistanceUnit(prefs.areaMaxLengthM)) : "";
+// --------------------------------------------------------------------------
+// Limits (every mode)
+// --------------------------------------------------------------------------
+
+// Each limit's unit: meters or m² <-> the number shown.
+const LIMIT_UNITS = {
+    minLengthM: "distance", maxLengthM: "distance", minAreaM2: "area", maxAreaM2: "area",
+    minClimbM: "elevation", maxClimbM: "elevation"
 };
-ui.areaMaxLengthInput.addEventListener("input", () => {
-    const text = ui.areaMaxLengthInput.value.trim();
-    const value = parseFloat(text);
-    if (text && !(value > 0)) return;
-    prefs.areaMaxLengthM = text ? fromDistanceUnit(value) : null;
-    rememberPrefs();
-    render();
+const limitScale = (name) => {
+    const kind = LIMIT_UNITS[name];
+    return kind === "area" ? units().area.sqMeters : units()[kind].meters;
+};
+
+function renderLimitInputs() {
+    ui.limitInputs.forEach(input => {
+        const value = prefs.limits[input.dataset.limit];
+        if (document.activeElement !== input) input.value = value === null ? "" : Number((value / limitScale(input.dataset.limit)).toPrecision(4));
+    });
+}
+
+// The limits that apply in the current mode: start points have their own
+// longest distance.
+const activeLimits = () => ({ ...prefs.limits, ...(state.mode === "distance" ? { maxLengthM: null } : {}) });
+
+// Limits for a search (only those set).
+const limitsFor = () => Object.fromEntries(Object.entries(activeLimits()).filter(([, v]) => v !== null));
+
+// A min above its max can't be met.
+function conflictingLimits(limits = activeLimits()) {
+    const pairs = [["minLengthM", "maxLengthM", "distance"], ["minAreaM2", "maxAreaM2", "area"], ["minClimbM", "maxClimbM", "climb"]];
+    return pairs.filter(([lo, hi]) => limits[lo] !== null && limits[hi] !== null && limits[lo] > limits[hi]).map(p => p[2]);
+}
+
+function renderLimits() {
+    const start = state.mode === "distance";
+    const max = ui.limitsSection.querySelector('[data-limit="maxLengthM"]');
+    max.disabled = start;
+    max.placeholder = start ? "per pin" : "–";
+    max.title = start ? "Each start point has its own length" : "";
+    if (start) max.value = "";
+    else if (document.activeElement !== max) renderLimitInputs();
+    const set = Object.values(activeLimits()).filter(v => v !== null).length;
+    ui.limitsCount.textContent = `${set} set`;
+    ui.limitsCount.hidden = set === 0;
+    const conflicts = conflictingLimits();
+    ui.limitInputs.forEach(input => input.classList.toggle("is-invalid", conflicts.some(c => LIMIT_UNITS[input.dataset.limit] === (c === "climb" ? "elevation" : c))));
+    ui.limitsNote.classList.toggle("is-warning", conflicts.length > 0);
+    ui.limitsNote.textContent = conflicts.length ? `The ${conflicts.join(" and ")} minimum is above its maximum.`
+        : set ? "If they can't all be met, the longest distance comes first, then the most climb, then the rest." : "";
+}
+
+ui.limitInputs.forEach(input => {
+    input.addEventListener("input", () => {
+        const text = input.value.trim();
+        const value = parseFloat(text);
+        if (text && !(value >= 0)) return;
+        prefs.limits[input.dataset.limit] = text ? value * limitScale(input.dataset.limit) : null;
+        rememberPrefs();
+        render();
+    });
 });
 
 // ==========================================================================
@@ -785,11 +851,11 @@ function searchJobs() {
                 kind: "start",
                 start,
                 label: `Start ${startNumber(start.id)}`,
-                key: `start:${start.id}:${lat.toFixed(6)},${lng.toFixed(6)}:${Math.round(start.maxDistanceM)}:${roadsKey()}`,
+                key: `start:${start.id}:${lat.toFixed(6)},${lng.toFixed(6)}:${Math.round(start.maxDistanceM)}:${roadsKey()}:${limitsKey()}`,
                 networkKey: `start:${start.id}`,
                 region: startRegion(start),
                 roads: roadOptions(),
-                objective: { mode: "start", start: { lat, lng }, maxLengthM: start.maxDistanceM }
+                objective: { mode: "start", start: { lat, lng }, ...limitsFor(), maxLengthM: start.maxDistanceM }
             };
         });
     }
@@ -805,18 +871,19 @@ function searchJobs() {
     }
     const outline = target.outline.map(p => ({ lat: p.lat, lng: p.lng }));
     const coverage = coverageShare(target.areaSqKm * 1e6);
-    const maxLengthM = prefs.areaMaxLengthM;
     return [{
         kind: "area",
         label,
-        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${coverage.toFixed(5)}:${Math.round(maxLengthM || 0)}:${roadsKey()}`,
+        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${coverage.toFixed(5)}:${roadsKey()}:${limitsKey()}`,
         networkKey: "area",
         region: marginRegion(target, CONFIG.areaMargins[0]),
         target,
         roads: roadOptions(),
-        objective: { mode: "area", target: outline, coverage, ...(maxLengthM ? { maxLengthM } : {}) }
+        objective: { mode: "area", target: outline, coverage, ...limitsFor() }
     }];
 }
+
+const limitsKey = () => Object.entries(limitsFor()).map(([k, v]) => `${k}=${Math.round(v)}`).join(",");
 
 // A finished loop already exists for exactly this job (same pin, length,
 // shape and coverage), so there's nothing to recompute.
@@ -994,18 +1061,15 @@ function showLoop(route, loop, job) {
         areaM2: loop.areaM2,
         iq: loop.iq,
         coverage: loop.coverage ?? null,
-        // (Within the length limit, falling short of the coverage is
-        // expected: see lengthLimitNote. The search's coverage is measured
-        // on a simplified outline, so a hair short counts as met, as in
-        // routeWarning.)
-        feasible: loop.feasible || (job.kind === "area" && loop.repeats === 0 && loop.lengthM <= (job.objective.maxLengthM || Infinity) * 1.005 &&
-            (lengthLimited(loop, job) || loop.coverage >= job.objective.coverage - 0.005)),
+        // (Measured on the final loop: see missedLimits.)
+        feasible: loop.repeats === 0 && missedLimits(loop, job).length === 0,
+        climbM: loop.climbM || 0,
         flags: loop.flags || []
     });
     // Start where the loop passes closest to the pin.
     if (job.kind === "start") route.startOffsetM = nearestOffset(route, job.start.latlng);
     route.warning = routeWarning(route, loop, job);
-    route.note = [routeNote(loop), lengthLimitNote(loop, job)].filter(Boolean).join(" ");
+    route.note = [routeNote(loop), limitedCoverageNote(loop, job)].filter(Boolean).join(" ");
 
     if (route.id === state.activeRouteId) {
         drawRouteDecor();
@@ -1042,7 +1106,7 @@ function flagWarning(flags) {
     const notes = [];
     if (hops > 0) notes.push(`It uses ${hops} fence hop${hops > 1 ? "s" : ""} (a gap under 10 m between roads that don't connect): check ${hops > 1 ? "they" : "it"} can be crossed.`);
     if (railM > 0) notes.push(`${formatDistance(railM)} of it runs along railroad tracks: only run there where it's allowed.`);
-    if (motorwayM > 0) notes.push(`${formatDistance(motorwayM)} of it is on motorways, which are usually closed to people on foot or bike. "Avoid motorways" under Roads to use leaves them out.`);
+    if (motorwayM > 0) notes.push(`${formatDistance(motorwayM)} of it is on motorways, which are usually closed to people on foot or bike. "Avoid motorways" under Roads & hills leaves them out.`);
     if (privateM > 0) notes.push(`${formatDistance(privateM)} of it is on roads or paths marked private or no entry: check you may use them.`);
     return notes.join(" ");
 }
@@ -1058,36 +1122,55 @@ function routeWarning(route, result, job) {
     const flagged = flagWarning(route.flags);
     if (flagged) notes.push(flagged);
     if (result.repeats > 0) notes.push("It runs part of a street twice.");
-    if (job.kind === "start" && result.lengthM > job.start.maxDistanceM) {
-        notes.push(`It's longer than your ${formatDistance(job.start.maxDistanceM)} limit.`);
-    }
+    notes.push(...missedLimits(result, job));
     if (job.kind === "start") {
         const [lat, lng] = pointAtOffset(route, route.startOffsetM);
         const gap = haversine(lat, lng, job.start.latlng.lat, job.start.latlng.lng);
         if (gap > 150) notes.push(`The closest it passes to your pin is ${formatDistance(gap)}.`);
     }
-    // The search measures coverage on a simplified outline; allow for the
-    // small difference from the exact figure.
-    if (job.kind === "area" && result.lengthM > (job.objective.maxLengthM || Infinity) * 1.005) {
-        notes.push(`It's longer than your ${formatDistance(job.objective.maxLengthM)} limit.`);
-    }
-    if (job.kind === "area" && result.coverage < job.objective.coverage - 0.005 && !lengthLimited(result, job)) {
-        notes.push(`It only encloses ${formatCoverage(result.coverage)} of the area (target ${formatCoverage(job.objective.coverage)}). ` +
-            `Try a lower target.`);
-    }
     return notes.join(" ");
 }
 
-// An area loop that falls short of the coverage target because of the
-// length limit (which wins, see the coverage hint): not a problem, a note.
-const lengthLimited = (result, job) => Boolean(job.objective.maxLengthM) && result.lengthM >= 0.9 * job.objective.maxLengthM;
+// The limits a loop misses, most important first (as the search ranks
+// them, see limitMisses in js/solver.js), as sentences. Measured on the
+// final loop, with a little slack for rounding; the climb is the search's
+// estimate. Falling short of the coverage because a more important limit
+// holds the loop back is not a miss (see limitedCoverageNote).
+function missedLimits(result, job) {
+    const o = job.objective, out = [];
+    const slack = 1.005, climb = result.climbM || 0;
+    if (o.maxLengthM && result.lengthM > o.maxLengthM * slack) out.push(`It's longer than your ${formatDistance(o.maxLengthM)} limit.`);
+    if (o.maxClimbM != null && climb > o.maxClimbM * slack + 1) out.push(`It climbs about ${formatElevation(climb)}, more than your ${formatElevation(o.maxClimbM)} limit.`);
+    if (o.minLengthM && result.lengthM < o.minLengthM / slack) out.push(`It's shorter than your ${formatDistance(o.minLengthM)} minimum.`);
+    if (o.minAreaM2 && result.areaM2 < o.minAreaM2 / slack) out.push(`It encloses ${formatArea(result.areaM2)}, less than your ${formatArea(o.minAreaM2)} minimum.`);
+    if (o.maxAreaM2 && result.areaM2 > o.maxAreaM2 * slack) out.push(`It encloses ${formatArea(result.areaM2)}, more than your ${formatArea(o.maxAreaM2)} maximum.`);
+    // (The search measures coverage on a simplified outline: allow for the
+    // small difference from the exact figure.)
+    if (job.kind === "area" && result.coverage < o.coverage - 0.005 && !heldBack(result, job)) {
+        out.push(`It only encloses ${formatCoverage(result.coverage)} of the area (target ${formatCoverage(o.coverage)}). Try a lower target.`);
+    }
+    if (o.minClimbM && climb < o.minClimbM / slack - 1) out.push(`It only climbs about ${formatElevation(climb)}, less than your ${formatElevation(o.minClimbM)} minimum.`);
+    return out;
+}
+
+// The limits that hold an area loop back from its coverage target (they
+// come first, see missedLimits): the ones it's at or close to.
+function heldBack(result, job) {
+    const o = job.objective, names = [];
+    if (o.maxLengthM && result.lengthM >= 0.9 * o.maxLengthM) names.push("distance");
+    if (o.maxClimbM != null && (result.climbM || 0) >= 0.9 * o.maxClimbM) names.push("climb");
+    if (o.maxAreaM2 && result.areaM2 >= 0.9 * o.maxAreaM2) names.push("area");
+    return names.length ? names : null;
+}
 
 const formatCoverage = (share) => `${formatNumber(share * 100, share < 0.1 ? 1 : 0)}%`;
 
-function lengthLimitNote(result, job) {
-    if (job.kind !== "area" || !(result.coverage < job.objective.coverage - 0.005) || !lengthLimited(result, job)) return "";
-    return `Your ${formatDistance(job.objective.maxLengthM)} limit keeps it to ${formatCoverage(result.coverage)} of the area ` +
-        `(target ${formatCoverage(job.objective.coverage)}): it's the loop within the limit that surrounds the most.`;
+function limitedCoverageNote(result, job) {
+    if (job.kind !== "area" || !(result.coverage < job.objective.coverage - 0.005)) return "";
+    const names = heldBack(result, job);
+    if (!names) return "";
+    return `Your ${names.join(" and ")} limit${names.length > 1 ? "s keep" : " keeps"} it to ${formatCoverage(result.coverage)} of the area ` +
+        `(target ${formatCoverage(job.objective.coverage)}): it's the loop within ${names.length > 1 ? "them" : "it"} that surrounds the most.`;
 }
 
 const activeRoute = () => state.routes.find(r => r.id === state.activeRouteId) || null;

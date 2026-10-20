@@ -4,7 +4,7 @@
 
 const CONFIG = {
     // Release number, as in index.html's ?v= (for the worker's scripts).
-    release: 11,
+    release: 12,
 
     map: {
         initialCenter: [20, 0],
@@ -96,9 +96,8 @@ const CONFIG = {
         corridorMinTiles: 0.25,
         // Loops expected to be longer than this (2,000 km) start from
         // motorways, trunk and primary roads of zoom hugeZoom tiles, get at
-        // most hugePasses corridor passes, and don't count the climb (the
-        // terrain tiles for a whole country show only hills kilometers
-        // wide).
+        // most hugePasses corridor passes. (Their climb comes from coarse
+        // terrain tiles: an estimate, see addRoadClimb.)
         hugeLoopM: 2000000,
         hugeZoom: 7,
         hugePasses: 1,

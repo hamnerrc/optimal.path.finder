@@ -4,6 +4,44 @@ Live site: https://hamnerrc.github.io/optimal.path.finder/ (updates on push)
 =============================================================================
 
 -----------------------------------------------------------------------------
+ROUND 11 (2026-10-19): LIMITS, CLIMB IN COARSE STAGES, TIDIER PANEL
+-----------------------------------------------------------------------------
+Also fixed in between (round 10b): the iPad error "edge.coords" came from
+the browser mixing a cached old solver.js with the new files. Every script
+now loads with the release number (?v=12), so that can't happen again.
+
+Limits (new section, every mode): min and max distance, area and climb.
+Blank means no limit. Priority when they can't all be met:
+  1. longest distance (how far you can go; per pin in start point mode)
+  2. most climb
+  3. shortest distance, smallest and largest area
+  4. the share of the area to surround (Area/Place)
+  5. least climb
+  6. then the goal: most area, or roundest
+A loop that misses one says which, in the warning; a loop held back from
+its coverage target by a distance, climb or area limit gets a note instead
+("Your climb limit keeps it to 42% of the area"), as that's expected. A min
+above its max is flagged. Climb limits use the search's climb estimate
+(terrain tiles); the elevation profile is more exact.
+Examples: Vermont 12 mi start: 328 m of climb unlimited, 172 m with a 200 m
+cap, 100 m with 100 m. 1 mi-radius circle in Lawrence at 90%: 157 m
+unlimited; with a 60 m cap, a 7.3 mi loop covering 42% and climbing 60 m.
+Searches without limits give exactly the same loops as before.
+
+Climb in the coarse stages: country-sized searches count the climb again,
+from coarse terrain tiles (an estimate), so the rough loop isn't set
+somewhere hilly that the detailed stages can't get it out of. USA at 10%:
+39 s (same as without), roundness 0.69.
+
+Panel: shorter hints, the coverage target as one line ("Surround at least
+[90] [% of the area]"), Limits and "Roads & hills" as collapsible sections,
+and the long explanations moved to a "How it works" section at the bottom.
+
+Note on timings: the tile server's speed varies through the day. Kansas at
+75% took 42 s this morning and 60-64 s this evening, with the old and new
+code alike.
+
+-----------------------------------------------------------------------------
 ROUND 10 (2026-10-19): AREA LENGTH LIMIT, COVERAGE UNITS, HILLS SLIDER, SPEED
 -----------------------------------------------------------------------------
 Asked for: a max loop length in area mode that overrides the coverage

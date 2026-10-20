@@ -15,12 +15,25 @@ Three ways to plan:
   The app finds the roundest loop (highest isoperimetric quotient,
   4π·area ÷ length²) that encloses at least a chosen share of the shape,
   typed as a percentage of it or as an area in sq mi or sq km. Between
-  equally round loops, the one enclosing more area wins. An optional
-  maximum loop length overrides the target: the loop stays within it, and
-  if the target can't be reached that way, it is the loop within the limit
-  that encloses the most.
+  equally round loops, the one enclosing more area wins.
 - **Place**: search for a city, county, state, lake or park and use its real
   boundary (from OpenStreetMap via Nominatim) as the area.
+
+**Limits** (every mode, optional): the shortest and longest distance, the
+smallest and largest enclosed area, and the least and most climb. In start
+point mode each pin's length is its longest distance. If they can't all be
+met, they count in this order: the longest distance (how far you can go),
+then the most climb, then the shortest distance and the area limits, then
+the share of the area to surround, then the least climb, and only then the
+goal (most area, or roundest). A loop that misses a limit says which; one
+held back from its coverage target by a distance, climb or area limit
+says so in a note (that's expected). In the solver each loop gets a rank,
+the most important limit it misses (`limitMisses` in `js/solver.js`), and a
+lower rank always beats a better score; within a rank, misses shrink the
+score steeply so the search heads toward meeting them. Climb limits are
+checked against the search's climb estimate (terrain tiles): the sweep
+tracks the climb of every path, some sweeps count climb as lost area (to
+find flat loops) and, with a climb limit, some try smaller loops.
 
 For each loop the panel shows distance, enclosed area, roundness, coverage,
 an estimated time from your pace (min/mi, min/km, mph or km/h), and an
@@ -36,7 +49,7 @@ start point nearby loads instantly. Tiles start downloading as soon as a
 pin, shape or place is set, before "Find loop" is pressed. The same search
 gives the same loop every time.
 
-**Roads to use** (in the panel, for every mode): avoid motorways,
+**Roads & hills** (in the panel, for every mode): avoid motorways,
 expressways and their ramps (off by default); allow fence hops (straight
 links of up to 10 m from a dead end to a road it doesn't connect to, never
 across another road, railroad, river or shore, and never from a driveway,
@@ -214,8 +227,9 @@ that, `js/pipeline.js` searches in stages:
    polished block by block. The result always uses the real road shapes.
 3. The same again in a corridor along the improved loop, so each side can
    move further (up to three passes, until a pass gains less than 0.5%;
-   one for loops over 2,000 km, where the climb isn't counted either:
-   terrain tiles for a whole country only show hills kilometers wide).
+   one for loops over 2,000 km). Every stage counts the climb, the coarse
+   ones from coarse terrain tiles (an estimate, but enough that the rough
+   loop doesn't settle somewhere the later stages couldn't get it out of).
 
 A corridor takes at most about 1,500 tiles (`corridorPlan`). Tile servers
 answer about 150 requests a second whatever their size, so the number of

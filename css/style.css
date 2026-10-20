@@ -956,7 +956,7 @@ h1 {
 }
 
 .coverage-equivalent {
-    margin-top: -4px;
+    margin-top: -6px;
     font-variant-numeric: tabular-nums;
 }
 
@@ -969,7 +969,97 @@ h1 {
     color: var(--text-faint);
 }
 
-/* Climb cost slider (Roads to use) */
+/* A field with a button beside it (Start point) */
+.section > .inline-row {
+    flex-direction: row;
+    align-items: flex-end;
+    gap: 8px;
+}
+
+.inline-row .field-grow {
+    flex: 1;
+    min-width: 0;
+}
+
+.inline-row .btn {
+    flex: none;
+    height: 42px;
+}
+
+/* Limits: min / max per measure */
+.limits-grid {
+    display: grid;
+    grid-template-columns: auto 1fr 1fr;
+    align-items: center;
+    gap: 6px 8px;
+    margin-top: 10px;
+}
+
+.limits-head {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+}
+
+.limits-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+.limits-label span {
+    font-weight: 400;
+    color: var(--text-faint);
+}
+
+.limits-grid input {
+    width: 100%;
+    min-width: 0;
+    height: 32px;
+    padding: 0 8px;
+    font: inherit;
+    font-size: 14px;
+    color: var(--text);
+    background: var(--surface-solid);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+}
+
+.limits-grid input:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.limits-grid input:invalid,
+.limits-grid input.is-invalid {
+    border-color: var(--danger, #dc2626);
+}
+
+.limits-grid input:disabled {
+    opacity: 0.5;
+}
+
+#limitsNote:empty {
+    display: none;
+}
+
+#limitsNote.is-warning {
+    color: var(--warning);
+}
+
+.muted {
+    color: var(--text-faint);
+}
+
+.about .hint {
+    margin-top: 8px;
+}
+
+/* Climb cost slider (Roads & hills) */
 .climb-field {
     display: flex;
     flex-direction: column;

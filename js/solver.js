@@ -174,7 +174,9 @@ function prepareGraph(network, params) {
     const oLen = new Float64Array(E0);
     const oCross = new Float64Array(E0);
     const oExtra = new Float64Array(E0);   // extra cost, in meters
+    const oClimb = new Float64Array(E0);   // climb (see addRoadClimb), in meters
     source.forEach((edge, e) => {
+        oClimb[e] = edge.climb || 0;
         oFrom[e] = index.get(edge.from);
         oTo[e] = index.get(edge.to);
         oLen[e] = edge.distance;
@@ -297,6 +299,7 @@ function prepareGraph(network, params) {
     const eLen = new Float64Array(E);
     const eCross = new Float64Array(E);
     const eExtra = new Float64Array(E);
+    const eClimb = new Float64Array(E);
     const chainOff = new Int32Array(E + 1);
     chains.forEach((chain, e) => {
         chainOff[e + 1] = chainOff[e] + chain.edges.length;
@@ -313,6 +316,7 @@ function prepareGraph(network, params) {
             chainDir[chainOff[e] + k] = dir;
             eLen[e] += oLen[oe];
             eExtra[e] += oExtra[oe];
+            eClimb[e] += oClimb[oe];
             eCross[e] += dir * oCross[oe];
             at = other(oe, at);
         });
@@ -341,28 +345,35 @@ function prepareGraph(network, params) {
         return pts;
     });
     const targetXY = params.mode === "area" ? params.target.map(p => project(p.lat, p.lng)) : null;
-    // Extra cost (SOLVER.climbCost): area mode, as length; with a length
-    // limit (and in start mode) as lost area instead, so it doesn't use up
-    // the limit (see below).
-    const costAsArea = params.mode === "start" || params.maxLengthM > 0;
+    // Extra cost (SOLVER.climbCost): area mode, as length; with limits
+    // (and in start mode) as lost area instead, so the length the search
+    // sees is the real one (see below).
+    const costAsArea = params.mode === "start" || hasLimits(params);
     const realLen = eLen.slice();
     if (!costAsArea) for (let e = 0; e < E; e++) eLen[e] += eExtra[e];
 
     const data = {
         N: M, E, x, y, eFrom, eTo, eLen, eCross,
         adjOff: adjacency.adjOff, adjEdge: adjacency.adjEdge,
-        nStem: null, ePen: null,
+        nStem: null, ePen: null, eClimb: null,
         lat0, lng0, kx, ky,
         faces: buildFaces(M, eFrom, eTo, eLen, lines, targetXY)
     };
+    // A piece's share of a value for its merged edge (by length).
+    const { P, pEdge, pLen } = data.faces;
+    const perPiece = (values) => Float64Array.from({ length: P }, (_, p) => realLen[pEdge[p]] > 0 ? values[pEdge[p]] * pLen[p] / realLen[pEdge[p]] : 0);
     if (costAsArea) {
         // As area: each meter costs what one more meter of a round loop of
-        // the length limit would enclose. (For a round loop that lowers its
-        // roundness as much as the same extra length would.)
-        const perMeter = 0.8 * params.maxLengthM / (2 * Math.PI);
-        const { P, pEdge, pLen } = data.faces;
+        // the expected length would enclose. (For a round loop that lowers
+        // its roundness as much as the same extra length would.)
+        const perMeter = 0.8 * expectedLength(params, targetXY) / (2 * Math.PI);
         data.ePen = Float64Array.from(eExtra, extra => perMeter * extra);
-        data.faces.pPen = Float64Array.from({ length: P }, (_, p) => realLen[pEdge[p]] > 0 ? data.ePen[pEdge[p]] * pLen[p] / realLen[pEdge[p]] : 0);
+        data.faces.pPen = perPiece(data.ePen);
+    }
+    if (hasClimbLimits(params)) {
+        // The climb of each road, for the climb limits.
+        data.eClimb = eClimb;
+        data.faces.pClimb = perPiece(eClimb);
     }
     const prepared = {
         data, network, source, oFrom, oTo, chainOff, chainEdge, chainDir, cOrig, project, unproject,
@@ -390,6 +401,19 @@ function prepareGraph(network, params) {
         Object.assign(prepared, { startOrig, stemPrev: prevEdge });
     }
     return prepared;
+}
+
+// Length of the loop a search expects: the length limit (start mode), or
+// the perimeter of a circle as big as the target area, or the limit if
+// shorter (area mode).
+function expectedLength(params, targetXY) {
+    if (params.mode === "start") return params.maxLengthM;
+    let cross = 0;
+    targetXY.forEach((p, i) => {
+        const q = targetXY[(i + 1) % targetXY.length];
+        cross += p.x * q.y - q.x * p.y;
+    });
+    return Math.min(2 * Math.PI * Math.sqrt(Math.abs(cross) / 2 / Math.PI), params.maxLengthM || Infinity);
 }
 
 function buildAdjacency(N, eFrom, eTo) {
@@ -1181,32 +1205,64 @@ function polarTarget(target, cx, cy, theta0, bins) {
 //   maxLengthM  the loop may not be longer (start; area: optional)
 //   coverage    (area)   0..1 share of the target the loop must enclose
 //   targetArea  (area)   m², for the tiebreak
-// metrics: { length, area, repeats, coverage? }
+//   minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM   optional limits
+// metrics: { length, area, repeats, coverage?, realArea?, climb? }
+//   area is what the goal counts (less the area lost to extra costs, see
+//   prepareGraph); realArea, the enclosed area, is what area limits check
+//   (area if not given); climb is checked only if given.
 //
 // Start mode: score = area. Area mode: score = isoperimetric quotient, with
 // a small bonus for enclosing more area, so that of two equally round loops
 // the bigger one wins. Unmet requirements shrink the score steeply instead of
 // ruling the loop out, so the best loop so far can be shown even if none
-// meets them. In area mode the length limit comes first: a loop over it
-// scores below one that covers less within it.
+// meets them. Returns { score, feasible, rank }: rank is 0 if every limit is
+// met, otherwise the priority of the most important one missed (see
+// limitMisses); a lower rank always wins over a better score.
 function scoreLoop(metrics, objective) {
     const repeatFactor = 0.8 ** metrics.repeats;
-    if (objective.mode === "start") {
-        const over = metrics.length / objective.maxLengthM;
-        return {
-            score: metrics.area * (over > 1 ? over ** -10 : 1) * repeatFactor,
-            feasible: over <= 1 && metrics.repeats === 0
-        };
-    }
+    const { rank, factor: limitFactor } = limitMisses(metrics, objective);
+    const factor = limitFactor * repeatFactor;
+    const feasible = rank === 0 && metrics.repeats === 0;
+    if (objective.mode === "start") return { score: metrics.area * factor, feasible, rank };
     const iq = 4 * Math.PI * metrics.area / metrics.length ** 2;
-    const short = metrics.coverage / objective.coverage;
-    const over = objective.maxLengthM ? metrics.length / objective.maxLengthM : 0;
     const sizeBonus = SOLVER.areaTiebreak * Math.min(metrics.area / objective.targetArea, 2);
-    return {
-        score: (iq + sizeBonus) * (short < 1 ? short ** 6 : 1) * (over > 1 ? over ** -40 : 1) * repeatFactor,
-        feasible: short >= 1 && over <= 1 && metrics.repeats === 0
-    };
+    return { score: (iq + sizeBonus) * factor, feasible, rank };
 }
+
+// Which limits a loop misses: { rank, log, factor }. rank is the priority of the
+// most important one missed (0: none), from common sense about what a
+// runner can't bend: the longest distance first (it's how far they can
+// go), then the most climb, then the shortest distance and the smallest and
+// largest area, then the share of the area to cover, then the least climb.
+// factor is what the score is multiplied by (log, its log): steeper for
+// more important limits, so that the search heads for loops that meet
+// them. coverageSteepness: the exponent for the coverage target (the block
+// polish pushes harder, see SOLVER.polishShortfall).
+function limitMisses(m, o, coverageSteepness = 6) {
+    let rank = 0, log = 0, factor = 1;
+    // ratio > 1 is how far it's off.
+    const miss = (priority, ratio, steepness) => {
+        if (!(ratio > 1)) return;
+        if (priority > rank) rank = priority;
+        log -= steepness * Math.log(ratio);
+        factor *= ratio ** -steepness;
+    };
+    const area = m.realArea ?? m.area;
+    if (o.maxLengthM) miss(5, m.length / o.maxLengthM, o.mode === "start" ? 10 : 40);
+    if (o.maxClimbM != null && m.climb != null) miss(4, (m.climb + 10) / (o.maxClimbM + 10), 20);
+    if (o.minLengthM) miss(3, o.minLengthM / m.length, 8);
+    if (o.minAreaM2) miss(3, o.minAreaM2 / Math.max(area, 1), 8);
+    if (o.maxAreaM2) miss(3, area / o.maxAreaM2, 8);
+    if (o.coverage) miss(2, o.coverage / Math.max(m.coverage, 1e-9), coverageSteepness);
+    if (o.minClimbM && m.climb != null) miss(1, (o.minClimbM + 10) / (m.climb + 10), 6);
+    return { rank, log, factor };
+}
+
+// Whether a search has any of the optional limits (area mode: also the
+// length limit).
+const hasLimits = (p) => Boolean((p.mode === "area" && p.maxLengthM) || p.minLengthM || p.minAreaM2 || p.maxAreaM2 ||
+    p.minClimbM || p.maxClimbM != null);
+const hasClimbLimits = (p) => Boolean(p.minClimbM || p.maxClimbM != null);
 
 // --------------------------------------------------------------------------
 // Angular sweep
@@ -1223,11 +1279,13 @@ function scoreLoop(metrics, objective) {
 //     area + mu × covered area − lambda × length
 // (area is the area swept from the centre; lambda credits shorter paths
 // with the area their spare length could enclose). Every path that gets
-// back to s is a loop; it is measured with close(area, covered, length) →
-// { score, feasible }, and the best one is returned:
-//   { edges, dirs, area, covered, length, score, feasible } or null.
+// back to s is a loop; it is measured with close(area, covered, length,
+// climb) → { score, feasible, rank } (climb: with climb limits, else
+// undefined), and the best one is returned:
+//   { edges, dirs, area, covered, length, climb, score, feasible, rank } or null.
 //
 // opts: { K, mu, lambda, target (polarTarget, area mode), close,
+//         climbWeight (with climb limits: area each meter of climb costs),
 //         order, period (go forward along a reference loop instead),
 //         end, endAng, theta0 (with order: the best path from s to end
 //         instead of a loop; close() gets its totals) }
@@ -1236,7 +1294,8 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
     // The planar map of buildFaces: a road crossing another without a
     // junction meets it at a vertex the loop can pass only once, straight
     // on, so loops never cross themselves.
-    const { V, vX: x, vY: y, vOff, vPiece, vCut, pFrom, pTo, pLen, pCross, pEdge, pCut, pPen } = g.faces;
+    const { V, vX: x, vY: y, vOff, vPiece, vCut, pFrom, pTo, pLen, pCross, pEdge, pCut, pPen, pClimb } = g.faces;
+    const climbWeight = pClimb ? opts.climbWeight || 0 : 0;
     const TWO_PI = 2 * Math.PI;
     const theta0 = opts.theta0 ?? Math.atan2(y[s] - cy, x[s] - cx);
     const end = opts.end ?? -1;
@@ -1246,10 +1305,11 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
             ang: new Float64Array(V), rank: new Int32Array(V).fill(-1), sel: new Int32Array(V), selCount: 0,
             fOff: new Int32Array(V + 1), dS: new Float32Array(V + 1),
             fTo: new Int32Array(slots), fLen: new Float32Array(slots), fArea: new Float32Array(slots),
-            fCov: new Float32Array(slots), fHalf: new Int32Array(slots), fGroup: new Int8Array(slots)
+            fCov: new Float32Array(slots), fHalf: new Int32Array(slots), fGroup: new Int8Array(slots),
+            fClimb: pClimb ? new Float32Array(slots) : null
         });
     }
-    const { ang, rank, fOff, dS, fTo, fLen, fArea, fCov, fHalf, fGroup } = scratch;
+    const { ang, rank, fOff, dS, fTo, fLen, fArea, fCov, fHalf, fGroup, fClimb } = scratch;
     const order = opts.order;
 
     // Vertices that can be on a loop through s of this length, by angle
@@ -1320,9 +1380,11 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
             }
             fTo[n] = r;
             fLen[n] = pLen[p];
+            if (fClimb) fClimb[n] = pClimb[p];
             // Shoelace sum relative to the centre.
             // (Start mode: less the area lost to the piece's extra cost.)
-            fArea[n] = ((forward ? pCross[p] : -pCross[p]) - (cx * (y[w] - y[v]) - cy * (x[w] - x[v]))) / 2 - (pPen ? pPen[p] : 0);
+            fArea[n] = ((forward ? pCross[p] : -pCross[p]) - (cx * (y[w] - y[v]) - cy * (x[w] - x[v]))) / 2 - (pPen ? pPen[p] : 0) -
+                (climbWeight ? climbWeight * pClimb[p] : 0);
             fCov[n] = target ? fanCover(target, x[v] - cx, y[v] - cy, x[w] - cx, y[w] - cy, theta0) : 0;
             fHalf[n] = 2 * p + (forward ? 0 : 1);
             fGroup[n] = vCut[w] && r < M ? groupAt(p, w) : -1;
@@ -1343,14 +1405,16 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
     rowStart[M] = rows;
     const K = Math.max(8, Math.min(opts.K, Math.floor(SOLVER.maxStates / Math.max(1, rows))));
     const size = rows * K;
-    if (!scratch.st || scratch.st.length < 3 * size) {
-        scratch.st = new Float32Array(3 * size);
+    // (With climb limits, a fourth value per state: the climb so far.)
+    const W = fClimb ? 4 : 3;
+    if (!scratch.st || scratch.st.length < W * size) {
+        scratch.st = new Float32Array(W * size);
         scratch.pState = new Int32Array(size);
         scratch.pSlot = new Int32Array(size);
     }
     const { st, pState, pSlot } = scratch;
-    for (let i = 0; i < 3 * size; i += 3) st[i] = -Infinity;
-    st[0] = st[1] = st[2] = 0;
+    for (let i = 0; i < W * size; i += W) st[i] = -Infinity;
+    for (let k = 0; k < W; k++) st[k] = 0;
     const q = budget / K;
     const lambda = opts.lambda;
 
@@ -1364,7 +1428,7 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
         // don't need to be told apart here.)
         let top = -Infinity;
         for (let state = rowStart[i] * K; state < rowStart[i + 1] * K; state++) {
-            const at = 3 * state;
+            const at = W * state;
             const a0 = st[at];
             if (a0 === -Infinity) continue;
             const c0 = st[at + 1];
@@ -1374,6 +1438,7 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
             if (w0 <= top && !split) continue;
             top = Math.max(top, w0);
             const l0 = st[at + 2];
+            const k0 = fClimb ? st[at + 3] : 0;
             const pIn = split && i > 0 ? fHalf[pSlot[state]] >> 1 : -1;
             for (let j = e0; j < e1; j++) {
                 if (split) {
@@ -1388,9 +1453,10 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
                 const a1 = a0 + fArea[j];
                 const c1 = c0 + fCov[j];
                 if (r === M) {
-                    const result = opts.close(a1, c1, l1);
+                    const k1 = fClimb ? k0 + fClimb[j] : undefined;
+                    const result = opts.close(a1, c1, l1, k1);
                     if (!best || isBetterResult(result, best)) {
-                        best = { area: a1, covered: c1, length: l1, score: result.score, feasible: result.feasible };
+                        best = { area: a1, covered: c1, length: l1, climb: k1, score: result.score, feasible: result.feasible, rank: result.rank };
                         bestState = state;
                         bestSlot = j;
                     }
@@ -1399,11 +1465,12 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
                 let kk = (l1 / q) | 0;
                 if (kk >= K) kk = K - 1;
                 const idx = (rowStart[r] + (fGroup[j] > 0 ? fGroup[j] : 0)) * K + kk;
-                const old = st[3 * idx];
-                if (old === -Infinity || a1 + mu * c1 - lambda * l1 > old + mu * st[3 * idx + 1] - lambda * st[3 * idx + 2]) {
-                    st[3 * idx] = a1;
-                    st[3 * idx + 1] = c1;
-                    st[3 * idx + 2] = l1;
+                const old = st[W * idx];
+                if (old === -Infinity || a1 + mu * c1 - lambda * l1 > old + mu * st[W * idx + 1] - lambda * st[W * idx + 2]) {
+                    st[W * idx] = a1;
+                    st[W * idx + 1] = c1;
+                    st[W * idx + 2] = l1;
+                    if (fClimb) st[W * idx + 3] = k0 + fClimb[j];
                     pState[idx] = state;
                     pSlot[idx] = j;
                 }
@@ -1485,14 +1552,15 @@ function fanCover(target, ax, ay, bx, by, theta0) {
 // winding suburban streets, or that need to reach further to cover enough)
 // cheap to try: about a microsecond each.
 //
-// logScore(area, length, covered, stem) is the log of the loop's score, and
-// feasible(…) whether it meets the requirements (same arguments).
+// logScore(area, length, covered, stem, climb, realArea) is the log of the
+// loop's score, and rank(…) the limits it misses (same arguments; see
+// limitMisses). area is less what extra costs take off, realArea not.
 class FacePolish {
-    constructor(g, logScore, feasible) {
+    constructor(g, logScore, rank) {
         const fc = this.fc = g.faces;
         this.g = g;
         this.logScore = logScore;
-        this.feasible = feasible;
+        this.rank = rank;
         this.inR = new Uint8Array(fc.F);
         this.onB = new Int32Array(fc.P).fill(-1);   // index in bList, or -1
         this.bList = new Int32Array(fc.P);
@@ -1554,7 +1622,7 @@ class FacePolish {
         this.out.fill(-1);
         this.vB.fill(0);
         this.bCount = 0;
-        this.area = this.length = this.covered = 0;
+        this.area = this.length = this.covered = this.climb = this.pen = 0;
         this.faces = 0;
         for (let f = 0; f < fc.F; f++) {
             if (!inside[f]) continue;
@@ -1573,7 +1641,11 @@ class FacePolish {
         this.onB[p] = this.bCount;
         this.bList[this.bCount++] = p;
         this.length += fc.pLen[p];
-        if (fc.pPen) this.area -= fc.pPen[p];
+        if (fc.pPen) {
+            this.area -= fc.pPen[p];
+            this.pen += fc.pPen[p];
+        }
+        if (fc.pClimb) this.climb += fc.pClimb[p];
         this.vB[fc.pFrom[p]]++;
         this.vB[fc.pTo[p]]++;
         this.setOut(p);
@@ -1586,7 +1658,11 @@ class FacePolish {
         this.onB[last] = i;
         this.onB[p] = -1;
         this.length -= fc.pLen[p];
-        if (fc.pPen) this.area += fc.pPen[p];
+        if (fc.pPen) {
+            this.area += fc.pPen[p];
+            this.pen -= fc.pPen[p];
+        }
+        if (fc.pClimb) this.climb -= fc.pClimb[p];
         this.vB[fc.pFrom[p]]--;
         this.vB[fc.pTo[p]]--;
         if (out[fc.pFrom[p]] === 2 * p) out[fc.pFrom[p]] = -1;
@@ -1614,8 +1690,8 @@ class FacePolish {
     }
 
     // Whether face f can be flipped (in ↔ out) keeping the inside one simple
-    // piece. Sets this.nextLength, this.nextStem and this.dPen (start mode:
-    // the change in area lost to extra costs, see addBoundary).
+    // piece. Sets this.nextLength, this.nextStem, this.dPen (the change in
+    // area lost to extra costs, see addBoundary) and this.dClimb.
     check(f) {
         const { fc, inR, vB, nStem } = this;
         if (!fc.faceOk[f]) return false;
@@ -1625,7 +1701,7 @@ class FacePolish {
         // A street of f is a "contact" if it is on the boundary now (it
         // leaves the boundary when f flips; the others join it). Contacts
         // must form one unbroken run.
-        let contacts = 0, runs = 0, dLength = 0, dPen = 0;
+        let contacts = 0, runs = 0, dLength = 0, dPen = 0, dClimb = 0;
         let prev = inR[fc.hFace[fc.faceHalf[b - 1] ^ 1]] !== fin;
         let stem = this.stem, stemLeaves = false;
         for (let k = a; k < b; k++) {
@@ -1638,9 +1714,11 @@ class FacePolish {
                 if (!prev) runs++;
                 dLength -= fc.pLen[p];
                 if (fc.pPen) dPen += fc.pPen[p];
+                if (fc.pClimb) dClimb -= fc.pClimb[p];
             } else {
                 dLength += fc.pLen[p];
                 if (fc.pPen) dPen -= fc.pPen[p];
+                if (fc.pClimb) dClimb += fc.pClimb[p];
                 // A vertex that joins the boundary must not be on it already
                 // (the loop would touch itself).
                 if (!prev && vB[v]) return false;
@@ -1667,6 +1745,7 @@ class FacePolish {
         this.nextLength = this.length + dLength;
         this.nextStem = stem;
         this.dPen = dPen;
+        this.dClimb = dClimb;
         return true;
     }
 
@@ -1719,10 +1798,12 @@ class FacePolish {
     // if none was better than the start.
     anneal(moves, T0, T1, random) {
         const { fc, inR } = this;
-        let current = this.logScore(this.area, this.length, this.covered, this.stem);
-        let bestFeasible = this.feasible(this.area, this.length, this.covered, this.stem);
+        // (The enclosed area is the area less what extra costs take off,
+        // plus those.)
+        let current = this.logScore(this.area, this.length, this.covered, this.stem, this.climb, this.area + this.pen);
+        let bestRank = this.rank(this.area, this.length, this.covered, this.stem, this.climb, this.area + this.pen);
         let best = current;
-        const start = { log: current, feasible: bestFeasible };
+        const start = { log: current, rank: bestRank };
         let bestInside = null, atBest = true;
         const cool = Math.log(T1 / T0) / moves;
         for (let m = 0; m < moves; m++) {
@@ -1732,10 +1813,11 @@ class FacePolish {
                 const T = T0 * Math.exp(cool * m);
                 const move = this.reroute(random);
                 if (!move) continue;
-                const next = this.logScore(this.area + move.dArea, this.length + move.dLength, this.covered + move.dCovered, move.stem);
+                const area = this.area + move.dArea, climb = this.climb + move.dClimb, real = area + this.pen - move.dPen;
+                const next = this.logScore(area, this.length + move.dLength, this.covered + move.dCovered, move.stem, climb, real);
                 if (next < current && random() >= Math.exp((next - current) / T)) continue;
-                const feasible = this.feasible(this.area + move.dArea, this.length + move.dLength, this.covered + move.dCovered, move.stem);
-                const better = (feasible && !bestFeasible) || (feasible === bestFeasible && next > best);
+                const rank = this.rank(area, this.length + move.dLength, this.covered + move.dCovered, move.stem, climb, real);
+                const better = rank < bestRank || (rank === bestRank && next > best);
                 if (atBest && !better) bestInside = inR.slice();
                 for (const f of move.faces) this.flip(f);
                 // Flipping blocks one by one can pass through states where
@@ -1751,7 +1833,7 @@ class FacePolish {
                 atBest = better;
                 if (better) {
                     best = next;
-                    bestFeasible = feasible;
+                    bestRank = rank;
                 }
                 continue;
             }
@@ -1763,10 +1845,11 @@ class FacePolish {
             const sign = inR[f] ? -1 : 1;
             const area = this.area + sign * fc.faceArea[f] + this.dPen;
             const covered = fc.faceCover ? this.covered + sign * fc.faceCover[f] : 0;
-            const next = this.logScore(area, this.nextLength, covered, this.nextStem);
+            const climb = this.climb + this.dClimb, real = area + this.pen - this.dPen;
+            const next = this.logScore(area, this.nextLength, covered, this.nextStem, climb, real);
             if (next < current && random() >= Math.exp((next - current) / (T0 * Math.exp(cool * m)))) continue;
-            const feasible = this.feasible(area, this.nextLength, covered, this.nextStem);
-            const better = (feasible && !bestFeasible) || (feasible === bestFeasible && next > best);
+            const rank = this.rank(area, this.nextLength, covered, this.nextStem, climb, real);
+            const better = rank < bestRank || (rank === bestRank && next > best);
             if (atBest && !better) bestInside = inR.slice();
             this.flip(f);
             this.stem = this.nextStem;
@@ -1774,14 +1857,14 @@ class FacePolish {
             atBest = better;
             if (better) {
                 best = next;
-                bestFeasible = feasible;
+                bestRank = rank;
             }
         }
         if (!atBest) {
             if (!bestInside) return null;
             this.setInside(bestInside);
         }
-        if (best <= start.log && bestFeasible === start.feasible) return null;
+        if (best <= start.log && bestRank === start.rank) return null;
         return this.loop();
     }
 
@@ -1790,7 +1873,8 @@ class FacePolish {
     // them just outside the loop (growing it) or just inside (shrinking it),
     // flipping all the blocks in between. Straightens out jagged stretches
     // that single-block moves are slow to fix. Returns { faces, dArea,
-    // dLength, dCovered, stem } or null if there is no such path.
+    // dLength, dCovered, dPen, dClimb, stem } or null if there is no such
+    // path (dPen: the change in area lost to extra costs).
     reroute(random) {
         const { fc, inR, out, vB } = this;
         const stamp = ++this.stamp;
@@ -1802,12 +1886,13 @@ class FacePolish {
         if (this.cutEnd(p0, a)) return null;
         const k = 2 + Math.floor(random() * Math.min(30, this.bCount / 3));
         const stretch = [];
-        let v = a, lengthS = 0, pen = 0;
+        let v = a, lengthS = 0, pen = 0, climb = 0;
         for (let i = 0; ; i++) {
             const h = out[v];
             stretch.push(h);
             lengthS += fc.pLen[h >> 1];
             if (fc.pPen) pen += fc.pPen[h >> 1];
+            if (fc.pClimb) climb -= fc.pClimb[h >> 1];
             v = h & 1 ? fc.pFrom[h >> 1] : fc.pTo[h >> 1];
             if (v === a || stretch.length >= this.bCount - 2) return null;
             if (i + 1 >= k && !this.cutEnd(h >> 1, v)) break;
@@ -1859,6 +1944,7 @@ class FacePolish {
             const p = prevPiece[w];
             this.onPath[p] = stamp;
             if (fc.pPen) pen -= fc.pPen[p];
+            if (fc.pClimb) climb += fc.pClimb[p];
             w = fc.pFrom[p] === w ? fc.pTo[p] : fc.pFrom[p];
             if (w !== a) pathVertices.push(w);
         }
@@ -1904,7 +1990,7 @@ class FacePolish {
             }
             for (const w of pathVertices) if (nStem[w] < stem) stem = nStem[w];
         }
-        return { faces, dArea: sign * dArea + pen, dCovered: sign * dCovered, dLength: dist[b] - lengthS, stem };
+        return { faces, dArea: sign * dArea + pen, dCovered: sign * dCovered, dLength: dist[b] - lengthS, dPen: pen, dClimb: climb, stem };
     }
 
     // The boundary as a loop of merged edges, starting at the junction
@@ -1932,8 +2018,7 @@ class FacePolish {
         } while (v !== first && edges.length <= this.bCount);
         return {
             edges, dirs, join: first,
-            area: this.area, length: this.length, covered: this.covered, stem: this.stem,
-            feasible: this.feasible(this.area, this.length, this.covered, this.stem)
+            area: this.area, length: this.length, covered: this.covered, stem: this.stem, climb: this.climb
         };
     }
 }
@@ -1965,8 +2050,10 @@ class SweepSearch {
         this.worker = worker;
         this.workers = workers;
         this.isStart = params.mode === "start";
-        this.objective = { mode: params.mode, maxLengthM: params.maxLengthM, coverage: params.coverage };
+        const { mode, maxLengthM, coverage, minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM } = params;
+        this.objective = { mode, maxLengthM, coverage, minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM };
         this.scratch = {};
+        this.exact = Boolean(g.eClimb) || hasLimits(params);
         this.random = mulberry32(1 + worker);
         this.rounds = 0;
         this.evaluations = 0;
@@ -2001,11 +2088,14 @@ class SweepSearch {
             hull.forEach((p, i) => { perimeter += Math.hypot(hull[(i + 1) % hull.length].x - p.x, hull[(i + 1) % hull.length].y - p.y); });
             // Loops longer than this can't be rounder than ones that are
             // shorter and still cover enough (or are over the limit).
-            this.budget = Math.min(Math.max(1.5 * perimeter, 2.5 * Math.PI * this.radius), params.maxLengthM || Infinity);
+            this.budget = Math.min(Math.max(1.5 * perimeter, 2.5 * Math.PI * this.radius, 1.2 * (minLengthM || 0)), maxLengthM || Infinity);
             // How far out from the middle loops reach, as a share of the
-            // target's size: enough to cover the target, or as far as the
-            // length limit allows.
-            this.reach = Math.min(Math.sqrt(params.coverage), (params.maxLengthM || Infinity) / (2 * Math.PI * this.radius));
+            // target's size: enough to cover the target (and any smallest
+            // area), but no more than the length limit or largest area
+            // allow.
+            const r = this.radius;
+            this.reach = Math.min(Math.max(Math.sqrt(coverage), Math.sqrt((minAreaM2 || 0) / this.targetArea)),
+                (maxLengthM || Infinity) / (2 * Math.PI * r), Math.sqrt((maxAreaM2 || Infinity) / this.targetArea));
             this.anchor = params.anchor ? project(params.anchor) : null;
         }
     }
@@ -2091,8 +2181,10 @@ class SweepSearch {
             const phi = 2 * Math.PI * w;
             // (On the outline shrunk to the coverage, or as far out as a
             // little beyond it.)
-            const k = this.reach;
-            const scale = k + (1.05 - k) * ((i * 0.6180339887) % 1);
+            // With a climb limit, every other sweep also tries smaller loops
+            // (the climb limit comes before the coverage target).
+            const k = this.reach, spread = (i * 0.6180339887) % 1;
+            const scale = this.params.maxClimbM != null && i % 2 === 1 ? k * (0.25 + 0.75 * spread) : k + (1.05 - k) * spread;
             const at = this.anchor && (this.fixedCenter || i % 2 === 0) ? this.anchor : outlinePoint(this.targetXY, center, phi, scale);
             s = nearestJunction(g, at.x, at.y, n => !g.faces.vCut[n]);
             budget = this.budget;
@@ -2102,16 +2194,24 @@ class SweepSearch {
         }
 
         const objective = this.objective;
+        // With climb limits, sweeps take turns counting climb as lost area
+        // (heavily, lightly, not at all; or as gained area, for the least
+        // climb), so some look for flat loops, others ignore hills.
+        let climbWeight = 0;
+        if (g.eClimb) {
+            const weights = this.params.maxClimbM != null ? [0, 1, 4, 16] : [0, -1, -4];
+            climbWeight = weights[i % weights.length] * 0.8 * (isStart ? budget : Math.min(2 * Math.PI * this.radius, this.budget)) / (2 * Math.PI);
+        }
         const close = isStart
-            ? (area, covered, length) => scoreLoop({ length: length + 2 * stem, area, repeats: 0 }, objective)
-            : (area, covered, length) => scoreLoop({ length, area, coverage: covered / this.targetArea, repeats: 0 }, objective);
+            ? (area, covered, length, climb) => scoreLoop({ length: length + 2 * stem, area, climb, repeats: 0 }, objective)
+            : (area, covered, length, climb) => scoreLoop({ length, area, climb, coverage: covered / this.targetArea, repeats: 0 }, objective);
         // Marginal area per meter of length for a round loop of this size.
         const lambda = 0.8 * (isStart ? budget : Math.min(2 * Math.PI * this.radius, this.budget)) / (2 * Math.PI) * (1 + mu);
         // Improving a rough loop: the first sweep goes in order along it
         // rather than around the centre, so it can follow its every wiggle.
         const along = this.along && i === 1 ? this.along : null;
         const swept = sweepLoop(g, s, center.x, center.y, budget,
-            { K: SOLVER.lengthBuckets, mu, lambda, target, close, order: along?.order, period: along?.period }, this.scratch);
+            { K: SOLVER.lengthBuckets, mu, lambda, target, close, climbWeight, order: along?.order, period: along?.period }, this.scratch);
         this.evaluations++;
         if (!swept) return;
         let cand = this.candidate(swept, s, stem, center);
@@ -2122,7 +2222,7 @@ class SweepSearch {
         const top = this.bestSwept;
         if (!top || isBetterResult(cand, top)) this.bestSwept = cand;
         const within = isStart ? 0 : SOLVER.polishWithin;
-        if (!top || (cand.feasible || !top.feasible) && cand.score >= top.score * (1 - within)) {
+        if (!top || rankOf(cand) <= rankOf(top) && cand.score >= top.score * (1 - within)) {
             const polished = this.polishLoop(swept);
             if (polished) {
                 const next = this.candidate(polished, isStart ? polished.join : s, polished.stem, center);
@@ -2163,6 +2263,12 @@ class SweepSearch {
         const weights = SOLVER.coverageWeights;
         const mu = isStart ? 0 : weights[Math.floor(w * weights.length)];
         const stem = loop.metrics.stem || 0;
+        // With climb limits, as in sweep (the same for the whole pass).
+        let climbWeight = 0;
+        if (g.eClimb) {
+            const cw = this.params.maxClimbM != null ? [0, 1, 4, 16] : [0, -1, -4];
+            climbWeight = cw[i % cw.length] * 0.8 * loop.metrics.length / (2 * Math.PI);
+        }
 
         // The loop as pieces: start vertex, piece, direction, and the index
         // of its merged edge in loop.edges.
@@ -2173,15 +2279,17 @@ class SweepSearch {
                 else for (let p = F.eOff[e + 1] - 1; p >= F.eOff[e]; p--) { verts.push(F.pTo[p]); pcs.push(p); dirs.push(-1); edgeAt.push(k); }
             });
             const n = pcs.length;
-            const cumL = new Float64Array(n + 1), cumA = new Float64Array(n + 1), cumC = new Float64Array(n + 1);
+            const cumL = new Float64Array(n + 1), cumA = new Float64Array(n + 1), cumC = new Float64Array(n + 1), cumK = new Float64Array(n + 1);
             for (let k = 0; k < n; k++) {
                 const a = verts[k], b = verts[(k + 1) % n], p = pcs[k];
                 const ax = F.vX[a] - c.x, ay = F.vY[a] - c.y, bx = F.vX[b] - c.x, by = F.vY[b] - c.y;
                 cumL[k + 1] = cumL[k] + F.pLen[p];
-                cumA[k + 1] = cumA[k] + ((dirs[k] === 1 ? F.pCross[p] : -F.pCross[p]) - (c.x * (F.vY[b] - F.vY[a]) - c.y * (F.vX[b] - F.vX[a]))) / 2 - (F.pPen ? F.pPen[p] : 0);
+                cumA[k + 1] = cumA[k] + ((dirs[k] === 1 ? F.pCross[p] : -F.pCross[p]) - (c.x * (F.vY[b] - F.vY[a]) - c.y * (F.vX[b] - F.vX[a]))) / 2 - (F.pPen ? F.pPen[p] : 0) -
+                    (climbWeight ? climbWeight * F.pClimb[p] : 0);
                 cumC[k + 1] = cumC[k] + (target ? fanCover(target, ax, ay, bx, by, 0) : 0);
+                cumK[k + 1] = cumK[k] + (F.pClimb ? F.pClimb[p] : 0);
             }
-            return { verts, edgeAt, n, cumL, cumA, cumC };
+            return { verts, edgeAt, n, cumL, cumA, cumC, cumK };
         };
         let L = unpack(loop);
         const total = () => L.cumL[L.n];
@@ -2233,7 +2341,7 @@ class SweepSearch {
             // The join to the start must stay on the loop (start mode).
             if (isStart && (b - a + n) % n > (L.verts.indexOf(loop.s) - a + n) % n) continue;
 
-            const restL = total() - winLen, restA = L.cumA[n] - sum(L.cumA, a, b), restC = L.cumC[n] - sum(L.cumC, a, b);
+            const restL = total() - winLen, restA = L.cumA[n] - sum(L.cumA, a, b), restC = L.cumC[n] - sum(L.cumC, a, b), restK = L.cumK[n] - sum(L.cumK, a, b);
             const sV = L.verts[a], eV = L.verts[b];
             const startAng = along.order[sV];
             const endAng = ((along.order[eV] - startAng) / along.period * 2 * Math.PI + 2 * Math.PI) % (2 * Math.PI);
@@ -2246,16 +2354,18 @@ class SweepSearch {
             const area = L.cumA[n], length = total();
             const lambda = (isStart ? 0.8 * length / (2 * Math.PI) : 2 * area / length) * (0.6 + 0.8 * w);
             const close = isStart
-                ? (pa, pc, pl) => scoreLoop({ length: pl + restL + 2 * stem, area: pa + restA, repeats: 0 }, objective)
-                : (pa, pc, pl) => scoreLoop({ length: pl + restL, area: pa + restA, coverage: (pc + restC) / this.targetArea, repeats: 0 }, objective);
+                ? (pa, pc, pl, pk) => scoreLoop({ length: pl + restL + 2 * stem, area: pa + restA, climb: pk === undefined ? undefined : pk + restK, repeats: 0 }, objective)
+                : (pa, pc, pl, pk) => scoreLoop({ length: pl + restL, area: pa + restA, climb: pk === undefined ? undefined : pk + restK, coverage: (pc + restC) / this.targetArea, repeats: 0 }, objective);
             const path = sweepLoop(g, sV, c.x, c.y, budget,
-                { K: 24, mu, lambda: lambda * (1 + mu), target, close, order: along.order, period: along.period, end: eV, endAng, theta0: 0, candidates: between(sV, eV) }, this.scratch);
+                { K: 24, mu, lambda: lambda * (1 + mu), target, close, climbWeight, order: along.order, period: along.period, end: eV, endAng, theta0: 0, candidates: between(sV, eV) }, this.scratch);
             this.evaluations++;
             if (!path) continue;
             const cand = this.candidate({
                 edges: [], dirs: [], length: path.length + restL, area: path.area + restA, covered: path.covered + restC
             }, loop.s, stem, c);
-            if (!isBetterResult(cand, loop) || cand.score <= loop.score * (1 + 1e-9)) continue;
+            // (A quick check first; not with climb weights, which this
+            // measure includes.)
+            if (!climbWeight && (!isBetterResult(cand, loop) || cand.score <= loop.score * (1 + 1e-9))) continue;
             // Splice: the path, then the loop from b on round to a.
             const ea = L.edgeAt[a], eb = L.edgeAt[b];
             const edges = path.edges.slice(), dirs = path.dirs.slice();
@@ -2263,10 +2373,17 @@ class SweepSearch {
                 edges.push(loop.edges[k]);
                 dirs.push(loop.dirs[k]);
             }
-            cand.edges = edges;
-            cand.dirs = dirs;
-            if (isStart) cand.s = loop.s;
-            loop = cand;
+            if (this.exact) {
+                // (Now measured exactly, climb included.)
+                const spliced = this.candidate({ edges, dirs, covered: path.covered + restC }, loop.s, stem, c);
+                if (!isBetterResult(spliced, loop) || (rankOf(spliced) === rankOf(loop) && spliced.score <= loop.score * (1 + 1e-9))) continue;
+                loop = spliced;
+            } else {
+                cand.edges = edges;
+                cand.dirs = dirs;
+                if (isStart) cand.s = loop.s;
+                loop = cand;
+            }
             L = unpack(loop);
         }
         if (loop === this.best) return;
@@ -2280,12 +2397,35 @@ class SweepSearch {
         if (isBetterResult(loop, this.best)) this.best = loop;
     }
 
+    // A loop as a result. With limits, a loop of edges is measured exactly
+    // (the area a sweep gives can include climb weights, and area limits
+    // need the enclosed area); otherwise, and for a loop without edges (a
+    // stretch's path in refine, not yet spliced), by what's given.
     candidate(loop, s, stem, center) {
-        const metrics = { length: loop.length + 2 * stem, area: loop.area, repeats: 0, stem };
+        const exact = this.exact && loop.edges.length ? this.exactMetrics(loop.edges, loop.dirs) : null;
+        const metrics = { length: (exact ? exact.length : loop.length) + 2 * stem, area: exact ? exact.area : loop.area, repeats: 0, stem };
+        if (exact) {
+            metrics.realArea = exact.realArea;
+            if (this.g.eClimb) metrics.climb = exact.climb;
+        }
         if (!this.isStart) metrics.coverage = loop.covered / this.targetArea;
         metrics.iq = 4 * Math.PI * metrics.area / metrics.length ** 2;
-        const { score, feasible } = scoreLoop(metrics, this.objective);
-        return { edges: loop.edges, dirs: loop.dirs, metrics, score, feasible, s, center };
+        const { score, feasible, rank } = scoreLoop(metrics, this.objective);
+        return { edges: loop.edges, dirs: loop.dirs, metrics, score, feasible, rank, s, center };
+    }
+
+    // Length, enclosed area, area less the area lost to extra costs, and
+    // climb of a loop of merged edges.
+    exactMetrics(edges, dirs) {
+        const { g } = this;
+        let length = 0, cross = 0, pen = 0, climb = 0;
+        edges.forEach((e, i) => {
+            length += g.eLen[e];
+            cross += dirs[i] * g.eCross[e];
+            if (g.ePen) pen += g.ePen[e];
+            if (g.eClimb) climb += g.eClimb[e];
+        });
+        return { length, realArea: cross / 2, area: cross / 2 - pen, climb };
     }
 
     // Length, area and coverage of a loop of merged edges (coverage from
@@ -2311,25 +2451,25 @@ class SweepSearch {
     polishLoop(loop, keep = false) {
         if (!this.polish) {
             const { isStart, objective, targetArea } = this;
-            const maxLength = objective.maxLengthM || Infinity, need = objective.coverage * targetArea;
-            const logScore = isStart
-                ? (area, length, covered, stem) => {
-                    if (!(area > 0)) return -Infinity;
-                    const over = (length + 2 * stem) / maxLength;
-                    return Math.log(area) - (over > 1 ? 10 * Math.log(over) : 0);
-                }
-                : (area, length, covered) => {
-                    if (!(area > 0) || !(covered > 0)) return -Infinity;
-                    const iq = 4 * Math.PI * area / (length * length);
-                    const short = covered / need;
-                    const reward = SOLVER.polishLinear ? SOLVER.polishLinear * Math.min(short, 1.01) : (short < 1 ? SOLVER.polishShortfall * Math.log(short) : 0);
-                    const over = length / maxLength;
-                    return Math.log(iq + SOLVER.areaTiebreak * Math.min(area / targetArea, 2)) + reward - (over > 1 ? 40 * Math.log(over) : 0);
-                };
-            const feasible = isStart
-                ? (area, length, covered, stem) => length + 2 * stem <= maxLength
-                : (area, length, covered) => covered >= need && length <= maxLength;
-            this.polish = new FacePolish(this.g, logScore, feasible);
+            const withClimb = Boolean(this.g.eClimb);
+            // (One object, reused: this runs for every block flip.)
+            const m = { length: 0, area: 0, realArea: 0, climb: undefined, coverage: undefined };
+            const measure = (area, length, covered, stem, climb, realArea) => {
+                m.length = length + 2 * stem;
+                m.area = area;
+                m.realArea = realArea;
+                if (withClimb) m.climb = climb;
+                if (!isStart) m.coverage = covered / targetArea;
+                return m;
+            };
+            const logScore = (area, length, covered, stem, climb, realArea) => {
+                if (!(area > 0) || (!isStart && !(covered > 0))) return -Infinity;
+                const base = isStart ? Math.log(area)
+                    : Math.log(4 * Math.PI * area / (length * length) + SOLVER.areaTiebreak * Math.min(area / targetArea, 2));
+                return base + limitMisses(measure(area, length, covered, stem, climb, realArea), objective, SOLVER.polishShortfall).log;
+            };
+            const rank = (area, length, covered, stem, climb, realArea) => limitMisses(measure(area, length, covered, stem, climb, realArea), objective).rank;
+            this.polish = new FacePolish(this.g, logScore, rank);
         }
         if (!this.polish.load(loop.edges, loop.dirs)) return null;
         const moves = Math.max(SOLVER.polishMoves / 4, Math.min(SOLVER.polishMoves, 200 * this.polish.bCount));
@@ -2351,7 +2491,8 @@ class SweepSearch {
             anchor: toLatLng({ x: g.x[b.s], y: g.y[b.s] }),
             metrics: b.metrics,
             score: b.score,
-            feasible: b.feasible
+            feasible: b.feasible,
+            rank: b.rank
         };
     }
 }
@@ -2689,7 +2830,7 @@ class SearchTracker {
             this.stale++;
             return false;
         }
-        const significant = !best || (result.feasible && !best.feasible) ||
+        const significant = !best || rankOf(result) < rankOf(best) ||
             result.score > best.score + SOLVER.minGain * Math.abs(best.score);
         if (significant) {
             this.stale = 0;
@@ -2718,7 +2859,9 @@ const noLoopMessage = (params) => params.mode === "start"
     ? "Couldn't form a loop here. Try a larger distance or a different start point."
     : "Couldn't form a loop here. Try a larger area.";
 
-const isBetterResult = (a, b) => !b || (a.feasible && !b.feasible) || (a.feasible === b.feasible && a.score > b.score);
+// Lower rank (limits missed, see limitMisses) first, then higher score.
+const rankOf = (r) => r.rank ?? (r.feasible ? 0 : 1);
+const isBetterResult = (a, b) => !b || rankOf(a) < rankOf(b) || (rankOf(a) === rankOf(b) && a.score > b.score);
 
 // --------------------------------------------------------------------------
 // Results (main thread)
@@ -2792,8 +2935,11 @@ function expandLoop(prep, res, params, exact) {
 
     // The real length and area (the search's include extra costs, see
     // SOLVER.climbCost).
-    let lengthM = 0, cross = 0;
-    for (const [e] of ordered) lengthM += prep.source[e].distance;
+    let lengthM = 0, cross = 0, climbM = 0;
+    for (const [e] of ordered) {
+        lengthM += prep.source[e].distance;
+        climbM += prep.source[e].climb || 0;
+    }
     let prev = prep.project(coords[0][0], coords[0][1]);
     for (let i = 1; i < coords.length; i++) {
         const p = prep.project(coords[i][0], coords[i][1]);
@@ -2818,6 +2964,8 @@ function expandLoop(prep, res, params, exact) {
         flags: kept,                  // [{ kind: "hop" | "rail" | "motorway" | "private", coords }]
         score: res.score,
         feasible: res.feasible,
+        rank: res.rank,
+        climbM,                       // climb, as the search estimated it (0 if not read)
         center: res.center,
         anchor: res.anchor
     };

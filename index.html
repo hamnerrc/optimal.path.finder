@@ -16,26 +16,26 @@
     <!-- Scripts and styles carry the release number (?v=), so a browser never
          mixes files from two releases out of its cache: bump it with every
          change. -->
-    <link rel="stylesheet" href="css/style.css?v=11">
+    <link rel="stylesheet" href="css/style.css?v=12">
 
     <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-    <script defer src="js/config.js?v=11"></script>
-    <script defer src="js/geometry.js?v=11"></script>
-    <script defer src="js/units.js?v=11"></script>
-    <script defer src="js/storage.js?v=11"></script>
-    <script defer src="js/overpass.js?v=11"></script>
-    <script defer src="js/vectortiles.js?v=11"></script>
-    <script defer src="js/roadtiles.js?v=11"></script>
-    <script defer src="js/network.js?v=11"></script>
-    <script defer src="js/solver.js?v=11"></script>
-    <script defer src="js/solve.js?v=11"></script>
-    <script defer src="js/pipeline.js?v=11"></script>
-    <script defer src="js/loop.js?v=11"></script>
-    <script defer src="js/elevation.js?v=11"></script>
-    <script defer src="js/export.js?v=11"></script>
-    <script defer src="js/map.js?v=11"></script>
-    <script defer src="js/app.js?v=11"></script>
+    <script defer src="js/config.js?v=12"></script>
+    <script defer src="js/geometry.js?v=12"></script>
+    <script defer src="js/units.js?v=12"></script>
+    <script defer src="js/storage.js?v=12"></script>
+    <script defer src="js/overpass.js?v=12"></script>
+    <script defer src="js/vectortiles.js?v=12"></script>
+    <script defer src="js/roadtiles.js?v=12"></script>
+    <script defer src="js/network.js?v=12"></script>
+    <script defer src="js/solver.js?v=12"></script>
+    <script defer src="js/solve.js?v=12"></script>
+    <script defer src="js/pipeline.js?v=12"></script>
+    <script defer src="js/loop.js?v=12"></script>
+    <script defer src="js/elevation.js?v=12"></script>
+    <script defer src="js/export.js?v=12"></script>
+    <script defer src="js/map.js?v=12"></script>
+    <script defer src="js/app.js?v=12"></script>
 </head>
 
 <body>
@@ -73,22 +73,21 @@
 
         <!-- Mode 1: start points, each with a maximum loop length -->
         <section id="distanceSection" class="section">
-            <p class="hint">Finds the loop through each start point that encloses the most area without going over its length.
-                Loops start and finish at the road junction nearest your pin. If a bigger loop is a short way off, the run goes out to it and back the same way.
-                The search keeps going until it stops finding better loops; press Stop at any time to keep the best so far.</p>
-            <label class="field">
-                <span class="field-label">Max loop length for new points</span>
-                <span class="input-unit">
-                    <input id="distanceInput" type="number" min="0.5" step="0.5" inputmode="decimal">
-                    <span class="unit-distance">mi</span>
-                </span>
-            </label>
-
-            <button id="pickButton" type="button" class="btn btn-secondary">
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
-                <span>Add start point</span>
-            </button>
-            <p id="pickHint" class="hint">Click the button, then click the map. Drag pins to move them. Each start point gets its own loop.</p>
+            <p class="hint">The biggest-area loop from each start point, up to its length.</p>
+            <div class="inline-row">
+                <label class="field field-grow">
+                    <span class="field-label">Length for new points</span>
+                    <span class="input-unit">
+                        <input id="distanceInput" type="number" min="0.5" step="0.5" inputmode="decimal">
+                        <span class="unit-distance">mi</span>
+                    </span>
+                </label>
+                <button id="pickButton" type="button" class="btn btn-secondary">
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" /></svg>
+                    <span>Add start point</span>
+                </button>
+            </div>
+            <p id="pickHint" class="hint">Then click the map. Drag pins to move them.</p>
 
             <ol id="startList" class="start-list"></ol>
         </section>
@@ -96,7 +95,7 @@
         <!-- Mode 2: bounding shape -->
         <section id="shapeSection" class="section" hidden>
             <div id="shapeChoose">
-                <p class="hint">Draw an area. The loop will be the roundest one that encloses enough of it.</p>
+                <p class="hint">The roundest loop that surrounds enough of a shape you draw.</p>
                 <div class="shape-choices">
                     <button id="chooseCircleButton" type="button" class="shape-choice">
                         <svg viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="16" /><circle class="dot" cx="8" cy="24" r="3" /><circle class="dot" cx="40" cy="24" r="3" /></svg>
@@ -155,7 +154,7 @@
 
         <!-- Mode 3: a real place's boundary (city, county, state, lake, park…) -->
         <section id="placeSection" class="section" hidden>
-            <p class="hint">Capture a real place: search for a city, county, state, lake or park and use its boundary as the area.</p>
+            <p class="hint">The roundest loop that surrounds enough of a city, county, state, lake or park.</p>
             <form id="placeForm" class="search" autocomplete="off">
                 <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7-6.2-7-11.5A7 7 0 0 1 19 9.5C19 14.8 12 21 12 21z" /><circle cx="12" cy="9.5" r="2.5" /></svg>
                 <input id="placeInput" type="search" placeholder="e.g. Lawrence, Kansas" aria-label="Search for a place boundary">
@@ -171,11 +170,9 @@
             </div>
         </section>
 
-        <!-- Coverage target and length limit, shared by Area and Place -->
+        <!-- Coverage target, shared by Area and Place -->
         <section id="coverageSection" class="section coverage" hidden>
-            <label class="field" for="coverageInput">
-                <span class="field-label">How much of the area must the loop surround?</span>
-            </label>
+            <label class="field-label" for="coverageInput">Surround at least</label>
             <div class="coverage-row">
                 <span class="input-unit">
                     <input id="coverageInput" type="number" min="0" step="any" inputmode="decimal" aria-describedby="coverageEquivalent">
@@ -187,26 +184,36 @@
                 </select>
             </div>
             <p id="coverageEquivalent" class="hint coverage-equivalent"></p>
-            <label class="field">
-                <span class="field-label">Max loop length <span class="optional">(optional)</span></span>
-                <span class="input-unit">
-                    <input id="areaMaxLengthInput" type="number" min="0" step="any" inputmode="decimal" placeholder="No limit">
-                    <span class="unit-distance">mi</span>
-                </span>
-            </label>
-            <p class="hint">The app finds the roundest loop that surrounds at least this much of the area. 100% means the loop goes around all of it. A length limit always wins: if the target can't be reached within it, you get the loop that surrounds the most it can. Roads up to 20% beyond the area are used, or further if that isn't enough to reach the target.</p>
         </section>
+
+        <!-- Optional limits on the loop (every mode) -->
+        <details id="limitsSection" class="collapsible">
+            <summary>Limits <span id="limitsCount" class="count" hidden></span></summary>
+            <div class="limits-grid" role="group" aria-label="Limits on the loop">
+                <span></span><span class="limits-head">Min</span><span class="limits-head">Max</span>
+                <span class="limits-label">Distance <span class="unit-distance">mi</span></span>
+                <input data-limit="minLengthM" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Shortest distance">
+                <input data-limit="maxLengthM" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Longest distance">
+                <span class="limits-label">Area <span class="unit-area">sq mi</span></span>
+                <input data-limit="minAreaM2" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Smallest area">
+                <input data-limit="maxAreaM2" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Largest area">
+                <span class="limits-label">Climb <span class="unit-elevation">ft</span></span>
+                <input data-limit="minClimbM" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Least climb">
+                <input data-limit="maxClimbM" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Most climb">
+            </div>
+            <p id="limitsNote" class="hint"></p>
+        </details>
 
         <!-- Which roads loops may use (every mode) -->
         <details id="roadOptions" class="collapsible road-options">
-            <summary>Roads to use <span id="roadOptionsCount" class="count" hidden></span></summary>
+            <summary>Roads &amp; hills <span id="roadOptionsCount" class="count" hidden></span></summary>
             <label class="checkbox">
                 <input id="noMotorwaysInput" type="checkbox">
-                <span>Avoid motorways, expressways and their ramps</span>
+                <span>Avoid motorways and expressways</span>
             </label>
             <label class="checkbox">
                 <input id="hopsInput" type="checkbox">
-                <span>Allow fence hops: gaps under 10 m between roads that don't connect</span>
+                <span>Allow fence hops <span class="muted">(gaps under 10 m between roads)</span></span>
             </label>
             <label class="checkbox">
                 <input id="railwaysInput" type="checkbox">
@@ -214,7 +221,7 @@
             </label>
             <label class="checkbox">
                 <input id="preferSmallInput" type="checkbox">
-                <span>Prefer smaller roads: take a road beside a highway or railroad when it's about as good</span>
+                <span>Prefer smaller roads <span class="muted">(over a highway or track beside them)</span></span>
             </label>
             <div class="climb-field">
                 <label class="field-label" for="climbCostInput">Hills</label>
@@ -222,7 +229,7 @@
                 <div class="range-ends" aria-hidden="true"><span>No cost</span><span>Avoid hills avidly</span></div>
                 <p id="climbCostOutput" class="hint"></p>
             </div>
-            <p class="hint">Paths, trails, sidewalks and rail trails are always used. Fence hops never cross a road, railroad, river or shore, and never start or end on a driveway, bridge or tunnel. A loop that uses fence hops, railroad tracks, motorways or roads marked private says so and marks them in orange: check them before you run.</p>
+            <p class="hint">Stretches to check (fence hops, tracks, motorways, private roads) are marked in orange.</p>
         </details>
         <!-- Found loops -->
         <section id="routesSection" class="section" hidden>
@@ -307,6 +314,17 @@
                 <span>Show roads on the map</span>
             </label>
             <p id="networkNote" class="hint" hidden>Too many roads to draw them all: only major roads are shown, or none.</p>
+        </details>
+
+        <!-- The longer explanations, out of the way -->
+        <details id="aboutSection" class="collapsible about">
+            <summary>How it works</summary>
+            <p class="hint"><strong>Start point:</strong> each start point gets the loop that encloses the most area within its length. Loops start and finish at the road junction nearest the pin; if a bigger loop is a short way off, the run goes out to it and back the same way (that stretch counts twice).</p>
+            <p class="hint"><strong>Area and Place:</strong> the roundest loop (4π × area ÷ length², 1 for a circle) that surrounds at least the share of the area you ask for; of two equally round loops, the bigger. Roads up to 20% beyond the area are used, or further if that isn't enough.</p>
+            <p class="hint"><strong>Limits</strong> are optional (blank: none). If they can't all be met, the longest distance comes first, then the most climb, then the shortest distance and the area limits, then the share of the area, then the least climb; the loop says which it misses. Climb limits use an estimate from terrain data; the elevation profile is more exact.</p>
+            <p class="hint"><strong>Hills:</strong> each meter of climb counts as that many meters of extra length while searching, so a flatter loop wins when it's about as good.</p>
+            <p class="hint"><strong>Roads:</strong> paths, trails, sidewalks and rail trails are always used. Fence hops never cross a road, railroad, river or shore, and never start or end on a driveway, bridge or tunnel. Check the orange stretches before you run.</p>
+            <p class="hint">The search keeps going until it stops finding better loops; press Stop at any time to keep the best so far. Big areas are searched in stages, first on major roads.</p>
         </details>
 
         <footer class="panel-footer">

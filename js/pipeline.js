@@ -24,12 +24,14 @@
 // ==========================================================================
 
 // job:
-//   objective  { mode: "start", start: {lat,lng}, maxLengthM }
-//            | { mode: "area", target: [{lat,lng}], coverage }
+//   objective  { mode: "start", start: {lat,lng}, maxLengthM, …limits }
+//            | { mode: "area", target: [{lat,lng}], coverage, maxLengthM?, …limits }
+//              limits (all optional): minLengthM, minAreaM2, maxAreaM2,
+//              minClimbM, maxClimbM (see limitMisses in js/solver.js)
 //   region     full-detail road region
 //   target     area mode: the area's region (for wider margins)
-//   roads      road options: { noMotorways, hops, railways, preferSmall, preferFlat } (see
-//              roadTypesFor and solverParams)
+//   roads      road options: { noMotorways, hops, railways, preferSmall, preferFlat,
+//              climbCost } (see roadTypesFor and solverParams)
 // options: { signal, onStatus(text, fraction), onLoop(loop, final), onNetwork(network) }
 // Resolves with the final loop: { coords, lengthM, areaM2, iq, coverage, feasible, score, chunked }.
 async function searchLoop(job, options) {
@@ -82,7 +84,7 @@ async function searchFullDetail(job, { signal, onStatus, onLoop, onNetwork }, ma
     const network = buildRoadNetwork(osm, job.region);
     if (network.edges.length === 0) throw new Error("No roads found here.");
     onNetwork(network);
-    await loadClimb(network, job.roads, signal, onStatus, 0);
+    await loadClimb(network, job, signal, onStatus, 0);
 
     onStatus("Searching…", 0);
     await nextFrame();
@@ -118,9 +120,11 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
     osm = null;   // (no longer needed: memory is tight on big searches)
     if (coarse.edges.length === 0) throw new Error("No major roads found here.");
     onNetwork(coarse);
+    // (The climb too, from coarse terrain tiles here: only an estimate, but
+    // enough that the rough loop doesn't settle in the hills, where the
+    // stages after it couldn't get it out.)
     const huge = expected > settings.hugeLoopM;
-    const roads = huge ? { ...job.roads, preferFlat: false } : job.roads;
-    await loadClimb(coarse, roads, signal, onStatus, 0);
+    await loadClimb(coarse, job, signal, onStatus, 0);
 
     // While the search runs, the tiles along its best loop so far start
     // downloading (the browser has little else to do meanwhile).
@@ -154,7 +158,7 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
                 onStatus(`Loading ${kind} along ${what} (${done} of ${total} tiles)…`, share(0)), Infinity, zoom), corridor);
             if (local.edges.length === 0) break;
             onNetwork(local);
-            await loadClimb(local, roads, signal, onStatus, share(0));
+            await loadClimb(local, job, signal, onStatus, share(0));
             await nextFrame();
             const reference = simplifyLine(loopPart(best), points);
             fine = { ...await runSolver(local, { ...solverParams(job), center: best.center, anchor: best.anchor, reference }, {
@@ -180,7 +184,7 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
         // helped is the last.
         const gain = pass === 1 ? Infinity : (fine.score - best.score) / Math.abs(best.score);
         console.log(`[Search] Pass ${pass}: score ${fine.score.toFixed(4)} (was ${best.score.toFixed(4)})`);
-        const close = pass === 1 && fine.feasible >= best.feasible && fine.score > 0.9 * best.score;
+        const close = pass === 1 && rankOf(fine) <= rankOf(best) && fine.score > 0.9 * best.score;
         if (close || isBetterResult(fine, best)) best = fine;
         else if (pass === 1) break;
         if (gain < settings.passMinGain) break;
@@ -350,18 +354,20 @@ function loopPart(loop) {
     return kept.length >= 3 ? kept : points.slice(0, -1);
 }
 
-// Solver params for a job.
+// Solver params for a job (with its limits, see limitMisses).
 function solverParams({ objective, roads }) {
     const prefer = { preferSmall: Boolean(roads?.preferSmall), preferFlat: Boolean(roads?.preferFlat), climbCost: roads?.climbCost };
+    const { maxLengthM, minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM } = objective;
+    const limits = { maxLengthM, minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM };
     return objective.mode === "start"
-        ? { mode: "start", start: objective.start, maxLengthM: objective.maxLengthM, ...prefer }
-        : { mode: "area", target: objective.target, coverage: objective.coverage, maxLengthM: objective.maxLengthM, ...prefer };
+        ? { mode: "start", start: objective.start, ...limits, ...prefer }
+        : { mode: "area", target: objective.target, coverage: objective.coverage, ...limits, ...prefer };
 }
 
-// The climb along every road (for "prefer flatter loops"), from terrain
-// tiles. Without them, the search goes on without it.
-async function loadClimb(network, roads, signal, onStatus, fraction) {
-    if (!roads?.preferFlat) return;
+// The climb along every road (for the Hills slider and climb limits), from
+// terrain tiles. Without them, the search goes on without it.
+async function loadClimb(network, job, signal, onStatus, fraction) {
+    if (!job.roads?.preferFlat && !hasClimbLimits(job.objective)) return;
     onStatus("Reading the climb along the roads…", fraction);
     const t0 = Date.now();
     await addRoadClimb(network, signal);
