@@ -182,6 +182,41 @@ function localProjection(refLat, refLng = 0) {
     };
 }
 
+// Lambert azimuthal equal-area projection around (refLat, refLng), in
+// meters: areas are exact, and distances within about 1.5% up to 2,000 km
+// from the middle. For areas of a state or more, where a flat projection
+// would get areas wrong by several percent.
+function equalAreaProjection(refLat, refLng) {
+    const R = EARTH_RADIUS_M, f0 = refLat * DEG, l0 = refLng * DEG;
+    const sin0 = Math.sin(f0), cos0 = Math.cos(f0);
+    return {
+        equalArea: true,
+        toXY: (p) => {
+            const f = p.lat * DEG, dl = p.lng * DEG - l0;
+            const sinF = Math.sin(f), cosF = Math.cos(f), cosL = Math.cos(dl);
+            const k = Math.sqrt(2 / (1 + sin0 * sinF + cos0 * cosF * cosL));
+            return { x: R * k * cosF * Math.sin(dl), y: R * k * (cos0 * sinF - sin0 * cosF * cosL) };
+        },
+        toLatLng: (x, y) => {
+            const rho = Math.hypot(x, y);
+            if (rho === 0) return { lat: refLat, lng: refLng };
+            const c = 2 * Math.asin(Math.min(1, rho / (2 * R))), sinC = Math.sin(c), cosC = Math.cos(c);
+            return {
+                lat: Math.asin(cosC * sin0 + y * sinC * cos0 / rho) / DEG,
+                lng: (l0 + Math.atan2(x * sinC, rho * cos0 * cosC - y * sin0 * sinC)) / DEG
+            };
+        }
+    };
+}
+
+// The projection for things within a bbox: flat if it's small (as before),
+// equal-area if it spans more than about 2° (200 km).
+function projectionFor(bbox) {
+    const lat0 = (bbox.minLat + bbox.maxLat) / 2, lng0 = (bbox.minLng + bbox.maxLng) / 2;
+    const big = bbox.maxLat - bbox.minLat > 2 || (bbox.maxLng - bbox.minLng) * Math.cos(lat0 * DEG) > 2;
+    return big ? equalAreaProjection(lat0, lng0) : localProjection(lat0, lng0);
+}
+
 function boundsOf(points) {
     return points.reduce((box, p) => ({
         minLat: Math.min(box.minLat, p.lat), maxLat: Math.max(box.maxLat, p.lat),
@@ -199,7 +234,7 @@ const OVERPASS_POLY_MAX_POINTS = 200;
 
 function createPolygonRegion(points, type = "polygon") {
     const bbox = boundsOf(points);
-    const { toXY } = localProjection((bbox.minLat + bbox.maxLat) / 2, (bbox.minLng + bbox.maxLng) / 2);
+    const { toXY } = projectionFor(bbox);
     const xy = points.map(toXY);
     let twiceArea = 0;
     for (let i = 0; i < xy.length; i++) {
@@ -253,7 +288,7 @@ function createRectangleRegion([a, b, c]) {
 // roads along a rough loop when refining a very long one.
 function createCorridorRegion(points, radiusMeters) {
     const bbox0 = boundsOf(points);
-    const { toXY } = localProjection((bbox0.minLat + bbox0.maxLat) / 2, (bbox0.minLng + bbox0.maxLng) / 2);
+    const { toXY } = projectionFor(bbox0);
     const xy = points.map(toXY);
     const dLat = radiusMeters / (EARTH_RADIUS_M * DEG);
     const dLng = dLat / Math.max(Math.cos(((bbox0.minLat + bbox0.maxLat) / 2) * DEG), 1e-6);
@@ -428,7 +463,7 @@ function polygonCentroidXY(points) {
 
 if (typeof module !== "undefined") {
     module.exports = {
-        haversine, metersToMiles, milesToMeters, sqKmToSqMiles, localProjection, boundsOf,
+        haversine, metersToMiles, milesToMeters, sqKmToSqMiles, localProjection, equalAreaProjection, projectionFor, boundsOf,
         createCircleRegion, createCircleFromDiameter, createEllipseRegion, createRectangleRegion,
         createPolygonRegion, createCorridorRegion, simplifyLine, simplifyRing,
         createShapeRegion, marginRegion, polygonCentroidXY, convexHull

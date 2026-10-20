@@ -4,6 +4,44 @@ Live site: https://hamnerrc.github.io/optimal.path.finder/ (updates on push)
 =============================================================================
 
 -----------------------------------------------------------------------------
+ROUND 12 (2026-10-20): ONE AREA CONTROL, NARROW AREA RANGES AT COUNTRY SCALE
+-----------------------------------------------------------------------------
+"Surround at least" and the Limits area row are now one control in Area and
+Place: "How much of it the loop surrounds: at least [ ] at most [ ] [unit]",
+in % of the area, sq mi or sq km (switching the unit converts both). The
+Limits area row is only shown in Start point mode, where it means the area
+inside the loop. The "Covers" figure shows the area too when you asked in
+sq mi or sq km.
+
+Your test, USA with 333,400 to 334,000 sq mi and hills at 1:
+  before   337,800 sq mi (outside the range), roundness 0.578
+  now      333,920 sq mi (inside), roundness 0.722, about 80 s in Chrome
+           on this laptop (39 s in the node test harness)
+What was wrong, and fixed:
+- Areas across a whole country were measured in a flat projection: the
+  contiguous US came out 3% too big, and loops across it were off too
+  (the app said a loop enclosed 323,000 sq mi but covered 336,500). Big
+  areas now use an equal-area projection.
+- The coverage of a candidate loop was estimated in 2,048 angular slices:
+  fine for "at least 90%", far too rough for a range 0.2% wide. Now it's
+  measured exactly.
+- The search's length steps and size weight were set for the size of the
+  whole country, so it couldn't aim at a loop a tenth of that size.
+- Two flaws in the block map (several roads crossing at one point, at
+  interchanges) and loops crossing themselves at overpasses meant big
+  loops could never be polished block by block. Both fixed; this also
+  helps every big search (plain USA at 10%: roundness 0.718, 56 s).
+- Missing a limit by less now always beats missing it by more, whatever
+  the roundness (limits come first, as agreed).
+
+Also: Kansas at 63% 0.749 -> 0.760; every smaller search in the test set
+gives the same loop as before.
+
+Known limit: a range this narrow on a loop this big takes longer than a
+plain search (about 80 s vs 56 s): the loop has to be moved by about a
+kilometer all the way round.
+
+-----------------------------------------------------------------------------
 ROUND 11 (2026-10-19): LIMITS, CLIMB IN COARSE STAGES, TIDIER PANEL
 -----------------------------------------------------------------------------
 Also fixed in between (round 10b): the iPad error "edge.coords" came from

@@ -48,11 +48,27 @@ const SOLVER = {
     maxStates: 3e6,
     // Angular bins used to measure coverage around a centre (area mode).
     coverageBins: 2048,
-    coverageRows: 600,        // scanlines used by createCoverageMeter
+    // Scanlines used to measure coverage (createCoverageMeter,
+    // faceCoverage): at least coverageRows, and for a big area one every
+    // coverageRowM up to coverageMaxRows (a country: rows ~500 m apart, so
+    // a narrow area target can be told apart).
+    coverageRows: 600,
+    coverageRowM: 200,
+    coverageMaxRows: 6000,
     // Area mode: weights of covered area over any area tried by the sweep.
     // 0 just maximizes area for each length; higher values make the loop
     // follow the target more closely.
     coverageWeights: [0, 0.6, 1.5, 3, 6],
+    // Area mode with an upper bound on coverage: loops are assumed at least
+    // this round when setting the sweep's length budget.
+    leastRoundness: 0.3,
+    // How hard a rough loop is pulled toward the middle of a narrow
+    // coverage range (see roughParams): 1% off costs this many % of score.
+    aimSteepness: 3,
+    // The block polish of a loop that misses a limit: how much getting
+    // closer to it outweighs roundness (log units per log of the ratio),
+    // so that limits come first (see limitMisses).
+    offWeight: 0,
     // Area mode: weight of the "bigger is better" tiebreak between loops of
     // equal roundness. Small, so it only decides near-ties.
     areaTiebreak: 0.005,
@@ -86,6 +102,7 @@ const SOLVER = {
     // The rough loop of a staged search only sets the shape, so its search
     // settles sooner too.
     roughSweeps: 20,
+    roughMaxRounds: 40,
     // ...and the shortest stretch rerouted is at least 1/refineWindows of
     // the loop (see refine).
     refineWindows: 400,
@@ -124,7 +141,8 @@ const SOLVER = {
 //   adjOff, adjEdge             adjacency lists
 //   nStem                       start mode: distance from the start to each
 //                               junction along the roads
-//   lat0, lng0, kx, ky          the projection
+//   lat0, lng0, kx, ky          the projection (or equalArea: Lambert
+//                               equal-area around lat0, lng0)
 //   startX, startY              start mode: the start node
 //   faces                       the planar map and its faces (buildFaces)
 //   ePen                        start mode, or area mode with a length
@@ -151,19 +169,24 @@ function prepareGraph(network, params) {
         if (n.lng < minLng) minLng = n.lng;
         if (n.lng > maxLng) maxLng = n.lng;
     }
+    // (Equal-area for a network more than about 200 km across, see
+    // projectionFor: areas there would otherwise be off by percents.)
     const lat0 = (minLat + maxLat) / 2;
     const lng0 = (minLng + maxLng) / 2;
     const ky = DEG * EARTH_RADIUS_M;
     const kx = ky * Math.cos(lat0 * DEG);
-    const project = (lat, lng) => ({ x: (lng - lng0) * kx, y: (lat - lat0) * ky });
-    const unproject = (x, y) => ({ lat: y / ky + lat0, lng: x / kx + lng0 });
+    const projection = projectionFor({ minLat, maxLat, minLng, maxLng });
+    const equalArea = Boolean(projection.equalArea);
+    const project = equalArea ? (lat, lng) => projection.toXY({ lat, lng }) : (lat, lng) => ({ x: (lng - lng0) * kx, y: (lat - lat0) * ky });
+    const unproject = equalArea ? projection.toLatLng : (x, y) => ({ lat: y / ky + lat0, lng: x / kx + lng0 });
 
     const ox = new Float64Array(N);
     const oy = new Float64Array(N);
     ids.forEach((id, i) => {
         const n = network.nodes.get(id);
-        ox[i] = (n.lng - lng0) * kx;
-        oy[i] = (n.lat - lat0) * ky;
+        const p = project(n.lat, n.lng);
+        ox[i] = p.x;
+        oy[i] = p.y;
     });
 
     // Original edges (self-loops are dropped: they can't be part of a ring).
@@ -187,8 +210,8 @@ function prepareGraph(network, params) {
         const c = edge.pts;
         for (let i = 2; i < c.length; i += 2) {
             const aLat = c[i - 2], aLng = c[i - 1], bLat = c[i], bLng = c[i + 1];
-            const ax = (aLng - lng0) * kx, ay = (aLat - lat0) * ky;
-            const bx = (bLng - lng0) * kx, by = (bLat - lat0) * ky;
+            const { x: ax, y: ay } = project(aLat, aLng);
+            const { x: bx, y: by } = project(bLat, bLng);
             cross += ax * by - bx * ay;
         }
         oCross[e] = cross;
@@ -333,7 +356,8 @@ function prepareGraph(network, params) {
             const forward = oFrom[oe] === at;
             for (let k = pts.length ? 1 : 0; k < n; k++) {
                 const j = 2 * (forward ? k : n - 1 - k);
-                pts.push((c[j + 1] - lng0) * kx, (c[j] - lat0) * ky);
+                const p = project(c[j], c[j + 1]);
+                pts.push(p.x, p.y);
             }
             at = other(oe, at);
         }
@@ -356,7 +380,7 @@ function prepareGraph(network, params) {
         N: M, E, x, y, eFrom, eTo, eLen, eCross,
         adjOff: adjacency.adjOff, adjEdge: adjacency.adjEdge,
         nStem: null, ePen: null, eClimb: null,
-        lat0, lng0, kx, ky,
+        lat0, lng0, kx, ky, equalArea,
         faces: buildFaces(M, eFrom, eTo, eLen, lines, targetXY)
     };
     // A piece's share of a value for its merged edge (by length).
@@ -404,8 +428,8 @@ function prepareGraph(network, params) {
 }
 
 // Length of the loop a search expects: the length limit (start mode), or
-// the perimeter of a circle as big as the target area, or the limit if
-// shorter (area mode).
+// the perimeter of a circle as big as the share of the target area it must
+// cover, or the limit if shorter (area mode).
 function expectedLength(params, targetXY) {
     if (params.mode === "start") return params.maxLengthM;
     let cross = 0;
@@ -413,7 +437,7 @@ function expectedLength(params, targetXY) {
         const q = targetXY[(i + 1) % targetXY.length];
         cross += p.x * q.y - q.x * p.y;
     });
-    return Math.min(2 * Math.PI * Math.sqrt(Math.abs(cross) / 2 / Math.PI), params.maxLengthM || Infinity);
+    return Math.min(2 * Math.PI * Math.sqrt(params.coverage * Math.abs(cross) / 2 / Math.PI), params.maxLengthM || Infinity);
 }
 
 function buildAdjacency(N, eFrom, eTo) {
@@ -729,6 +753,18 @@ function findCrossings(N, eFrom, eTo, lines) {
     const vx = [], vy = [];
     const tangled = new Set();
     const seenCut = new Set();
+    // Where three or more roads cross at one point (common at interchanges
+    // in simplified tiles), they share one virtual vertex: two at the same
+    // spot would leave a piece of no length between them, which breaks the
+    // faces around it (and so the block polish of any loop through there).
+    const atPoint = new Map();     // rounded position -> virtual vertex
+    const cutAt = new Set();       // "edge,vertex" already cut
+    const addCut = (e, pos, v) => {
+        const key = `${e},${v}`;
+        if (cutAt.has(key)) return;
+        cutAt.add(key);
+        cuts[e].push(pos, v);
+    };
     const cell = [];
     for (let k = 0; k < np;) {
         const key = Math.floor(pairs[k] / S);
@@ -775,11 +811,16 @@ function findCrossings(N, eFrom, eTo, lines) {
                     else cuts[eb].push(posB, endA);
                     continue;
                 }
-                const v = N + vx.length;
-                vx.push(px);
-                vy.push(py);
-                cuts[ea].push(posA, v);
-                cuts[eb].push(posB, v);
+                const spot = `${Math.round(px * 4)},${Math.round(py * 4)}`;
+                let v = atPoint.get(spot);
+                if (v === undefined) {
+                    v = N + vx.length;
+                    vx.push(px);
+                    vy.push(py);
+                    atPoint.set(spot, v);
+                }
+                addCut(ea, posA, v);
+                addCut(eb, posB, v);
             }
         }
     }
@@ -875,13 +916,13 @@ function biconnectedParts(V, P, eFrom, eTo, vOff, vEdge) {
 // Target area inside each face, by scanlines shared by all faces (so that
 // the faces inside a loop add up to the scanline measure of the loop).
 function faceCoverage(faces, pLine, target) {
-    const { F, faceOff, faceHalf, faceOk } = faces;
+    const { F, faceOff, faceHalf } = faces;
     let minY = Infinity, maxY = -Infinity;
     for (const p of target) {
         minY = Math.min(minY, p.y);
         maxY = Math.max(maxY, p.y);
     }
-    const rows = 600;
+    const rows = coverageRowCount(minY, maxY);
     const dy = (maxY - minY) / rows;
     const rowY = (r) => minY + (r + 0.5) * dy;
     const crossings = (xs, ys, visit) => {
@@ -898,10 +939,13 @@ function faceCoverage(faces, pLine, target) {
     crossings(target.map(p => p.x), target.map(p => p.y), (r, x) => targetRows[r].push(x));
     for (const row of targetRows) row.sort((a, b) => a - b);
 
+    // (Every block, even one whose outline isn't a simple ring, e.g. with a
+    // dead-end road inside: the scanlines' crossings along such a road
+    // cancel out. Only the outside, and slivers, have no area to cover.)
     const cover = new Float64Array(F);
     const byRow = new Map();
     for (let f = 0; f < F; f++) {
-        if (!faceOk[f]) continue;
+        if (!(faces.faceArea[f] > 0)) continue;
         const xs = [], ys = [];
         for (let k = faceOff[f]; k < faceOff[f + 1]; k++) {
             const h = faceHalf[k], pts = pLine[h >> 1], n = pts.length / 2;
@@ -1077,13 +1121,16 @@ function junctionFinder(g) {
 // simple polygon (convex or not) and the loop any closed outline.
 // --------------------------------------------------------------------------
 
+const coverageRowCount = (minY, maxY) =>
+    Math.round(Math.min(SOLVER.coverageMaxRows, Math.max(SOLVER.coverageRows, (maxY - minY) / SOLVER.coverageRowM)));
+
 function createCoverageMeter(target) {
-    const rows = SOLVER.coverageRows;
     let minY = Infinity, maxY = -Infinity;
     for (const p of target) {
         minY = Math.min(minY, p.y);
         maxY = Math.max(maxY, p.y);
     }
+    const rows = coverageRowCount(minY, maxY);
     const dy = (maxY - minY) / rows;
 
     // The target's inside intervals on each scanline: [x0, x1, x2, x3, …].
@@ -1204,6 +1251,7 @@ function polarTarget(target, cx, cy, theta0, bins) {
 //   mode        "start" | "area"
 //   maxLengthM  the loop may not be longer (start; area: optional)
 //   coverage    (area)   0..1 share of the target the loop must enclose
+//   maxCoverage (area)   optional: and at most this share
 //   targetArea  (area)   m², for the tiebreak
 //   minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM   optional limits
 // metrics: { length, area, repeats, coverage?, realArea?, climb? }
@@ -1215,21 +1263,22 @@ function polarTarget(target, cx, cy, theta0, bins) {
 // a small bonus for enclosing more area, so that of two equally round loops
 // the bigger one wins. Unmet requirements shrink the score steeply instead of
 // ruling the loop out, so the best loop so far can be shown even if none
-// meets them. Returns { score, feasible, rank }: rank is 0 if every limit is
-// met, otherwise the priority of the most important one missed (see
-// limitMisses); a lower rank always wins over a better score.
+// meets them. Returns { score, feasible, rank, off }: rank is 0 if every
+// limit is met, otherwise the priority of the most important one missed
+// (see limitMisses), and off how far off it is; a lower rank, then (at the
+// same rank) being less far off, always wins over a better score.
 function scoreLoop(metrics, objective) {
     const repeatFactor = 0.8 ** metrics.repeats;
-    const { rank, factor: limitFactor } = limitMisses(metrics, objective);
+    const { rank, factor: limitFactor, off } = limitMisses(metrics, objective);
     const factor = limitFactor * repeatFactor;
     const feasible = rank === 0 && metrics.repeats === 0;
-    if (objective.mode === "start") return { score: metrics.area * factor, feasible, rank };
+    if (objective.mode === "start") return { score: metrics.area * factor, feasible, rank, off };
     const iq = 4 * Math.PI * metrics.area / metrics.length ** 2;
     const sizeBonus = SOLVER.areaTiebreak * Math.min(metrics.area / objective.targetArea, 2);
-    return { score: (iq + sizeBonus) * factor, feasible, rank };
+    return { score: (iq + sizeBonus) * factor, feasible, rank, off };
 }
 
-// Which limits a loop misses: { rank, log, factor }. rank is the priority of the
+// Which limits a loop misses: { rank, log, factor, off }. rank is the priority of the
 // most important one missed (0: none), from common sense about what a
 // runner can't bend: the longest distance first (it's how far they can
 // go), then the most climb, then the shortest distance and the smallest and
@@ -1237,13 +1286,19 @@ function scoreLoop(metrics, objective) {
 // factor is what the score is multiplied by (log, its log): steeper for
 // more important limits, so that the search heads for loops that meet
 // them. coverageSteepness: the exponent for the coverage target (the block
-// polish pushes harder, see SOLVER.polishShortfall).
-function limitMisses(m, o, coverageSteepness = 6) {
-    let rank = 0, log = 0, factor = 1;
-    // ratio > 1 is how far it's off.
+// polish pushes harder, see SOLVER.polishShortfall; so does every search
+// with a coverage range, which is narrow and comes before roundness).
+function limitMisses(m, o, coverageSteepness = o.maxCoverage ? SOLVER.polishShortfall : 6) {
+    let rank = 0, log = 0, factor = 1, off = 0;
+    // ratio > 1 is how far it's off. off: how far off the loop is on the
+    // most important limits it misses (summed logs of the ratios).
     const miss = (priority, ratio, steepness) => {
         if (!(ratio > 1)) return;
-        if (priority > rank) rank = priority;
+        if (priority > rank) {
+            rank = priority;
+            off = 0;
+        }
+        if (priority === rank) off += Math.log(ratio);
         log -= steepness * Math.log(ratio);
         factor *= ratio ** -steepness;
     };
@@ -1254,13 +1309,20 @@ function limitMisses(m, o, coverageSteepness = 6) {
     if (o.minAreaM2) miss(3, o.minAreaM2 / Math.max(area, 1), 8);
     if (o.maxAreaM2) miss(3, area / o.maxAreaM2, 8);
     if (o.coverage) miss(2, o.coverage / Math.max(m.coverage, 1e-9), coverageSteepness);
+    if (o.maxCoverage) miss(2, m.coverage / o.maxCoverage, coverageSteepness);
+    // (Not a limit: a pull toward this coverage, see roughParams.)
+    if (o.aimCoverage && m.coverage > 0) {
+        const off = SOLVER.aimSteepness * Math.abs(Math.log(m.coverage / o.aimCoverage));
+        log -= off;
+        factor *= Math.exp(-off);
+    }
     if (o.minClimbM && m.climb != null) miss(1, (o.minClimbM + 10) / (m.climb + 10), 6);
-    return { rank, log, factor };
+    return { rank, log, factor, off };
 }
 
 // Whether a search has any of the optional limits (area mode: also the
 // length limit).
-const hasLimits = (p) => Boolean((p.mode === "area" && p.maxLengthM) || p.minLengthM || p.minAreaM2 || p.maxAreaM2 ||
+const hasLimits = (p) => Boolean((p.mode === "area" && p.maxLengthM) || p.maxCoverage || p.minLengthM || p.minAreaM2 || p.maxAreaM2 ||
     p.minClimbM || p.maxClimbM != null);
 const hasClimbLimits = (p) => Boolean(p.minClimbM || p.maxClimbM != null);
 
@@ -1456,7 +1518,7 @@ function sweepLoop(g, s, cx, cy, budget, opts, scratch) {
                     const k1 = fClimb ? k0 + fClimb[j] : undefined;
                     const result = opts.close(a1, c1, l1, k1);
                     if (!best || isBetterResult(result, best)) {
-                        best = { area: a1, covered: c1, length: l1, climb: k1, score: result.score, feasible: result.feasible, rank: result.rank };
+                        best = { area: a1, covered: c1, length: l1, climb: k1, score: result.score, feasible: result.feasible, rank: result.rank, off: result.off };
                         bestState = state;
                         bestSlot = j;
                     }
@@ -1588,9 +1650,16 @@ class FacePolish {
     // Sets the inside to the faces inside a counter-clockwise loop of merged
     // edges. False if the loop doesn't enclose a proper set of blocks.
     load(edges, dirs) {
-        const { fc } = this;
+        const { fc, g } = this;
         const onLoop = new Uint8Array(fc.P);
         const stack = [];
+        // A face of negative area inside the loop is the outside of a
+        // small piece of road map nested in a block (or a sliver between
+        // roads drawn on top of each other): it adds nothing, as the block
+        // around it already counts that area. Only the outside of the
+        // whole map (at least half as big as the loop) means it isn't one.
+        let loopArea = 0;
+        edges.forEach((e, i) => { loopArea += dirs[i] * g.eCross[e] / 2; });
         edges.forEach((e, i) => {
             for (let p = fc.eOff[e]; p < fc.eOff[e + 1]; p++) {
                 onLoop[p] = 1;
@@ -1602,7 +1671,7 @@ class FacePolish {
             const f = stack.pop();
             if (inside[f]) continue;
             // Reached the outside: not a proper loop.
-            if (fc.faceArea[f] < 0) return false;
+            if (fc.faceArea[f] < -0.5 * Math.abs(loopArea)) return false;
             inside[f] = 1;
             for (let k = fc.faceOff[f]; k < fc.faceOff[f + 1]; k++) {
                 const h = fc.faceHalf[k];
@@ -2050,15 +2119,17 @@ class SweepSearch {
         this.worker = worker;
         this.workers = workers;
         this.isStart = params.mode === "start";
-        const { mode, maxLengthM, coverage, minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM } = params;
-        this.objective = { mode, maxLengthM, coverage, minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM };
+        const { mode, maxLengthM, coverage, maxCoverage, aimCoverage, minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM } = params;
+        this.objective = { mode, maxLengthM, coverage, maxCoverage, aimCoverage, minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM };
         this.scratch = {};
         this.exact = Boolean(g.eClimb) || hasLimits(params);
         this.random = mulberry32(1 + worker);
         this.rounds = 0;
         this.evaluations = 0;
         this.best = null;
-        const project = (p) => ({ x: (p.lng - g.lng0) * g.kx, y: (p.lat - g.lat0) * g.ky });
+        const projection = g.equalArea ? equalAreaProjection(g.lat0, g.lng0) : null;
+        const project = projection ? projection.toXY : (p) => ({ x: (p.lng - g.lng0) * g.kx, y: (p.lat - g.lat0) * g.ky });
+        this.toLatLng = projection ? (p) => projection.toLatLng(p.x, p.y) : (p) => ({ lat: p.y / g.ky + g.lat0, lng: p.x / g.kx + g.lng0 });
         this.fixedCenter = params.center ? project(params.center) : null;
         this.reference = params.reference ? params.reference.map(project) : null;
         this.along = this.reference ? positionsAlong(g.faces, this.reference) : null;
@@ -2088,7 +2159,13 @@ class SweepSearch {
             hull.forEach((p, i) => { perimeter += Math.hypot(hull[(i + 1) % hull.length].x - p.x, hull[(i + 1) % hull.length].y - p.y); });
             // Loops longer than this can't be rounder than ones that are
             // shorter and still cover enough (or are over the limit).
-            this.budget = Math.min(Math.max(1.5 * perimeter, 2.5 * Math.PI * this.radius, 1.2 * (minLengthM || 0)), maxLengthM || Infinity);
+            // With an upper bound on coverage (or area), loops much longer
+            // than a circle around that much would be too jagged to win, and
+            // a tighter budget gives the sweep finer length steps (see
+            // lengthBuckets), so it can land in a narrow range.
+            const most = Math.min((maxCoverage || Infinity) * this.targetArea, maxAreaM2 || Infinity);
+            const bounded = 2 * Math.sqrt(Math.PI * most) / Math.sqrt(SOLVER.leastRoundness);
+            this.budget = Math.min(Math.max(1.5 * perimeter, 2.5 * Math.PI * this.radius, 1.2 * (minLengthM || 0)), maxLengthM || Infinity, Math.max(bounded, 1.2 * (minLengthM || 0)));
             // How far out from the middle loops reach, as a share of the
             // target's size: enough to cover the target (and any smallest
             // area), but no more than the length limit or largest area
@@ -2120,10 +2197,15 @@ class SweepSearch {
         if (this.reference && this.rounds === 0) {
             // Improving a rough loop (every search, on its first sweep): start
             // from the rough loop itself, traced on these roads and polished.
-            const traced = traceLoop(g, this.reference);
-            // (If it can't be polished, e.g. as it crosses itself on a
-            // bridge, it is still a loop on the real roads.)
-            const loop = traced && (this.polishLoop(traced, true) || this.measureLoop(traced));
+            const traced = untangleLoop(g, traceLoop(g, this.reference));
+            // (If it can't be polished, e.g. as it crosses itself at an
+            // interchange, it is still a loop on the real roads; but then
+            // this search's first sweep goes in order along the rough loop
+            // too, which can't cross itself, and is preferred if about as
+            // good: everything after it can be polished.)
+            const clean = traced && this.polishLoop(traced, true);
+            this.alongFirst = !clean;
+            const loop = clean || (traced && this.measureLoop(traced));
             // (Then the roads along it are broken somewhere: searching them
             // blindly would only find small loops, slowly.)
             if (!loop) throw new Error("Couldn't follow the rough loop on these roads.");
@@ -2133,7 +2215,9 @@ class SweepSearch {
         }
         // Improving a rough loop: after the first sweep, mostly reroute the
         // best loop stretch by stretch.
-        if (this.reference && this.best && i % 4 !== 0) {
+        const alongFirst = this.alongFirst;
+        this.alongFirst = false;
+        if (this.reference && this.best && i % 4 !== 0 && !alongFirst) {
             this.refine(i);
             return;
         }
@@ -2184,7 +2268,9 @@ class SweepSearch {
             // With a climb limit, every other sweep also tries smaller loops
             // (the climb limit comes before the coverage target).
             const k = this.reach, spread = (i * 0.6180339887) % 1;
-            const scale = this.params.maxClimbM != null && i % 2 === 1 ? k * (0.25 + 0.75 * spread) : k + (1.05 - k) * spread;
+            // (No further out than the largest share asked for.)
+            const top = Math.max(k, Math.min(1.05, Math.sqrt(this.params.maxCoverage || Infinity)));
+            const scale = this.params.maxClimbM != null && i % 2 === 1 ? k * (0.25 + 0.75 * spread) : k + (top - k) * spread;
             const at = this.anchor && (this.fixedCenter || i % 2 === 0) ? this.anchor : outlinePoint(this.targetXY, center, phi, scale);
             s = nearestJunction(g, at.x, at.y, n => !g.faces.vCut[n]);
             budget = this.budget;
@@ -2206,10 +2292,13 @@ class SweepSearch {
             ? (area, covered, length, climb) => scoreLoop({ length: length + 2 * stem, area, climb, repeats: 0 }, objective)
             : (area, covered, length, climb) => scoreLoop({ length, area, climb, coverage: covered / this.targetArea, repeats: 0 }, objective);
         // Marginal area per meter of length for a round loop of this size.
-        const lambda = 0.8 * (isStart ? budget : Math.min(2 * Math.PI * this.radius, this.budget)) / (2 * Math.PI) * (1 + mu);
+        // (Area mode: a round loop of the target's size, or with an upper
+        // bound on coverage, of the size asked for.)
+        const size = this.params.maxCoverage ? Math.sqrt((this.params.coverage + this.params.maxCoverage) / 2 * this.targetArea / Math.PI) : this.radius;
+        const lambda = 0.8 * (isStart ? budget : Math.min(2 * Math.PI * size, this.budget)) / (2 * Math.PI) * (1 + mu);
         // Improving a rough loop: the first sweep goes in order along it
         // rather than around the centre, so it can follow its every wiggle.
-        const along = this.along && i === 1 ? this.along : null;
+        const along = this.along && (i === 1 || alongFirst) ? this.along : null;
         const swept = sweepLoop(g, s, center.x, center.y, budget,
             { K: SOLVER.lengthBuckets, mu, lambda, target, close, climbWeight, order: along?.order, period: along?.period }, this.scratch);
         this.evaluations++;
@@ -2229,7 +2318,8 @@ class SweepSearch {
                 if (isBetterResult(next, cand)) cand = next;
             }
         }
-        if (!best || isBetterResult(cand, best)) {
+        const cleaner = alongFirst && best && rankOf(cand) <= rankOf(best) && cand.score >= 0.97 * best.score;
+        if (!best || isBetterResult(cand, best) || cleaner) {
             cand.centroid = loopCentroid(g, cand.edges, cand.dirs);
             this.best = cand;
         }
@@ -2341,7 +2431,12 @@ class SweepSearch {
             // The join to the start must stay on the loop (start mode).
             if (isStart && (b - a + n) % n > (L.verts.indexOf(loop.s) - a + n) % n) continue;
 
-            const restL = total() - winLen, restA = L.cumA[n] - sum(L.cumA, a, b), restC = L.cumC[n] - sum(L.cumC, a, b), restK = L.cumK[n] - sum(L.cumK, a, b);
+            // (The rest's coverage is corrected by how far the angular bins
+            // are off for the whole loop, when that's measured exactly: a
+            // narrow coverage range needs it.)
+            const bias = this.params.maxCoverage && loop.metrics.coverage !== undefined ? loop.metrics.coverage * this.targetArea - L.cumC[n] : 0;
+            const restL = total() - winLen, restA = L.cumA[n] - sum(L.cumA, a, b), restK = L.cumK[n] - sum(L.cumK, a, b);
+            const restC = L.cumC[n] - sum(L.cumC, a, b) + bias;
             const sV = L.verts[a], eV = L.verts[b];
             const startAng = along.order[sV];
             const endAng = ((along.order[eV] - startAng) / along.period * 2 * Math.PI + 2 * Math.PI) % (2 * Math.PI);
@@ -2386,7 +2481,9 @@ class SweepSearch {
             }
             L = unpack(loop);
         }
-        if (loop === this.best) return;
+        // (Unchanged: polished again only while it misses a limit, e.g. a
+        // narrow coverage range that the polish can step into.)
+        if (loop === this.best && rankOf(loop) === 0) return;
         // Polish the result block by block (if it doesn't cross itself).
         const polished = this.polishLoop({ edges: loop.edges, dirs: loop.dirs });
         if (polished) {
@@ -2408,10 +2505,32 @@ class SweepSearch {
             metrics.realArea = exact.realArea;
             if (this.g.eClimb) metrics.climb = exact.climb;
         }
-        if (!this.isStart) metrics.coverage = loop.covered / this.targetArea;
+        // (The area a sweep covers is measured in angular bins: too rough
+        // for a narrow range of coverage, so measured again here.)
+        // Block by block, as the block polish counts it, if the loop
+        // encloses a proper set of blocks; otherwise along its junctions.
+        let covered = loop.covered;
+        if (exact && this.params.maxCoverage) {
+            // (Loading a loop the blocks don't fit fails only after going
+            // through all of them: after many failures and no success, it
+            // isn't tried any more.)
+            this.blocks ||= new FacePolish(this.g, () => 0, () => 0);
+            this.blockLoads ||= { ok: 0, failed: 0 };
+            const tryBlocks = this.g.faces.faceCover && (this.blockLoads.ok > 0 || this.blockLoads.failed < 20);
+            if (tryBlocks && this.blocks.load(loop.edges, loop.dirs)) {
+                this.blockLoads.ok++;
+                covered = this.blocks.covered;
+            } else {
+                if (tryBlocks) this.blockLoads.failed++;
+                this.meter ||= createCoverageMeter(this.targetXY);
+                const pts = loopPoints(this.g, loop.edges, loop.dirs);
+                covered = this.meter.measure(pts.map(p => p.x), pts.map(p => p.y)) * this.targetArea;
+            }
+        }
+        if (!this.isStart) metrics.coverage = covered / this.targetArea;
         metrics.iq = 4 * Math.PI * metrics.area / metrics.length ** 2;
-        const { score, feasible, rank } = scoreLoop(metrics, this.objective);
-        return { edges: loop.edges, dirs: loop.dirs, metrics, score, feasible, rank, s, center };
+        const { score, feasible, rank, off } = scoreLoop(metrics, this.objective);
+        return { edges: loop.edges, dirs: loop.dirs, metrics, score, feasible, rank, off, s, center };
     }
 
     // Length, enclosed area, area less the area lost to extra costs, and
@@ -2466,13 +2585,16 @@ class SweepSearch {
                 if (!(area > 0) || (!isStart && !(covered > 0))) return -Infinity;
                 const base = isStart ? Math.log(area)
                     : Math.log(4 * Math.PI * area / (length * length) + SOLVER.areaTiebreak * Math.min(area / targetArea, 2));
-                return base + limitMisses(measure(area, length, covered, stem, climb, realArea), objective, SOLVER.polishShortfall).log;
+                const misses = limitMisses(measure(area, length, covered, stem, climb, realArea), objective, SOLVER.polishShortfall);
+                return base + misses.log - SOLVER.offWeight * misses.off;
             };
             const rank = (area, length, covered, stem, climb, realArea) => limitMisses(measure(area, length, covered, stem, climb, realArea), objective).rank;
             this.polish = new FacePolish(this.g, logScore, rank);
         }
         if (!this.polish.load(loop.edges, loop.dirs)) return null;
-        const moves = Math.max(SOLVER.polishMoves / 4, Math.min(SOLVER.polishMoves, 200 * this.polish.bCount));
+        // (A rough loop only sets the shape: a quarter of the effort.)
+        const most = this.params.rough ? SOLVER.polishMoves / 4 : SOLVER.polishMoves;
+        const moves = Math.max(most / 4, Math.min(most, 200 * this.polish.bCount));
         return this.polish.anneal(moves, SOLVER.polishHeat, SOLVER.polishHeat / 100, this.random) || (keep ? this.polish.loop() : null);
     }
 
@@ -2482,7 +2604,7 @@ class SweepSearch {
         const b = this.best;
         if (!b) return null;
         const { g } = this;
-        const toLatLng = (p) => ({ lat: p.y / g.ky + g.lat0, lng: p.x / g.kx + g.lng0 });
+        const { toLatLng } = this;
         return {
             edges: b.edges,
             dirs: b.dirs,
@@ -2492,9 +2614,107 @@ class SweepSearch {
             metrics: b.metrics,
             score: b.score,
             feasible: b.feasible,
-            rank: b.rank
+            rank: b.rank,
+            off: b.off
         };
     }
+}
+
+// A traced loop (see traceLoop) can cross itself where two roads it uses
+// pass over each other (at an interchange: the shortest ways between its
+// stops can take both roads). Then it has no proper inside, and can't be
+// polished block by block. Each crossing is undone by replacing the shorter
+// of the two ways round between the two crossing roads (those roads
+// included) by the shortest path between its ends that doesn't use them.
+// Returns the loop, untangled as far as that works (null stays null).
+function untangleLoop(g, loop, rounds = 30) {
+    if (!loop) return loop;
+    const F = g.faces;
+    let { edges, dirs } = loop;
+    const tail = (k) => dirs[k] === 1 ? g.eFrom[edges[k]] : g.eTo[edges[k]];
+    const head = (k) => dirs[k] === 1 ? g.eTo[edges[k]] : g.eFrom[edges[k]];
+    for (let round = 0; round < rounds; round++) {
+        // Two loop edges through the same crossing (virtual vertex).
+        const at = new Map();
+        let pair = null;
+        for (let k = 0; k < edges.length && !pair; k++) {
+            for (let p = F.eOff[edges[k]]; p < F.eOff[edges[k] + 1] && !pair; p++) {
+                for (const v of [F.pFrom[p], F.pTo[p]]) {
+                    if (v < g.N) continue;
+                    const other = at.get(v);
+                    if (other !== undefined && other !== k) {
+                        pair = [other, k];
+                        break;
+                    }
+                    at.set(v, k);
+                }
+            }
+        }
+        if (!pair) break;
+        const [i, j] = pair, n = edges.length;
+        // The two ways round: i…j, or j…i (wrapping), roads i and j in both.
+        let inner = 0, total = 0;
+        for (let k = 0; k < n; k++) {
+            total += g.eLen[edges[k]];
+            if (k >= i && k <= j) inner += g.eLen[edges[k]];
+        }
+        const outer = total - inner + g.eLen[edges[i]] + g.eLen[edges[j]];
+        const [from, to, span] = inner <= outer ? [i, j, inner] : [j, i, outer];
+        const banned = new Set([edges[i], edges[j]]);
+        const path = shortestPathAvoiding(g, tail(from), head(to), banned, 4 * span + 2000);
+        if (!path) break;
+        // Splice: the path, then the kept way round.
+        const keptEdges = [], keptDirs = [];
+        for (let k = (to + 1) % n; k !== from; k = (k + 1) % n) {
+            keptEdges.push(edges[k]);
+            keptDirs.push(dirs[k]);
+        }
+        edges = path.edges.concat(keptEdges);
+        dirs = path.dirs.concat(keptDirs);
+        if (edges.length < 3) return loop;
+    }
+    // Counter-clockwise.
+    let cross = 0;
+    edges.forEach((e, k) => { cross += dirs[k] * g.eCross[e]; });
+    if (cross < 0) return loop;
+    return { edges, dirs };
+}
+
+// Shortest path from junction a to b on the merged edges, not using any
+// edge in `banned` and no longer than `limit`: { edges, dirs } or null.
+function shortestPathAvoiding(g, a, b, banned, limit) {
+    const dist = new Map([[a, 0]]), prev = new Map();
+    const heap = new MinHeap(256);
+    heap.push(0, a);
+    while (heap.size > 0) {
+        const u = heap.pop();
+        if (u === b) break;
+        const du = dist.get(u);
+        if (du > limit) return null;
+        for (let k = g.adjOff[u]; k < g.adjOff[u + 1]; k++) {
+            const e = g.adjEdge[k];
+            if (banned.has(e)) continue;
+            const v = g.eFrom[e] === u ? g.eTo[e] : g.eFrom[e];
+            const dv = du + g.eLen[e];
+            if (dv < (dist.get(v) ?? Infinity)) {
+                dist.set(v, dv);
+                prev.set(v, e);
+                heap.push(dv, v);
+            }
+        }
+    }
+    if (!prev.has(b) && a !== b) return null;
+    const edges = [], dirs = [];
+    for (let v = b; v !== a;) {
+        const e = prev.get(v);
+        const u = g.eFrom[e] === v ? g.eTo[e] : g.eFrom[e];
+        edges.push(e);
+        dirs.push(g.eFrom[e] === u ? 1 : -1);
+        v = u;
+    }
+    edges.reverse();
+    dirs.reverse();
+    return { edges, dirs };
 }
 
 // Small seeded random number generator, so runs are repeatable.
@@ -2781,6 +3001,7 @@ function loopCentroid(g, edges, dirs) {
 // always ends at the same sweep with the same loop.
 class SearchTracker {
     constructor(workers, refining = false, rough = false) {
+        this.rough = rough;
         this.minStale = refining ? SOLVER.refineSweeps + 2 * workers
             : rough ? SOLVER.roughSweeps + 2 * workers : SOLVER.convergeSweeps + 4 * workers;
         this.needed = this.minStale;
@@ -2831,10 +3052,12 @@ class SearchTracker {
             return false;
         }
         const significant = !best || rankOf(result) < rankOf(best) ||
+            (rankOf(result) === rankOf(best) && offBy(result) < offBy(best) * 0.99) ||
             result.score > best.score + SOLVER.minGain * Math.abs(best.score);
         if (significant) {
             this.stale = 0;
-            this.needed = Math.max(this.minStale, Math.ceil(this.rounds / 2));
+            // (Not for a rough loop: it only sets the shape.)
+            this.needed = this.rough ? this.minStale : Math.max(this.minStale, Math.ceil(this.rounds / 2));
         } else {
             this.stale++;
         }
@@ -2843,7 +3066,7 @@ class SearchTracker {
     }
 
     get done() {
-        return this.best !== null && this.stale >= this.needed;
+        return this.best !== null && (this.stale >= this.needed || (this.rough && this.rounds >= SOLVER.roughMaxRounds));
     }
 
     // Rises toward 1 as the search settles; drops back after an improvement.
@@ -2859,9 +3082,18 @@ const noLoopMessage = (params) => params.mode === "start"
     ? "Couldn't form a loop here. Try a larger distance or a different start point."
     : "Couldn't form a loop here. Try a larger area.";
 
-// Lower rank (limits missed, see limitMisses) first, then higher score.
+// Lower rank (limits missed, see limitMisses) first, then (missing the same
+// limits) less far off, then higher score.
 const rankOf = (r) => r.rank ?? (r.feasible ? 0 : 1);
-const isBetterResult = (a, b) => !b || rankOf(a) < rankOf(b) || (rankOf(a) === rankOf(b) && a.score > b.score);
+const offBy = (r) => rankOf(r) > 0 ? r.off ?? 0 : 0;
+function isBetterResult(a, b) {
+    if (!b) return true;
+    const ra = rankOf(a), rb = rankOf(b);
+    if (ra !== rb) return ra < rb;
+    const oa = offBy(a), ob = offBy(b);
+    if (Math.abs(oa - ob) > 1e-9 * (1 + Math.abs(ob))) return oa < ob;
+    return a.score > b.score;
+}
 
 // --------------------------------------------------------------------------
 // Results (main thread)
@@ -2965,6 +3197,7 @@ function expandLoop(prep, res, params, exact) {
         score: res.score,
         feasible: res.feasible,
         rank: res.rank,
+        off: res.off,
         climbM,                       // climb, as the search estimated it (0 if not read)
         center: res.center,
         anchor: res.anchor

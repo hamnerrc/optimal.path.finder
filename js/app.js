@@ -57,6 +57,7 @@ const ui = {
     coverageSection: $("coverageSection"),
     coverageInput: $("coverageInput"),
     coverageUnitSelect: $("coverageUnitSelect"),
+    coverageMaxInput: $("coverageMaxInput"),
     coverageEquivalent: $("coverageEquivalent"),
     limitsSection: $("limitsSection"),
     limitsCount: $("limitsCount"),
@@ -140,6 +141,7 @@ const prefs = {
     // or sq km (see coverageShare); and an optional length limit.
     coverageValue: storedPrefs.coverageValue > 0 ? storedPrefs.coverageValue
         : storedPrefs.coveragePercent > 0 ? storedPrefs.coveragePercent : CONFIG.defaultCoveragePercent,
+    coverageMaxValue: storedPrefs.coverageMaxValue > 0 ? storedPrefs.coverageMaxValue : null,
     coverageUnit: ["percent", "sqmi", "sqkm"].includes(storedPrefs.coverageUnit) ? storedPrefs.coverageUnit : "percent",
     // Limits on the loop, in meters and m² (null: none). maxLengthM is for
     // Area and Place (start points each have their own); before the Limits
@@ -653,12 +655,24 @@ const roadOptions = () => ({ ...prefs.roads, preferFlat: prefs.climbCost > 0, cl
 
 const COVERAGE_UNITS = { sqmi: 2589988.11, sqkm: 1e6 };
 
-// Share of a target area (m²) the loop must surround, 0..1: the coverage
-// field as a percentage, or as an area (capped at all of it).
-function coverageShare(targetM2) {
-    const { coverageValue: value, coverageUnit: unit } = prefs;
+// A coverage field's value as a share of a target area (m²), 0..1: a
+// percentage, or an area (capped at all of it).
+function shareOf(value, targetM2, unit = prefs.coverageUnit) {
     if (unit === "percent") return Math.min(1, value / 100);
     return Math.min(1, value * COVERAGE_UNITS[unit] / targetM2);
+}
+
+// Share of a target area the loop must surround (the "at least" field)...
+const coverageShare = (targetM2) => shareOf(prefs.coverageValue, targetM2);
+// ...and the most it may (the optional "at most" field; null: any).
+const coverageMaxShare = (targetM2) => prefs.coverageMaxValue === null ? null : shareOf(prefs.coverageMaxValue, targetM2);
+
+// A share of the current target in the coverage field's unit ("10.1%" or
+// "333,400 sq mi").
+function formatShare(share, targetM2) {
+    if (prefs.coverageUnit === "percent" || !targetM2) return formatCoverage(share);
+    const value = share * targetM2 / COVERAGE_UNITS[prefs.coverageUnit];
+    return `${formatNumber(value, value < 10 ? 2 : value < 1000 ? 1 : 0)} ${prefs.coverageUnit === "sqmi" ? "sq mi" : "sq km"}`;
 }
 
 // The area or place being searched, if any (a region, see geometry.js).
@@ -668,25 +682,35 @@ function currentTarget() {
     return null;
 }
 
-// Under the coverage field: the same target in the other terms.
+// "at most" below "at least" can't be met.
+const coverageConflict = () => prefs.coverageMaxValue !== null && prefs.coverageMaxValue < prefs.coverageValue;
+
+// Under the coverage fields: the same target in the other terms.
 function renderCoverage() {
     const target = currentTarget();
     const el = ui.coverageEquivalent;
     el.classList.remove("is-warning");
+    ui.coverageMaxInput.classList.toggle("is-invalid", coverageConflict());
+    if (coverageConflict()) {
+        el.textContent = "The most is below the least.";
+        el.classList.add("is-warning");
+        return;
+    }
     if (!target) {
         el.textContent = prefs.coverageUnit === "percent" ? "" : "Draw an area or choose a place to compare.";
         return;
     }
     const totalM2 = target.areaSqKm * 1e6;
-    const share = coverageShare(totalM2);
+    const share = coverageShare(totalM2), max = coverageMaxShare(totalM2);
+    // In the other unit: area for a percentage, percentage for an area.
+    const other = (v) => prefs.coverageUnit === "percent" ? formatArea(v * totalM2) : formatCoverage(v);
     let text;
-    if (prefs.coverageUnit === "percent") {
-        text = `About ${formatArea(share * totalM2)} of its ${formatArea(totalM2)}.`;
-    } else if (prefs.coverageValue * COVERAGE_UNITS[prefs.coverageUnit] > totalM2) {
+    if (prefs.coverageUnit !== "percent" && prefs.coverageValue * COVERAGE_UNITS[prefs.coverageUnit] > totalM2) {
         text = `That's more than the whole area (${formatArea(totalM2)}): the loop will go around all of it.`;
         el.classList.add("is-warning");
     } else {
-        text = `${formatCoverage(share)} of its ${formatArea(totalM2)}.`;
+        text = max === null || max >= 1 ? `At least ${other(share)}` : `${other(share)} to ${other(max)}`;
+        text += ` of its ${formatArea(totalM2)}.`;
     }
     // The shortest loop that can surround that much is a circle.
     const shortest = 2 * Math.sqrt(Math.PI * share * totalM2);
@@ -699,8 +723,12 @@ function renderCoverage() {
     el.textContent = text;
 }
 
-ui.coverageInput.value = prefs.coverageValue;
-ui.coverageUnitSelect.value = prefs.coverageUnit;
+const renderCoverageInputs = () => {
+    ui.coverageInput.value = prefs.coverageValue;
+    ui.coverageMaxInput.value = prefs.coverageMaxValue ?? "";
+    ui.coverageUnitSelect.value = prefs.coverageUnit;
+};
+renderCoverageInputs();
 ui.coverageInput.addEventListener("input", () => {
     const value = parseFloat(ui.coverageInput.value);
     const valid = value > 0 && (prefs.coverageUnit !== "percent" || value <= 100);
@@ -710,24 +738,37 @@ ui.coverageInput.addEventListener("input", () => {
     rememberPrefs();
     render();
 });
-// Switching the unit converts the value, so the target stays the same.
+ui.coverageMaxInput.addEventListener("input", () => {
+    const text = ui.coverageMaxInput.value.trim();
+    const value = parseFloat(text);
+    if (text && !(value > 0)) return;
+    prefs.coverageMaxValue = text ? value : null;
+    rememberPrefs();
+    render();
+});
+// Switching the unit converts both values, so the target stays the same.
 ui.coverageUnitSelect.addEventListener("change", () => {
-    const unit = ui.coverageUnitSelect.value;
+    const unit = ui.coverageUnitSelect.value, from = prefs.coverageUnit;
     const target = currentTarget();
-    if (target) {
-        const m2 = coverageShare(target.areaSqKm * 1e6) * target.areaSqKm * 1e6;
-        const value = unit === "percent" ? m2 / (target.areaSqKm * 1e6) * 100 : m2 / COVERAGE_UNITS[unit];
-        prefs.coverageValue = Number(value.toPrecision(value < 1 ? 2 : 3));
-    } else if (prefs.coverageUnit !== "percent" || unit !== "percent") {
-        // Nothing to convert against: sq mi <-> sq km only.
-        if (prefs.coverageUnit !== "percent" && unit !== "percent") {
-            prefs.coverageValue = Number((prefs.coverageValue * COVERAGE_UNITS[prefs.coverageUnit] / COVERAGE_UNITS[unit]).toPrecision(3));
-        } else if (unit === "percent") {
-            prefs.coverageValue = CONFIG.defaultCoveragePercent;
+    const convert = (value) => {
+        if (value === null) return null;
+        let out;
+        if (target) {
+            const totalM2 = target.areaSqKm * 1e6, m2 = shareOf(value, totalM2, from) * totalM2;
+            out = unit === "percent" ? m2 / totalM2 * 100 : m2 / COVERAGE_UNITS[unit];
+        } else if (from !== "percent" && unit !== "percent") {
+            out = value * COVERAGE_UNITS[from] / COVERAGE_UNITS[unit];
+        } else {
+            // Nothing to convert against.
+            return unit === "percent" ? CONFIG.defaultCoveragePercent : null;
         }
-    }
+        // (Enough digits that a narrow range stays as it was.)
+        return Number(out.toPrecision(6));
+    };
+    prefs.coverageValue = convert(prefs.coverageValue) ?? prefs.coverageValue;
+    prefs.coverageMaxValue = convert(prefs.coverageMaxValue);
     prefs.coverageUnit = unit;
-    ui.coverageInput.value = prefs.coverageValue;
+    renderCoverageInputs();
     ui.coverageInput.setCustomValidity("");
     rememberPrefs();
     render();
@@ -756,7 +797,11 @@ function renderLimitInputs() {
 
 // The limits that apply in the current mode: start points have their own
 // longest distance.
-const activeLimits = () => ({ ...prefs.limits, ...(state.mode === "distance" ? { maxLengthM: null } : {}) });
+// In Area and Place, the area is the coverage fields' range instead.
+const activeLimits = () => ({
+    ...prefs.limits,
+    ...(state.mode === "distance" ? { maxLengthM: null } : { minAreaM2: null, maxAreaM2: null })
+});
 
 // Limits for a search (only those set).
 const limitsFor = () => Object.fromEntries(Object.entries(activeLimits()).filter(([, v]) => v !== null));
@@ -769,6 +814,7 @@ function conflictingLimits(limits = activeLimits()) {
 
 function renderLimits() {
     const start = state.mode === "distance";
+    ui.limitsSection.querySelectorAll(".limits-area").forEach(el => { el.hidden = !start; });
     const max = ui.limitsSection.querySelector('[data-limit="maxLengthM"]');
     max.disabled = start;
     max.placeholder = start ? "per pin" : "–";
@@ -870,16 +916,17 @@ function searchJobs() {
         label = state.place.name;
     }
     const outline = target.outline.map(p => ({ lat: p.lat, lng: p.lng }));
-    const coverage = coverageShare(target.areaSqKm * 1e6);
+    const coverage = coverageShare(target.areaSqKm * 1e6), maxShare = coverageMaxShare(target.areaSqKm * 1e6);
+    const maxCoverage = maxShare !== null && maxShare < 1 && !coverageConflict() ? maxShare : undefined;
     return [{
         kind: "area",
         label,
-        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${coverage.toFixed(5)}:${roadsKey()}:${limitsKey()}`,
+        key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${coverage.toFixed(6)}:${maxCoverage?.toFixed(6)}:${roadsKey()}:${limitsKey()}`,
         networkKey: "area",
         region: marginRegion(target, CONFIG.areaMargins[0]),
         target,
         roads: roadOptions(),
-        objective: { mode: "area", target: outline, coverage, ...limitsFor() }
+        objective: { mode: "area", target: outline, coverage, ...(maxCoverage ? { maxCoverage } : {}), ...limitsFor() }
     }];
 }
 
@@ -1064,6 +1111,7 @@ function showLoop(route, loop, job) {
         // (Measured on the final loop: see missedLimits.)
         feasible: loop.repeats === 0 && missedLimits(loop, job).length === 0,
         climbM: loop.climbM || 0,
+        targetM2: job.target ? job.target.areaSqKm * 1e6 : null,
         flags: loop.flags || []
     });
     // Start where the loop passes closest to the pin.
@@ -1146,8 +1194,15 @@ function missedLimits(result, job) {
     if (o.maxAreaM2 && result.areaM2 > o.maxAreaM2 * slack) out.push(`It encloses ${formatArea(result.areaM2)}, more than your ${formatArea(o.maxAreaM2)} maximum.`);
     // (The search measures coverage on a simplified outline: allow for the
     // small difference from the exact figure.)
-    if (job.kind === "area" && result.coverage < o.coverage - 0.005 && !heldBack(result, job)) {
-        out.push(`It only encloses ${formatCoverage(result.coverage)} of the area (target ${formatCoverage(o.coverage)}). Try a lower target.`);
+    // (Allowing for the search measuring coverage a little differently: a
+    // hair off, or a part of the narrowest range.)
+    const targetM2 = job.target ? job.target.areaSqKm * 1e6 : 0;
+    const slackShare = Math.min(0.005, o.maxCoverage ? (o.maxCoverage - o.coverage) / 4 + 0.0005 : Infinity);
+    if (job.kind === "area" && result.coverage < o.coverage - slackShare && !heldBack(result, job)) {
+        out.push(`It only surrounds ${formatShare(result.coverage, targetM2)} of the area (at least ${formatShare(o.coverage, targetM2)} asked). Try a lower target.`);
+    }
+    if (job.kind === "area" && o.maxCoverage && result.coverage > o.maxCoverage + slackShare) {
+        out.push(`It surrounds ${formatShare(result.coverage, targetM2)} of the area, more than the ${formatShare(o.maxCoverage, targetM2)} at most asked.`);
     }
     if (o.minClimbM && climb < o.minClimbM / slack - 1) out.push(`It only climbs about ${formatElevation(climb)}, less than your ${formatElevation(o.minClimbM)} minimum.`);
     return out;
@@ -1169,8 +1224,9 @@ function limitedCoverageNote(result, job) {
     if (job.kind !== "area" || !(result.coverage < job.objective.coverage - 0.005)) return "";
     const names = heldBack(result, job);
     if (!names) return "";
-    return `Your ${names.join(" and ")} limit${names.length > 1 ? "s keep" : " keeps"} it to ${formatCoverage(result.coverage)} of the area ` +
-        `(target ${formatCoverage(job.objective.coverage)}): it's the loop within ${names.length > 1 ? "them" : "it"} that surrounds the most.`;
+    const targetM2 = job.target.areaSqKm * 1e6;
+    return `Your ${names.join(" and ")} limit${names.length > 1 ? "s keep" : " keeps"} it to ${formatShare(result.coverage, targetM2)} of the area ` +
+        `(at least ${formatShare(job.objective.coverage, targetM2)} asked): it's the loop within ${names.length > 1 ? "them" : "it"} that surrounds the most.`;
 }
 
 const activeRoute = () => state.routes.find(r => r.id === state.activeRouteId) || null;
@@ -1251,7 +1307,11 @@ function renderRouteDetail() {
     ui.statArea.textContent = formatArea(route.areaM2);
     ui.statIq.textContent = route.iq.toFixed(2);
     ui.statCoverageBox.hidden = route.coverage === null;
-    if (route.coverage !== null) ui.statCoverage.textContent = formatCoverage(route.coverage);
+    if (route.coverage !== null) {
+        // (As an area too, if that's how the target was asked for.)
+        const area = prefs.coverageUnit !== "percent" && route.targetM2 ? formatShare(route.coverage, route.targetM2) : "";
+        ui.statCoverage.textContent = formatCoverage(route.coverage) + (area ? ` · ${area}` : "");
+    }
     ui.statTime.textContent = formatDuration(estimatedSeconds(route));
     ui.routeWarning.textContent = route.warning || "";
     ui.routeWarning.hidden = !route.warning;

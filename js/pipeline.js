@@ -25,7 +25,7 @@
 
 // job:
 //   objective  { mode: "start", start: {lat,lng}, maxLengthM, …limits }
-//            | { mode: "area", target: [{lat,lng}], coverage, maxLengthM?, …limits }
+//            | { mode: "area", target: [{lat,lng}], coverage, maxCoverage?, maxLengthM?, …limits }
 //              limits (all optional): minLengthM, minAreaM2, maxAreaM2,
 //              minClimbM, maxClimbM (see limitMisses in js/solver.js)
 //   region     full-detail road region
@@ -129,23 +129,31 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
     // While the search runs, the tiles along its best loop so far start
     // downloading (the browser has little else to do meanwhile).
     const prefetch = corridorPrefetcher(objective);
-    const rough = { ...await runSolver(coarse, { ...solverParams(job), avoidMotorways, rough: true }, {
+    let roughRounds = 0;
+    const roughStart = Date.now();
+    const rough = { ...await runSolver(coarse, { ...roughParams(solverParams(job)), avoidMotorways, rough: true }, {
         signal,
         onProgress: ({ fraction, rounds, best }) => {
             if (best) onLoop({ ...best, chunked: true }, false);
             prefetch.offer(best, fraction);
+            roughRounds = rounds;
             onStatus(`Finding a rough loop on major roads (round ${rounds})…`, 0.4 * fraction);
         }
     }), chunked: true };
     coarse = null;
+    console.log(`[Search] Rough loop: ${roughRounds} rounds, ${Date.now() - roughStart} ms`);
+    // (Its rank was for the widened range, see roughParams: what it misses
+    // is known only on all roads.)
+    if (rough.rank !== undefined) rough.rank = 6;
     onLoop(rough, false);
 
     // Stage 2: all roads along the rough loop, then along the improved one --
     // Each pass can move each side of the loop by up to the corridor's
     // width; the next pass starts from where the last one got to.
     let best = rough;
+    // (A huge loop that still misses a limit gets the usual passes.)
     const passes = huge ? settings.hugePasses : settings.corridorPasses;
-    for (let pass = 1; pass <= passes; pass++) {
+    for (let pass = 1; pass <= passes || (rankOf(best) > 0 && pass <= settings.corridorPasses); pass++) {
         const share = (fraction) => 0.4 + 0.6 * (pass - 1 + fraction) / passes;
         let fine;
         try {
@@ -182,7 +190,7 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
         // (with the real road shapes) wins, unless it's far worse (the
         // rough loop couldn't be followed). After that, a pass that barely
         // helped is the last.
-        const gain = pass === 1 ? Infinity : (fine.score - best.score) / Math.abs(best.score);
+        const gain = pass === 1 || rankOf(fine) < rankOf(best) ? Infinity : (fine.score - best.score) / Math.abs(best.score);
         console.log(`[Search] Pass ${pass}: score ${fine.score.toFixed(4)} (was ${best.score.toFixed(4)})`);
         const close = pass === 1 && rankOf(fine) <= rankOf(best) && fine.score > 0.9 * best.score;
         if (close || isBetterResult(fine, best)) best = fine;
@@ -224,7 +232,7 @@ function corridorPrefetcher(objective) {
     return {
         offer(loop, fraction) {
             if (loop) latest = loop;
-            if (!latest || latest === offered || fraction < 0.25) return;
+            if (!latest || latest === offered || fraction < CONFIG.chunked.prefetchSettled) return;
             offered = latest;
             clearTimeout(timer);
             timer = setTimeout(() => {
@@ -354,6 +362,25 @@ function loopPart(loop) {
     return kept.length >= 3 ? kept : points.slice(0, -1);
 }
 
+// The rough stage's params: a narrow range of coverage or area widened by
+// CONFIG.chunked.roughSlack each way, with a mild pull toward the middle of
+// the real range (aimCoverage). Its big blocks of major roads can rarely
+// land in a range that narrow, and its job is the shape; but the roads
+// along it can only move it a little (a corridor a few km wide), so it
+// should end up close.
+function roughParams(params) {
+    const slack = CONFIG.chunked.roughSlack;
+    const out = { ...params };
+    if (params.maxCoverage) {
+        out.coverage = params.coverage * (1 - slack);
+        out.maxCoverage = params.maxCoverage * (1 + slack);
+        out.aimCoverage = (params.coverage + params.maxCoverage) / 2;
+    }
+    if (params.minAreaM2) out.minAreaM2 = params.minAreaM2 * (1 - slack);
+    if (params.maxAreaM2) out.maxAreaM2 = params.maxAreaM2 * (1 + slack);
+    return out;
+}
+
 // Solver params for a job (with its limits, see limitMisses).
 function solverParams({ objective, roads }) {
     const prefer = { preferSmall: Boolean(roads?.preferSmall), preferFlat: Boolean(roads?.preferFlat), climbCost: roads?.climbCost };
@@ -361,7 +388,7 @@ function solverParams({ objective, roads }) {
     const limits = { maxLengthM, minLengthM, minAreaM2, maxAreaM2, minClimbM, maxClimbM };
     return objective.mode === "start"
         ? { mode: "start", start: objective.start, ...limits, ...prefer }
-        : { mode: "area", target: objective.target, coverage: objective.coverage, ...limits, ...prefer };
+        : { mode: "area", target: objective.target, coverage: objective.coverage, maxCoverage: objective.maxCoverage, ...limits, ...prefer };
 }
 
 // The climb along every road (for the Hills slider and climb limits), from

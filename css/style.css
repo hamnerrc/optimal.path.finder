@@ -936,6 +936,17 @@ h1 {
 
 .coverage-row .input-unit {
     flex: 1;
+    min-width: 0;
+}
+
+.input-unit > .input-prefix {
+    padding: 0 0 0 10px;
+    white-space: nowrap;
+    font-size: 12px;
+}
+
+.coverage-row .input-unit input {
+    padding: 0 8px 0 6px;
 }
 
 .coverage-row select {

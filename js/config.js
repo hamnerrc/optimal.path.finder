@@ -4,7 +4,7 @@
 
 const CONFIG = {
     // Release number, as in index.html's ?v= (for the worker's scripts).
-    release: 12,
+    release: 13,
 
     map: {
         initialCenter: [20, 0],
@@ -103,6 +103,13 @@ const CONFIG = {
         hugePasses: 1,
         hugeRoadTypes: ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link"],
         corridorPasses: 3,
+        // A coverage or area range is this much wider each way for the
+        // rough loop (see roughParams).
+        roughSlack: 0.06,
+        // The tiles along a search's best loop start downloading once the
+        // search is this settled (0..1, see SearchTracker.fraction): before
+        // that the loop still changes a lot, and the downloads are wasted.
+        prefetchSettled: 0.5,
         passMinGain: 0.005
     },
 

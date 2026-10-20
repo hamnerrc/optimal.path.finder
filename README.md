@@ -13,15 +13,17 @@ Three ways to plan:
   counts twice toward the length.
 - **Area**: draw a circle, ellipse, rectangle (any angle) or freehand shape.
   The app finds the roundest loop (highest isoperimetric quotient,
-  4π·area ÷ length²) that encloses at least a chosen share of the shape,
-  typed as a percentage of it or as an area in sq mi or sq km. Between
-  equally round loops, the one enclosing more area wins.
+  4π·area ÷ length²) that surrounds as much of the shape as asked: at
+  least one amount, and optionally at most another, as a percentage of it
+  or as an area in sq mi or sq km. Between equally round loops, the one
+  enclosing more area wins.
 - **Place**: search for a city, county, state, lake or park and use its real
   boundary (from OpenStreetMap via Nominatim) as the area.
 
 **Limits** (every mode, optional): the shortest and longest distance, the
-smallest and largest enclosed area, and the least and most climb. In start
-point mode each pin's length is its longest distance. If they can't all be
+smallest and largest enclosed area (start point mode; in Area and Place the
+surrounded area's range above takes its place), and the least and most
+climb. In start point mode each pin's length is its longest distance. If they can't all be
 met, they count in this order: the longest distance (how far you can go),
 then the most climb, then the shortest distance and the area limits, then
 the share of the area to surround, then the least climb, and only then the
@@ -29,8 +31,9 @@ goal (most area, or roundest). A loop that misses a limit says which; one
 held back from its coverage target by a distance, climb or area limit
 says so in a note (that's expected). In the solver each loop gets a rank,
 the most important limit it misses (`limitMisses` in `js/solver.js`), and a
-lower rank always beats a better score; within a rank, misses shrink the
-score steeply so the search heads toward meeting them. Climb limits are
+lower rank always beats a better score, and at the same rank, missing by
+less does; misses also shrink the score steeply so the search heads toward
+meeting them. Climb limits are
 checked against the search's climb estimate (terrain tiles): the sweep
 tracks the climb of every path, some sweeps count climb as lost area (to
 find flat loops) and, with a climb limit, some try smaller loops.
@@ -200,6 +203,21 @@ the loop can use roads outside its edge, including the corners of a
 square of grid streets around a round area. A wider margin often gives a
 much rounder loop. If the coverage target still can't be reached, the
 search is repeated with 40%.
+
+**Areas at country scale.** Areas are measured in a Lambert azimuthal
+equal-area projection for anything more than about 200 km across
+(`projectionFor` in `js/geometry.js`); a flat projection got the area of
+the contiguous US wrong by 3%, and of a loop across it by more. With a
+narrow range of coverage (e.g. 333,400 to 334,000 sq mi of the US, a
+range 0.2% wide), candidate loops are measured exactly (block by block, or
+by scanlines along the loop), the sweep's length budget and size weight
+follow the range rather than the whole area, and the rough stage looks in
+a range 6% wider each way (`CONFIG.chunked.roughSlack`), pulled toward its
+middle: its blocks of major roads are too coarse to land in the range, and
+the roads along its loop then fine-tune the size. A loop traced from the
+rough loop onto all roads can cross itself where two of its roads pass
+over each other; `untangleLoop` undoes that, so it can be polished block by
+block.
 
 ### Big searches
 

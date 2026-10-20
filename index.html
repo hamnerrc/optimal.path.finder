@@ -16,26 +16,26 @@
     <!-- Scripts and styles carry the release number (?v=), so a browser never
          mixes files from two releases out of its cache: bump it with every
          change. -->
-    <link rel="stylesheet" href="css/style.css?v=12">
+    <link rel="stylesheet" href="css/style.css?v=13">
 
     <script defer src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
-    <script defer src="js/config.js?v=12"></script>
-    <script defer src="js/geometry.js?v=12"></script>
-    <script defer src="js/units.js?v=12"></script>
-    <script defer src="js/storage.js?v=12"></script>
-    <script defer src="js/overpass.js?v=12"></script>
-    <script defer src="js/vectortiles.js?v=12"></script>
-    <script defer src="js/roadtiles.js?v=12"></script>
-    <script defer src="js/network.js?v=12"></script>
-    <script defer src="js/solver.js?v=12"></script>
-    <script defer src="js/solve.js?v=12"></script>
-    <script defer src="js/pipeline.js?v=12"></script>
-    <script defer src="js/loop.js?v=12"></script>
-    <script defer src="js/elevation.js?v=12"></script>
-    <script defer src="js/export.js?v=12"></script>
-    <script defer src="js/map.js?v=12"></script>
-    <script defer src="js/app.js?v=12"></script>
+    <script defer src="js/config.js?v=13"></script>
+    <script defer src="js/geometry.js?v=13"></script>
+    <script defer src="js/units.js?v=13"></script>
+    <script defer src="js/storage.js?v=13"></script>
+    <script defer src="js/overpass.js?v=13"></script>
+    <script defer src="js/vectortiles.js?v=13"></script>
+    <script defer src="js/roadtiles.js?v=13"></script>
+    <script defer src="js/network.js?v=13"></script>
+    <script defer src="js/solver.js?v=13"></script>
+    <script defer src="js/solve.js?v=13"></script>
+    <script defer src="js/pipeline.js?v=13"></script>
+    <script defer src="js/loop.js?v=13"></script>
+    <script defer src="js/elevation.js?v=13"></script>
+    <script defer src="js/export.js?v=13"></script>
+    <script defer src="js/map.js?v=13"></script>
+    <script defer src="js/app.js?v=13"></script>
 </head>
 
 <body>
@@ -172,11 +172,16 @@
 
         <!-- Coverage target, shared by Area and Place -->
         <section id="coverageSection" class="section coverage" hidden>
-            <label class="field-label" for="coverageInput">Surround at least</label>
+            <span class="field-label">How much of it the loop surrounds</span>
             <div class="coverage-row">
-                <span class="input-unit">
-                    <input id="coverageInput" type="number" min="0" step="any" inputmode="decimal" aria-describedby="coverageEquivalent">
-                </span>
+                <label class="input-unit">
+                    <span class="input-prefix">at least</span>
+                    <input id="coverageInput" type="number" min="0" step="any" inputmode="decimal" aria-label="At least" aria-describedby="coverageEquivalent">
+                </label>
+                <label class="input-unit">
+                    <span class="input-prefix">at most</span>
+                    <input id="coverageMaxInput" type="number" min="0" step="any" inputmode="decimal" placeholder="any" aria-label="At most (optional)" aria-describedby="coverageEquivalent">
+                </label>
                 <select id="coverageUnitSelect" aria-label="Coverage unit">
                     <option value="percent">% of the area</option>
                     <option value="sqmi">sq mi</option>
@@ -194,9 +199,9 @@
                 <span class="limits-label">Distance <span class="unit-distance">mi</span></span>
                 <input data-limit="minLengthM" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Shortest distance">
                 <input data-limit="maxLengthM" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Longest distance">
-                <span class="limits-label">Area <span class="unit-area">sq mi</span></span>
-                <input data-limit="minAreaM2" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Smallest area">
-                <input data-limit="maxAreaM2" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Largest area">
+                <span class="limits-label limits-area">Area <span class="unit-area">sq mi</span></span>
+                <input class="limits-area" data-limit="minAreaM2" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Smallest area">
+                <input class="limits-area" data-limit="maxAreaM2" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Largest area">
                 <span class="limits-label">Climb <span class="unit-elevation">ft</span></span>
                 <input data-limit="minClimbM" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Least climb">
                 <input data-limit="maxClimbM" type="number" min="0" step="any" inputmode="decimal" placeholder="–" aria-label="Most climb">
@@ -320,8 +325,8 @@
         <details id="aboutSection" class="collapsible about">
             <summary>How it works</summary>
             <p class="hint"><strong>Start point:</strong> each start point gets the loop that encloses the most area within its length. Loops start and finish at the road junction nearest the pin; if a bigger loop is a short way off, the run goes out to it and back the same way (that stretch counts twice).</p>
-            <p class="hint"><strong>Area and Place:</strong> the roundest loop (4π × area ÷ length², 1 for a circle) that surrounds at least the share of the area you ask for; of two equally round loops, the bigger. Roads up to 20% beyond the area are used, or further if that isn't enough.</p>
-            <p class="hint"><strong>Limits</strong> are optional (blank: none). If they can't all be met, the longest distance comes first, then the most climb, then the shortest distance and the area limits, then the share of the area, then the least climb; the loop says which it misses. Climb limits use an estimate from terrain data; the elevation profile is more exact.</p>
+            <p class="hint"><strong>Area and Place:</strong> the roundest loop (4π × area ÷ length², 1 for a circle) that surrounds as much of the area as you ask for: at least that much, and at most the second number if you give one (as a share, or in sq mi or sq km); of two equally round loops, the bigger. Roads up to 20% beyond the area are used, or further if that isn't enough.</p>
+            <p class="hint"><strong>Limits</strong> are optional (blank: none). The area limits are for Start point; in Area and Place the area surrounded is set above. If they can't all be met, the longest distance comes first, then the most climb, then the shortest distance and the area limits, then how much of the area to surround, then the least climb; a loop that misses one gets as close as it can and says so. Climb limits use an estimate from terrain data; the elevation profile is more exact.</p>
             <p class="hint"><strong>Hills:</strong> each meter of climb counts as that many meters of extra length while searching, so a flatter loop wins when it's about as good.</p>
             <p class="hint"><strong>Roads:</strong> paths, trails, sidewalks and rail trails are always used. Fence hops never cross a road, railroad, river or shore, and never start or end on a driveway, bridge or tunnel. Check the orange stretches before you run.</p>
             <p class="hint">The search keeps going until it stops finding better loops; press Stop at any time to keep the best so far. Big areas are searched in stages, first on major roads.</p>
