@@ -53,9 +53,10 @@ function roadTileZoom(bbox, maxTiles, top = 12) {
 // cover `region` (anything with a bbox, optionally contains() and outline).
 // roadTypes filters highway types; zoom defaults to full detail.
 // noExpressways also leaves out other roads tagged as expressways; hops adds
-// fence hops (see hopLines). Fails with err.tooManyRoads once the tiles
+// fence hops (see hopLines); connector adds a line ([[lat, lng], …]) as a
+// road of type "connector". Fails with err.tooManyRoads once the tiles
 // hold more than maxVertices points.
-async function fetchRoadsFromTiles(region, signal, { roadTypes = CONFIG.roadTypes, zoom = CONFIG.roadTiles.zoom, noExpressways = false, hops = false, onProgress, maxVertices = Infinity } = {}) {
+async function fetchRoadsFromTiles(region, signal, { roadTypes = CONFIG.roadTypes, zoom = CONFIG.roadTiles.zoom, noExpressways = false, hops = false, onProgress, maxVertices = Infinity, connector = null } = {}) {
     const template = await tileTemplate(signal);
     const tiles = tilesCovering(region, zoom);
     const types = new Set(roadTypes);
@@ -85,6 +86,13 @@ async function fetchRoadsFromTiles(region, signal, { roadTypes = CONFIG.roadType
             else if (hops && !line.brunnel) barriers.push(line.pts);
         }
         if (hops) for (const pts of tile.barriers) barriers.push(pts);
+    }
+    // (A line given as [[lat, lng], …], joined to the roads like one: see
+    // corridor connectors in js/pipeline.js.)
+    if (connector) {
+        const n = 2 ** zoom, pts = [];
+        for (const [lat, lng] of connector) pushPoint(pts, Math.round(lngToTileX(lng, n) * TILE_EXTENT), Math.round(latToTileY(lat, n) * TILE_EXTENT));
+        if (pts.length >= 4) lines.push({ highway: "connector", brunnel: false, oneway: 0, expressway: false, driveway: false, restricted: false, pts });
     }
     const noded = nodeLines(lines, zoom);
     if (hops) for (const hop of hopLines(noded, barriers, zoom)) noded.push(hop);
@@ -125,7 +133,10 @@ function loadTile(template, z, x, y, signal) {
         tileStore.set(key, entry);
         return entry;
     }
-    entry = fetchTile(template.replace("{z}", z).replace("{x}", x).replace("{y}", y), signal)
+    // (Across the antimeridian, x is past either end of the row: the tile
+    // is the same, its roads drawn on this side.)
+    const n = 2 ** z;
+    entry = fetchTile(template.replace("{z}", z).replace("{x}", ((x % n) + n) % n).replace("{y}", y), signal)
         .then(buffer => {
             const contents = tileContents(buffer, z, x, y);
             contents.vertices = entry.vertices = contents.lines.reduce((sum, line) => sum + line.pts.length / 2, 0) +
@@ -386,15 +397,21 @@ const NODE_CELL = 64;
 const END_SNAP_M = 2.5;
 // Ends cut at a tile edge, by another such end on the same edge, this much
 // further apart per zoom level below 14: coarser tiles are simplified more,
-// and each tile on its own (zoom 12: tens of meters).
+// and each tile on its own (zoom 12: tens of meters). And at least
+// EDGE_SNAP_UNITS apart (1.5 pixels of a 256-pixel tile, about what each
+// tile's simplification moves a line): a road that runs along a tile edge,
+// in and out of both tiles, is cut into pieces whose ends are that far
+// apart (zoom 12: up to 50 m or so).
 const EDGE_SNAP_M = 7.5;
+const EDGE_SNAP_UNITS = 24;
+const EDGE_SNAP_MAX_M = 1000;
 
 // Splits lines wherever they meet another line, so every junction is a
 // shared vertex. Rules: a line end (or tile-edge cut) touching another line
 // joins it; an inner vertex or a crossing joins only if neither line is a
 // bridge or tunnel. Returns new lines with the same properties.
-function nodeLines(lines, z = CONFIG.roadTiles.zoom) {
-    snapEnds(lines, z);
+function nodeLines(lines, z = CONFIG.roadTiles.zoom, pass = 1) {
+    if (pass === 1) snapEnds(lines, z);
 
     // Segment grid: each segment's box (grown by the join distance) is
     // listed in every cell it overlaps. The (cell, segment) pairs are packed
@@ -462,13 +479,16 @@ function nodeLines(lines, z = CONFIG.roadTiles.zoom) {
             const a = segs[i];
             for (let j = i + 1; j < segs.length; j++) {
                 const b = segs[j];
-                if (segLine[a] === segLine[b]) continue;
+                // (Segments of one line only where they cross: coarse tiles
+                // merge many roads into one line, which can cross itself.)
+                const same = segLine[a] === segLine[b];
+                if (same && Math.abs(segIndex[a] - segIndex[b]) <= 2) continue;
                 // Boxes must overlap; handle each pair only in the cell
                 // holding the corner of their overlap, not in every shared cell.
                 const minX = Math.max(box[4 * a], box[4 * b]), minY = Math.max(box[4 * a + 1], box[4 * b + 1]);
                 if (minX > Math.min(box[4 * a + 2], box[4 * b + 2]) || minY > Math.min(box[4 * a + 3], box[4 * b + 3])) continue;
                 if (cellOf(minX, minX0) !== cx || cellOf(minY, minY0) !== cy) continue;
-                meetSegments(lines, segLine, segIndex, Math.min(a, b), Math.max(a, b), addSplit);
+                meetSegments(lines, segLine, segIndex, Math.min(a, b), Math.max(a, b), addSplit, same);
             }
         }
     }
@@ -491,6 +511,11 @@ function nodeLines(lines, z = CONFIG.roadTiles.zoom) {
         }
         if (pts.length >= 4) out.push({ ...line, pts });
     });
+    // (Split points are rounded to whole units, which moves a line a
+    // little: in coarse tiles, where a unit is tens of meters and roads
+    // are drawn close together, that makes new crossings. A second pass
+    // joins those.)
+    if (z < CONFIG.roadTiles.zoom && pass < 2) return nodeLines(out, z, pass + 1);
     return out;
 }
 
@@ -507,7 +532,10 @@ function snapEnds(lines, z) {
     const midY = lines.length ? lines[0].pts[1] : n / 2;
     const unitM = 40075016.7 * Math.cos(tileYToLat(midY, n) * Math.PI / 180) / n;
     const reach = Math.max(SNAP_UNITS, END_SNAP_M / unitM);
-    const edgeReach = z >= CONFIG.roadTiles.zoom ? reach : Math.max(reach, EDGE_SNAP_M * 2 ** (CONFIG.roadTiles.zoom - z - 1) / unitM);
+    if (z < CONFIG.roadTiles.zoom) {
+        pairEdgeEnds(lines, Math.max(reach, EDGE_SNAP_M * 2 ** (CONFIG.roadTiles.zoom - z - 1) / unitM,
+            Math.min(EDGE_SNAP_UNITS, EDGE_SNAP_MAX_M / unitM)));
+    }
     const cell = Math.max(2, Math.ceil(reach));
     // Ends kept so far, chained per cell.
     const E = 2 * lines.length;
@@ -515,19 +543,15 @@ function snapEnds(lines, z) {
     const head = new Map();
     let count = 0;
     // Returns the point to use for an end: an earlier end close by, or
-    // this one (then kept). An end on a tile edge also takes an end on the
-    // same edge up to edgeReach away.
+    // this one (then kept).
     const snap = (x, y) => {
         const cx = Math.floor(x / cell), cy = Math.floor(y / cell);
-        const onX = x % TILE_EXTENT === 0, onY = y % TILE_EXTENT === 0;
-        const span = onX || onY ? Math.ceil(edgeReach / cell) : 1;
         let best = -1, bestD = Infinity;
-        for (let dx = -span; dx <= span; dx++) {
-            for (let dy = -span; dy <= span; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+            for (let dy = -1; dy <= 1; dy++) {
                 for (let k = head.get((cx + dx) * 2 ** 26 + cy + dy) ?? -1; k >= 0; k = next[k]) {
                     const d = Math.max(Math.abs(endX[k] - x), Math.abs(endY[k] - y));
-                    const sameEdge = (onX && endX[k] === x) || (onY && endY[k] === y);
-                    if ((d <= reach || (sameEdge && d <= edgeReach)) && d < bestD) {
+                    if (d <= reach && d < bestD) {
                         bestD = d;
                         best = k;
                     }
@@ -557,15 +581,89 @@ function snapEnds(lines, z) {
     });
 }
 
-function meetSegments(lines, segLine, segIndex, a, b, addSplit) {
+// Joins the ends of roads cut at tile edges (coarser tiles): on each edge,
+// an end with one on the other side of it up to `reach` along it, closest
+// pairs first, and the same kind of road before another (a road and a
+// railroad side by side are cut a few units apart: joined the wrong way
+// round, the road would be broken). Both ends of a pair are moved to the
+// same point, which snapEnds then joins.
+function pairEdgeEnds(lines, reach) {
+    const edges = new Map();   // edge -> [{ li, i, along, side, kind }]
+    lines.forEach((line, li) => {
+        const p = line.pts, last = p.length - 2;
+        for (const [i, j] of [[0, 2], [last, last - 2]]) {
+            const x = p[i], y = p[i + 1];
+            let key, along, side;
+            if (x % TILE_EXTENT === 0 && p[j] !== x) [key, along, side] = [`x${x}`, y, Math.sign(p[j] - x)];
+            else if (y % TILE_EXTENT === 0 && p[j + 1] !== y) [key, along, side] = [`y${y}`, x, Math.sign(p[j + 1] - y)];
+            else continue;
+            if (!edges.has(key)) edges.set(key, []);
+            edges.get(key).push({ li, i, along, side, kind: line.highway, pair: null });
+        }
+    });
+    const copied = new Set();
+    for (const [key, ends] of edges) {
+        ends.sort((a, b) => a.along - b.along);
+        const pairs = [];
+        for (let a = 0; a < ends.length; a++) {
+            for (let b = a + 1; b < ends.length && ends[b].along - ends[a].along <= reach; b++) {
+                if (ends[a].side === ends[b].side) continue;
+                const d = ends[b].along - ends[a].along;
+                pairs.push([ends[a].kind === ends[b].kind ? d : 4 * d + reach, a, b]);
+            }
+        }
+        pairs.sort((p, q) => p[0] - q[0]);
+        for (const [, a, b] of pairs) {
+            const A = ends[a], B = ends[b];
+            if (A.pair || B.pair) continue;
+            A.pair = B.pair = true;
+            if (A.along === B.along) continue;
+            const at = Math.round((A.along + B.along) / 2);
+            for (const { li, i } of [A, B]) {
+                if (!copied.has(li)) {
+                    copied.add(li);
+                    lines[li] = { ...lines[li], pts: lines[li].pts.slice() };
+                }
+                lines[li].pts[key[0] === "x" ? i + 1 : i] = at;
+            }
+        }
+    }
+}
+
+function meetSegments(lines, segLine, segIndex, a, b, addSplit, sameLine = false) {
     const la = lines[segLine[a]], lb = lines[segLine[b]];
     const pa = la.pts, pb = lb.pts, ia = segIndex[a], ib = segIndex[b];
     const ax = pa[ia], ay = pa[ia + 1], bx = pa[ia + 2], by = pa[ia + 3];
     const cx = pb[ib], cy = pb[ib + 1], dx = pb[ib + 2], dy = pb[ib + 3];
     const flat = !la.brunnel && !lb.brunnel;
 
+    // A proper crossing (first: a vertex of one segment near the other
+    // doesn't mean they don't also cross).
+    const rx = bx - ax, ry = by - ay, sx = dx - cx, sy = dy - cy;
+    const denom = rx * sy - ry * sx;
+    if (flat && denom !== 0) {
+        const t = ((cx - ax) * sy - (cy - ay) * sx) / denom;
+        const u = ((cx - ax) * ry - (cy - ay) * rx) / denom;
+        if (t > 0 && t < 1 && u > 0 && u < 1) {
+            const x = Math.round(ax + t * rx), y = Math.round(ay + t * ry);
+            // A crossing within a unit of a vertex is at that vertex: the
+            // other road is split there (unless it has that vertex too).
+            const near = (px, py) => Math.abs(px - x) <= 1 && Math.abs(py - y) <= 1;
+            const atA = near(ax, ay) ? [ax, ay] : near(bx, by) ? [bx, by] : null;
+            const atB = near(cx, cy) ? [cx, cy] : near(dx, dy) ? [dx, dy] : null;
+            if (atA && atB && atA[0] === atB[0] && atA[1] === atB[1]) return;
+            if (atA) addSplit(b, u, atA[0], atA[1]);
+            else if (atB) addSplit(a, t, atB[0], atB[1]);
+            else {
+                addSplit(a, t, x, y);
+                addSplit(b, u, x, y);
+            }
+            return;
+        }
+    }
+    if (sameLine) return;
+
     // A vertex of one segment on the inside of the other.
-    let touched = false;
     const touch = (px, py, isLineEnd, ownBrunnel, s, sx, sy, ex, ey, otherBrunnel) => {
         if (!flat && !(isLineEnd && !otherBrunnel)) return;
         if (ownBrunnel && !isLineEnd) return;
@@ -579,28 +677,12 @@ function meetSegments(lines, segLine, segIndex, a, b, addSplit) {
         const along = Math.sqrt(len2);
         if (t * along < SNAP_UNITS || (1 - t) * along < SNAP_UNITS) return;
         addSplit(s, t, px, py);
-        touched = true;
     };
     const lastA = pa.length - 2, lastB = pb.length - 2;
     touch(ax, ay, ia === 0, la.brunnel, b, cx, cy, dx, dy, lb.brunnel);
     touch(bx, by, ia + 2 === lastA, la.brunnel, b, cx, cy, dx, dy, lb.brunnel);
     touch(cx, cy, ib === 0, lb.brunnel, a, ax, ay, bx, by, la.brunnel);
     touch(dx, dy, ib + 2 === lastB, lb.brunnel, a, ax, ay, bx, by, la.brunnel);
-    if (touched || !flat) return;
-
-    // A proper crossing.
-    const rx = bx - ax, ry = by - ay, sx = dx - cx, sy = dy - cy;
-    const denom = rx * sy - ry * sx;
-    if (denom === 0) return;
-    const t = ((cx - ax) * sy - (cy - ay) * sx) / denom;
-    const u = ((cx - ax) * ry - (cy - ay) * rx) / denom;
-    if (t <= 0 || t >= 1 || u <= 0 || u >= 1) return;
-    const x = Math.round(ax + t * rx), y = Math.round(ay + t * ry);
-    // A crossing within a unit of a vertex is that vertex.
-    const near = (px, py) => Math.abs(px - x) <= 1 && Math.abs(py - y) <= 1;
-    if (near(ax, ay) || near(bx, by) || near(cx, cy) || near(dx, dy)) return;
-    addSplit(a, t, x, y);
-    addSplit(b, u, x, y);
 }
 
 // --- Fence hops ---------------------------------------------------------

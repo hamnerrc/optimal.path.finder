@@ -4,7 +4,7 @@
 
 const CONFIG = {
     // Release number, as in index.html's ?v= (for the worker's scripts).
-    release: 13,
+    release: 14,
 
     map: {
         initialCenter: [20, 0],
@@ -47,11 +47,20 @@ const CONFIG = {
     // search is repeated with the next margin.
     defaultCoveragePercent: 90,
     areaMargins: [1.2, 1.4],
+    // (Only if the loop got at least this share of the way to the target:
+    // further short, it's the roads in the area that are too few.)
+    widenFrom: 0.5,
 
     // "Hills" slider: meters of extra length a meter of climb counts as
     // while searching (0 to maxClimbCost; see SOLVER.climbCost).
     defaultClimbCost: 3,
     maxClimbCost: 10,
+
+    // Start mode: if no loop fits within reach of a start point, roads up to
+    // startWidening times further out are loaded, and so on up to
+    // startWideningMaxM (see searchStart).
+    startWidening: 2,
+    startWideningMaxM: 32000,
 
     // Default pace for time estimates, in seconds per mile.
     defaultPaceSecPerMile: 540,
@@ -85,22 +94,28 @@ const CONFIG = {
         startRadiusFraction: 0.4,
         // The corridor reaches this share of the rough loop's size (its
         // length / π) to either side, and at least corridorMinM.
-        corridorFraction: 0.03,
+        corridorFraction: 0.05,
         corridorMinM: 1000,
         // At most this many tiles per corridor (see corridorPlan): a
         // narrower corridor, or coarser tiles (down to corridorMinZoom), if
         // needed. Keeps a loop around a whole country quick and its road
         // network small enough for the browser.
         maxCorridorTiles: 1500,
+        // ...and holding at most this many road points (else half as wide).
+        maxCorridorVertices: 1500000,
         corridorMinZoom: 12,
         corridorMinTiles: 0.25,
         // Loops expected to be longer than this (2,000 km) start from
         // motorways, trunk and primary roads of zoom hugeZoom tiles, get at
-        // most hugePasses corridor passes. (Their climb comes from coarse
-        // terrain tiles: an estimate, see addRoadClimb.)
+        // most hugePasses corridor passes, each at least hugeCorridorMinM to
+        // either side (zoom 7 roads can be a kilometer off), of tiles down to
+        // zoom hugeCorridorMinZoom if need be. (Their climb
+        // comes from coarse terrain tiles: an estimate, see addRoadClimb.)
         hugeLoopM: 2000000,
         hugeZoom: 7,
         hugePasses: 1,
+        hugeCorridorMinM: 3000,
+        hugeCorridorMinZoom: 11,
         hugeRoadTypes: ["motorway", "motorway_link", "trunk", "trunk_link", "primary", "primary_link"],
         corridorPasses: 3,
         // A coverage or area range is this much wider each way for the

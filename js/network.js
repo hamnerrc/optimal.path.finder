@@ -87,6 +87,15 @@ function buildRoadNetwork(osmData, region) {
 
     const edges = [];
     let totalMeters = 0;
+    // Stretches already made into edges, either way round: coarse tiles
+    // draw both carriageways of a divided road as the same line, and a
+    // loop can't use a stretch twice (it only splits junctions off into
+    // useless zero-area "bubbles").
+    const seen = new Set();
+    // (Ends, the points next to them and the number of points, from the
+    // lower-numbered end.)
+    const stretchKey = (a, next, prev, b, count) => a < b || (a === b && next <= prev)
+        ? `${a},${next},${b},${count}` : `${b},${prev},${a},${count}`;
 
     for (const { way, pts } of runs) {
         const tags = way.tags || {};
@@ -101,6 +110,13 @@ function buildRoadNetwork(osmData, region) {
             distance += haversine(lats[pts[i - 1]], lngs[pts[i - 1]], lats[k], lngs[k]);
 
             if (kept[k]) {
+                const key = stretchKey(pts[start], pts[start + 1], pts[i - 1], k, i - start);
+                if (seen.has(key)) {
+                    start = i;
+                    distance = 0;
+                    continue;
+                }
+                seen.add(key);
                 // (One flat array: far less memory than a small array per
                 // point, or a typed array per edge.)
                 const coords = [];

@@ -1144,14 +1144,19 @@ function routeNote(result) {
 // What a loop uses that should be checked before running it (marked in
 // orange on the map).
 function flagWarning(flags) {
-    let hops = 0, railM = 0, motorwayM = 0, privateM = 0;
+    let hops = 0, railM = 0, motorwayM = 0, privateM = 0, connectorM = 0;
     for (const { kind, coords } of flags) {
         if (kind === "hop") hops += coords.length - 1;
         else if (kind === "rail") railM += lineLength(coords);
         else if (kind === "motorway") motorwayM += lineLength(coords);
+        else if (kind === "connector") connectorM += lineLength(coords);
         else privateM += lineLength(coords);
     }
     const notes = [];
+    if (connectorM > 0) {
+        notes.push(`${formatDistance(connectorM)} of it follows major roads from simplified maps, where the roads couldn't be loaded in full ` +
+            "detail: it can be a few hundred meters off them there.");
+    }
     if (hops > 0) notes.push(`It uses ${hops} fence hop${hops > 1 ? "s" : ""} (a gap under 10 m between roads that don't connect): check ${hops > 1 ? "they" : "it"} can be crossed.`);
     if (railM > 0) notes.push(`${formatDistance(railM)} of it runs along railroad tracks: only run there where it's allowed.`);
     if (motorwayM > 0) notes.push(`${formatDistance(motorwayM)} of it is on motorways, which are usually closed to people on foot or bike. "Avoid motorways" under Roads & hills leaves them out.`);
@@ -1170,6 +1175,10 @@ function routeWarning(route, result, job) {
     const flagged = flagWarning(route.flags);
     if (flagged) notes.push(flagged);
     if (result.repeats > 0) notes.push("It runs part of a street twice.");
+    if (result.roughOnly) {
+        notes.push("It's on major roads, from simplified maps: the roads along it couldn't be followed in full detail, so it can be " +
+            "a few hundred meters off them in places. A smaller area or target gives a loop on all roads.");
+    }
     notes.push(...missedLimits(result, job));
     if (job.kind === "start") {
         const [lat, lng] = pointAtOffset(route, route.startOffsetM);
@@ -1342,7 +1351,7 @@ function drawRouteDecor() {
     }
     // Stretches to check (see flagWarning); a hop is too short to see from
     // afar, so it also gets a dot.
-    const flagNames = { hop: "Fence hop", rail: "Railroad tracks", motorway: "Motorway", private: "Marked private or no entry" };
+    const flagNames = { hop: "Fence hop", rail: "Railroad tracks", motorway: "Motorway", private: "Marked private or no entry", connector: "Major road from simplified maps" };
     for (const { kind, coords } of route.flags || []) {
         L.polyline(coords, { color: CONFIG.colors.flag, weight: 7, opacity: 0.85, lineCap: "butt" })
             .bindTooltip(flagNames[kind]).addTo(arrowsLayer);

@@ -84,8 +84,9 @@ function terrainTile(key, signal) {
         terrainTiles.set(key, entry);
         return entry;
     }
-    const [z, x, y] = key.split("/");
-    const url = CONFIG.elevation.tileUrl.replace("{z}", z).replace("{x}", x).replace("{y}", y);
+    const [z, x, y] = key.split("/").map(Number);
+    const n = 2 ** z;   // (x past either end: across the antimeridian)
+    const url = CONFIG.elevation.tileUrl.replace("{z}", z).replace("{x}", ((x % n) + n) % n).replace("{y}", y);
     entry = fetch(url, { signal })
         .then(response => {
             if (!response.ok) throw new Error(`Terrain tile download failed (HTTP ${response.status})`);

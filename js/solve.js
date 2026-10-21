@@ -86,6 +86,7 @@ function coordinate(prep, params, engines, { signal, onProgress }) {
                 } else {
                     const err = new Error(message.message);
                     err.workerFailed = Boolean(message.workerFailed) && !reported;
+                    err.noLoop = message.message === noLoopMessage(params);
                     reject(err);
                 }
             }

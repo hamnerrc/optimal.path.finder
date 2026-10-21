@@ -35,23 +35,52 @@
 // options: { signal, onStatus(text, fraction), onLoop(loop, final), onNetwork(network) }
 // Resolves with the final loop: { coords, lengthM, areaM2, iq, coverage, feasible, score, chunked }.
 async function searchLoop(job, options) {
+    if (job.objective.mode === "start") return searchStart(job, options);
     if (job.objective.mode !== "area" || !job.target) return searchRegion(job, options);
 
     let best = null;
     const margins = CONFIG.areaMargins;
     for (let i = 0; i < margins.length; i++) {
         const region = i === 0 ? job.region : marginRegion(job.target, margins[i]);
-        const result = await searchRegion({ ...job, region }, options);
+        let result;
+        try {
+            result = await searchRegion({ ...job, region }, options);
+        } catch (err) {
+            // (No loop at all: maybe with the roads further out.)
+            if (!err.noLoop || best || i === margins.length - 1) throw err;
+            continue;
+        }
         if (!best || isBetterResult(result, best)) best = result;
-        // (Wider margins can't help a loop held back by its length limit.)
+        // (Wider margins can't help a loop held back by its length limit, nor
+        // one far short of its target: the roads in the area are too few,
+        // e.g. 90% of Russia, most of which has none.)
         const limited = job.objective.maxLengthM && best.lengthM >= 0.9 * job.objective.maxLengthM;
-        if (best.feasible || limited || i === margins.length - 1) break;
+        const farShort = (best.coverage ?? 0) < CONFIG.widenFrom * job.objective.coverage;
+        if (best.feasible || limited || farShort || i === margins.length - 1) break;
         const reached = Math.floor((best.coverage ?? 0) * 100);
         options.onLoop(best, false);
         options.onStatus(`Roads near the area only reach ${reached}% coverage. ` +
             `Widening the search to ${Math.round((margins[i + 1] - 1) * 100)}% around it…`, 0);
     }
     return best;
+}
+
+// Start mode. If no loop fits the length limit within reach (a farm road
+// in a grid of mile-long sections, or no roads at all nearby), the roads
+// further out are loaded, so the loop shown is the shortest one around
+// (with a warning that it's too long) rather than none.
+async function searchStart(job, options) {
+    const { start, maxLengthM } = job.objective;
+    for (let k = 0; ; k++) {
+        const radius = maxLengthM / 2 * CONFIG.startWidening ** k;
+        try {
+            return await searchRegion(k === 0 ? job : { ...job, region: createCircleRegion(start, radius) }, options);
+        } catch (err) {
+            if (!err.noLoop) throw err;
+            if (radius >= CONFIG.startWideningMaxM) throw new Error(`No roads that form a loop within ${formatDistance(radius)} of this start point.`);
+            options.onStatus(`No loop within ${formatDistance(maxLengthM)} here. Looking further out…`, 0);
+        }
+    }
 }
 
 async function searchRegion(job, options) {
@@ -82,7 +111,7 @@ async function searchFullDetail(job, { signal, onStatus, onLoop, onNetwork }, ma
     onStatus("Building road network…", 0);
     await nextFrame();
     const network = buildRoadNetwork(osm, job.region);
-    if (network.edges.length === 0) throw new Error("No roads found here.");
+    if (network.edges.length === 0) throw noLoopError("No roads found here.");
     onNetwork(network);
     await loadClimb(network, job, signal, onStatus, 0);
 
@@ -118,7 +147,7 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
     await nextFrame();
     let coarse = buildRoadNetwork(osm, coarseRegion);
     osm = null;   // (no longer needed: memory is tight on big searches)
-    if (coarse.edges.length === 0) throw new Error("No major roads found here.");
+    if (coarse.edges.length === 0) throw noLoopError("No major roads found here.");
     onNetwork(coarse);
     // (The climb too, from coarse terrain tiles here: only an estimate, but
     // enough that the rough loop doesn't settle in the hills, where the
@@ -158,12 +187,32 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
         let fine;
         try {
             prefetch.stop();
-            const { points, zoom, radius, corridor } = corridorAlong(best, objective);
-            console.log(`[Search] Pass ${pass}: corridor ${Math.round(radius)} m, zoom ${zoom}`);
-            const what = pass === 1 ? "the rough loop" : "the improved loop";
-            const kind = zoom === CONFIG.roadTiles.zoom ? "all roads" : "local roads";
-            const local = buildRoadNetwork(await loadRoads(corridor, job.roads, signal, (done, total) =>
-                onStatus(`Loading ${kind} along ${what} (${done} of ${total} tiles)…`, share(0)), Infinity, zoom), corridor);
+            // (Where the roads are very dense, e.g. along a loop across
+            // Java, a narrower corridor, so the network stays small enough
+            // for the browser.)
+            let plan = corridorAlong(best, objective), osmRoads = null;
+            while (!osmRoads) {
+                const { zoom, radius, corridor } = plan;
+                console.log(`[Search] Pass ${pass}: corridor ${Math.round(radius)} m, zoom ${zoom}`);
+                const what = pass === 1 ? "the rough loop" : "the improved loop";
+                const kind = zoom === CONFIG.roadTiles.zoom ? "all roads" : "local roads";
+                // (The first pass also gets the rough loop itself as a
+                // "connector" road: where the roads in the corridor are
+                // broken, e.g. one missing from the tiles for a stretch, the
+                // loop can still get round on it, though it counts as twice
+                // as long, and is flagged; see SOLVER.connectorCost.)
+                const connector = pass === 1 ? best.coords : null;
+                try {
+                    osmRoads = await loadRoads(corridor, job.roads, signal, (done, total) =>
+                        onStatus(`Loading ${kind} along ${what} (${done} of ${total} tiles)…`, share(0)), settings.maxCorridorVertices, zoom, connector);
+                } catch (err) {
+                    if (!err.tooManyRoads || radius <= settings.corridorMinM) throw err;
+                    plan = corridorAlong(best, objective, radius / 2);
+                }
+            }
+            const { points, corridor } = plan;
+            const local = buildRoadNetwork(osmRoads, corridor);
+            osmRoads = null;
             if (local.edges.length === 0) break;
             onNetwork(local);
             await loadClimb(local, job, signal, onStatus, share(0));
@@ -172,7 +221,9 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
             fine = { ...await runSolver(local, { ...solverParams(job), center: best.center, anchor: best.anchor, reference }, {
                 signal,
                 onProgress: ({ fraction, rounds, best: loop }) => {
-                    if (loop && (pass === 1 || isBetterResult(loop, best))) onLoop({ ...loop, chunked: true }, false);
+                    // (Not a loop far worse than the one it improves on: e.g. a
+                    // small one, where the rough loop couldn't be followed.)
+                    if (loop && keeps(loop, best, pass)) onLoop({ ...loop, chunked: true }, false);
                     if (pass < passes) prefetch.offer(loop, fraction);
                     onStatus(pass === 1 ? `Improving the loop with all roads (round ${rounds})…`
                         : `Improving the loop further, pass ${pass} (round ${rounds})…`, share(fraction));
@@ -192,26 +243,42 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
         // helped is the last.
         const gain = pass === 1 || rankOf(fine) < rankOf(best) ? Infinity : (fine.score - best.score) / Math.abs(best.score);
         console.log(`[Search] Pass ${pass}: score ${fine.score.toFixed(4)} (was ${best.score.toFixed(4)})`);
-        const close = pass === 1 && rankOf(fine) <= rankOf(best) && fine.score > 0.9 * best.score;
-        if (close || isBetterResult(fine, best)) best = fine;
+        if (keeps(fine, best, pass)) best = fine;
         else if (pass === 1) break;
-        if (gain < settings.passMinGain) break;
+        // (A loop that needs the connector somewhere can't be improved in a
+        // corridor of roads only.)
+        if (best.connectorM > 0) break;
+        // (Not `gain < passMinGain`: a loop scoring 0, far short of its
+        // target, gains NaN.)
+        if (!(gain >= settings.passMinGain)) break;
         if (pass < passes) onLoop(best, false);
     }
     prefetch.stop();
-    return best;
+    // (Not improved on all roads: see routeWarning in js/app.js.)
+    return best === rough ? { ...best, roughOnly: true } : best;
 }
+
+// Whether a corridor pass's loop replaces the loop it started from: if it's
+// better, or (first pass) not far worse; see searchStaged. (The rough loop
+// counts as missing every limit, as that's known only on all roads: the
+// first pass's loop replaces it if it meets them all, or is at least half
+// as good. Not a small loop that covers next to nothing, where the rough
+// loop couldn't be followed.)
+const keeps = (loop, from, pass) => pass === 1
+    ? rankOf(loop) === 0 || (isBetterResult(loop, from) && loop.score > 0.5 * from.score) ||
+        (rankOf(loop) <= rankOf(from) && loop.score > 0.9 * from.score)
+    : isBetterResult(loop, from);
 
 // The corridor of all roads along a loop for the next pass (see
 // corridorPlan): { points (of the line it follows), zoom, radius, corridor }.
-function corridorAlong(loop, objective) {
+function corridorAlong(loop, objective, maxRadius = Infinity) {
     let line = loopPart(loop);
     if (objective.mode === "start") line = [objective.start, ...line];
     // (At least a point per km: on a loop around a state, 400 points would
     // stray kilometers from its roads.)
     const points = Math.max(400, Math.ceil(loop.lengthM / 1000));
     line = simplifyLine(line, points);
-    const { zoom, radius } = corridorPlan(line, loop.lengthM);
+    const { zoom, radius } = corridorPlan(line, loop.lengthM, maxRadius);
     return { points, zoom, radius, corridor: createCorridorRegion(line, radius) };
 }
 
@@ -266,12 +333,12 @@ function prefetchRoads(job) {
 // can't be reached (without fence hops there). onProgress(done, total)
 // counts tiles. Fails with err.tooManyRoads if the tiles hold more than
 // maxVertices road points.
-async function loadRoads(region, roads, signal, onProgress, maxVertices = Infinity, zoom = CONFIG.roadTiles.zoom) {
+async function loadRoads(region, roads, signal, onProgress, maxVertices = Infinity, zoom = CONFIG.roadTiles.zoom, connector = null) {
     const roadTypes = roadTypesFor(roads);
     try {
         // (Fence hops need the paths and dead ends only full-detail tiles have.)
         const hops = Boolean(roads?.hops) && zoom === CONFIG.roadTiles.zoom;
-        return await fetchRoadsFromTiles(region, signal, { roadTypes, zoom, noExpressways: Boolean(roads?.noMotorways), hops, onProgress, maxVertices });
+        return await fetchRoadsFromTiles(region, signal, { roadTypes, zoom, noExpressways: Boolean(roads?.noMotorways), hops, onProgress, maxVertices, connector });
     } catch (err) {
         if (err.name === "AbortError" || err.tooManyRoads) throw err;
         console.warn("[Roads] Tiles unavailable, using Overpass:", err);
@@ -317,25 +384,55 @@ function expectedLoopLength(objective) {
 // times the area each, narrowing the corridor at the coarsest if needed.
 // Keeps a loop around a whole country quick and its road network small
 // enough for the browser.
-function corridorPlan(line, lengthM) {
+function corridorPlan(line, lengthM, maxRadius = Infinity) {
     const settings = CONFIG.chunked;
-    const wanted = Math.max(settings.corridorMinM, settings.corridorFraction * lengthM / Math.PI);
+    const wanted = Math.min(maxRadius, Math.max(settings.corridorMinM, settings.corridorFraction * lengthM / Math.PI));
     // About how many tiles a corridor takes (counting them exactly is slow
-    // for a wide corridor of small tiles).
-    let lineM = 0;
+    // for a wide corridor of small tiles), at the line's middle latitude.
+    let lineM = 0, lat = 0;
     for (let i = 1; i < line.length; i++) lineM += haversine(line[i - 1].lat, line[i - 1].lng, line[i].lat, line[i].lng);
-    const tileM = (zoom) => 40075016.7 * Math.cos(line[0].lat * DEG) / 2 ** zoom;
+    for (const p of line) lat += p.lat / line.length;
+    const tileM = (zoom) => 40075016.7 * Math.cos(lat * DEG) / 2 ** zoom;
     const count = (zoom, radius) => lineM * (2 * radius + tileM(zoom)) / tileM(zoom) ** 2;
-    for (let zoom = CONFIG.roadTiles.zoom; zoom > settings.corridorMinZoom; zoom--) {
-        if (count(zoom, wanted) <= settings.maxCorridorTiles) return { zoom, radius: wanted };
+    // (Not narrower than corridorMinTiles tiles, nor for a huge loop than
+    // hugeCorridorMinM: a rough loop from coarse tiles can be a kilometer
+    // or more off its roads.)
+    const least = lengthM > settings.hugeLoopM ? settings.hugeCorridorMinM : settings.corridorMinM;
+    const narrowest = (zoom) => Math.max(least, tileM(zoom) * settings.corridorMinTiles);
+    // (A huge loop may use zoom 11 tiles: no streets, but four times the
+    // area per tile.)
+    const minZoom = lengthM > settings.hugeLoopM ? settings.hugeCorridorMinZoom : settings.corridorMinZoom;
+    let plan = null;
+    for (let zoom = CONFIG.roadTiles.zoom; zoom > minZoom && !plan; zoom--) {
+        if (count(zoom, wanted) <= settings.maxCorridorTiles) plan = { zoom, radius: wanted };
     }
-    // (Not narrower than corridorMinTiles tiles: a rough loop from coarse
-    // tiles can be a kilometer or more off its roads.)
-    const zoom = settings.corridorMinZoom;
-    const narrowest = Math.max(settings.corridorMinM, tileM(zoom) * settings.corridorMinTiles);
-    let radius = wanted;
-    while (radius > narrowest && count(zoom, radius) > settings.maxCorridorTiles) radius = Math.max(narrowest, radius * 0.85);
-    return { zoom, radius };
+    // (Zoom 11 only if even the narrowest corridor of zoom 12 would take
+    // twice the most: they have more roads to go round a gap in.)
+    const z12 = settings.corridorMinZoom;
+    if (!plan && minZoom < z12 && count(z12, narrowest(z12)) <= 2 * settings.maxCorridorTiles) {
+        let radius = wanted;
+        while (radius > narrowest(z12) && count(z12, radius) > settings.maxCorridorTiles) radius = Math.max(narrowest(z12), radius * 0.85);
+        plan = { zoom: z12, radius };
+    }
+    if (!plan) {
+        const zoom = minZoom;
+        let radius = wanted;
+        while (radius > narrowest(zoom) && count(zoom, radius) > settings.maxCorridorTiles) radius = Math.max(narrowest(zoom), radius * 0.85);
+        plan = { zoom, radius };
+    }
+    // The estimate can be well off (a zigzag line, or one along the
+    // diagonal, crosses more tiles): checked, and the corridor narrowed (or
+    // made of coarser tiles) until it's no more than about the most.
+    for (let k = 0; k < 12; k++) {
+        const tiles = tilesAlongCorridor({ points: line, radiusMeters: plan.radius }, plan.zoom).length;
+        const most = (plan.zoom === z12 && minZoom < z12 ? 2 : 1) * settings.maxCorridorTiles;
+        if (tiles <= 1.2 * most) break;
+        const radius = Math.max(narrowest(plan.zoom), plan.radius * Math.max(0.5, most / tiles));
+        if (radius < plan.radius) plan = { zoom: plan.zoom, radius };
+        else if (plan.zoom > minZoom) plan = { zoom: plan.zoom - 1, radius: plan.radius };
+        else break;
+    }
+    return plan;
 }
 
 // Road types for a search's road options:

@@ -123,8 +123,43 @@ const SOLVER = {
     // searchStaged): motorways and trunk roads count as this much longer.
     avoidedRoadCost: 0.5,
     avoidedRoads: ["motorway", "motorway_link", "trunk", "trunk_link"],
+    // A big search's corridor connector (the rough loop, see searchStaged):
+    // counts as this much longer, so it's only used where the roads in the
+    // corridor don't get round.
+    connectorCost: 1,
     // Private stretches shorter than this aren't flagged (expandLoop).
-    minPrivateM: 50
+    minPrivateM: 50,
+    // Tracing a rough loop on all roads (traceLoop): a way between two
+    // stops longer than traceDetour × the distance + traceGapM is a gap in
+    // the roads, skipped by going on to a later stop; and cutting out more
+    // than traceCutMin junctions and a third of the way so far means it
+    // can't be followed.
+    traceDetour: 3,
+    traceGapM: 20000,
+    traceCutMin: 200,
+    // ...and junctions more than traceRecent back along the way so far are
+    // avoided (see traceLoop).
+    traceRecent: 100,
+    // Area mode, a loop with less than spotsBelow × the target's radius
+    // (about a fifth of the target or less): spots to centre sweeps on
+    // (see SweepSearch.spots), from a grid of about spotGrid points, each
+    // checked at spotRing points round it; at most maxSpots.
+    spotsBelow: 0.45,
+    spotGrid: 1500,
+    spotRing: 16,
+    maxSpots: 200,
+    // Points on a circle followed along the roads (SweepSearch.circleLoop).
+    circleStops: 64,
+    // Loops grown or traced round a circle (SweepSearch.growLoop,
+    // circleLoop): for every sweep that finds no loop (centred on a spot, or
+    // while there's no loop meeting the coverage target); and while the
+    // best loop misses the target after fallbackAfter sweeps, for the next
+    // fallbackSweeps sweeps, then every fourth.
+    fallbackAfter: 6,
+    fallbackSweeps: 12,
+    // Two roads between the same junctions enclosing less than this
+    // average width are one road twice (see prepareGraph).
+    bubbleWidthM: 15
 };
 
 // --------------------------------------------------------------------------
@@ -205,7 +240,8 @@ function prepareGraph(network, params) {
         oLen[e] = edge.distance;
         oExtra[e] = (params.preferFlat ? (params.climbCost ?? SOLVER.climbCost) * (edge.climb || 0) : 0) +
             (params.preferSmall ? (SOLVER.bigRoadCost[edge.highway] || 0) * edge.distance : 0) +
-            (params.avoidMotorways && SOLVER.avoidedRoads.includes(edge.highway) ? SOLVER.avoidedRoadCost * edge.distance : 0);
+            (params.avoidMotorways && SOLVER.avoidedRoads.includes(edge.highway) ? SOLVER.avoidedRoadCost * edge.distance : 0) +
+            (edge.highway === "connector" ? SOLVER.connectorCost * edge.distance : 0);
         let cross = 0;
         const c = edge.pts;
         for (let i = 2; i < c.length; i += 2) {
@@ -220,84 +256,122 @@ function prepareGraph(network, params) {
     const other = (e, u) => oFrom[e] === u ? oTo[e] : oFrom[e];
 
     const main = largestComponent({ N, eFrom: oFrom, eTo: oTo, adjOff, adjEdge });
-    if (main.size < 3) throw new Error("The road network here is too small to make a loop.");
+    if (main.size < 3) throw noLoopError("The road network here is too small to make a loop.");
 
-    // 1. Prune to the 2-core: repeatedly remove nodes with fewer than two
-    //    streets. What's left is every junction a ring can pass through.
-    const alive = Uint8Array.from(main);
-    const deg = new Int32Array(N);
-    for (let e = 0; e < E0; e++) {
-        if (alive[oFrom[e]]) {
-            deg[oFrom[e]]++;
-            deg[oTo[e]]++;
+    // Steps 1 and 2 repeat while they leave thin "bubbles" (see below).
+    const dead = new Uint8Array(E0);   // original edges left out
+    let alive, deg, isJunction, chains;
+    for (let round = 0; ; round++) {
+        // 1. Prune to the 2-core: repeatedly remove nodes with fewer than two
+        //    streets. What's left is every junction a ring can pass through.
+        alive = Uint8Array.from(main);
+        deg = new Int32Array(N);
+        for (let e = 0; e < E0; e++) {
+            if (alive[oFrom[e]] && !dead[e]) {
+                deg[oFrom[e]]++;
+                deg[oTo[e]]++;
+            }
         }
-    }
-    const stack = [];
-    for (let i = 0; i < N; i++) if (alive[i] && deg[i] < 2) stack.push(i);
-    while (stack.length) {
-        const u = stack.pop();
-        if (!alive[u]) continue;
-        alive[u] = 0;
-        for (let k = adjOff[u]; k < adjOff[u + 1]; k++) {
-            const v = other(adjEdge[k], u);
-            if (alive[v] && --deg[v] < 2) stack.push(v);
+        const stack = [];
+        for (let i = 0; i < N; i++) if (alive[i] && deg[i] < 2) stack.push(i);
+        while (stack.length) {
+            const u = stack.pop();
+            if (!alive[u]) continue;
+            alive[u] = 0;
+            for (let k = adjOff[u]; k < adjOff[u + 1]; k++) {
+                if (dead[adjEdge[k]]) continue;
+                const v = other(adjEdge[k], u);
+                if (alive[v] && --deg[v] < 2) stack.push(v);
+            }
         }
-    }
 
-    // 2. Merge chains of two-street nodes into single edges between
-    //    junctions. A chain that comes back to its own junction (a loop road
-    //    hanging off one corner) or a ring with no junction at all is split
-    //    at a middle node, so it can still be used.
-    const isJunction = new Uint8Array(N);
-    for (let i = 0; i < N; i++) if (alive[i] && deg[i] !== 2) isJunction[i] = 1;
-    let chains;
-    for (let pass = 0; ; pass++) {
-        chains = [];
-        const usedEdge = new Uint8Array(E0);
-        const covered = new Uint8Array(N);
-        for (let b = 0; b < N; b++) {
-            if (!isJunction[b]) continue;
-            covered[b] = 1;
-            for (let k = adjOff[b]; k < adjOff[b + 1]; k++) {
-                let e = adjEdge[k];
-                if (usedEdge[e] || !alive[other(e, b)]) continue;
-                const chain = { from: b, to: -1, edges: [], interior: [] };
-                let at = b;
-                for (;;) {
-                    usedEdge[e] = 1;
-                    chain.edges.push(e);
-                    at = other(e, at);
-                    if (isJunction[at]) break;
-                    chain.interior.push(at);
-                    covered[at] = 1;
-                    let next = -1;
-                    for (let j = adjOff[at]; j < adjOff[at + 1]; j++) {
-                        const f = adjEdge[j];
-                        if (f !== e && alive[other(f, at)]) next = f;
+        // 2. Merge chains of two-street nodes into single edges between
+        //    junctions. A chain that comes back to its own junction (a loop road
+        //    hanging off one corner) or a ring with no junction at all is split
+        //    at a middle node, so it can still be used.
+        isJunction = new Uint8Array(N);
+        for (let i = 0; i < N; i++) if (alive[i] && deg[i] !== 2) isJunction[i] = 1;
+        for (let pass = 0; ; pass++) {
+            chains = [];
+            const usedEdge = new Uint8Array(E0);
+            const covered = new Uint8Array(N);
+            for (let b = 0; b < N; b++) {
+                if (!isJunction[b]) continue;
+                covered[b] = 1;
+                for (let k = adjOff[b]; k < adjOff[b + 1]; k++) {
+                    let e = adjEdge[k];
+                    if (usedEdge[e] || dead[e] || !alive[other(e, b)]) continue;
+                    const chain = { from: b, to: -1, edges: [], interior: [] };
+                    let at = b;
+                    for (;;) {
+                        usedEdge[e] = 1;
+                        chain.edges.push(e);
+                        at = other(e, at);
+                        if (isJunction[at]) break;
+                        chain.interior.push(at);
+                        covered[at] = 1;
+                        let next = -1;
+                        for (let j = adjOff[at]; j < adjOff[at + 1]; j++) {
+                            const f = adjEdge[j];
+                            if (f !== e && !dead[f] && alive[other(f, at)]) next = f;
+                        }
+                        e = next;
                     }
-                    e = next;
+                    chain.to = at;
+                    chains.push(chain);
                 }
-                chain.to = at;
-                chains.push(chain);
             }
+            let split = false;
+            for (const chain of chains) {
+                if (chain.from === chain.to) {
+                    isJunction[chain.interior[chain.interior.length >> 1]] = 1;
+                    split = true;
+                }
+            }
+            for (let i = 0; i < N; i++) {
+                if (alive[i] && !covered[i]) {
+                    isJunction[i] = 1;   // a ring with no junction on it
+                    split = true;
+                    break;
+                }
+            }
+            if (!split || pass > 6) break;
         }
-        let split = false;
+        chains = chains.filter(c => c.from !== c.to);
+
+        // Two roads between the same junctions that run (almost) along each
+        // other: both carriageways of a divided road, drawn apart by a few
+        // meters. A loop gains nothing from the thin "bubble" between them,
+        // and junctions on one can't start a loop (see sweepLoop), so one of
+        // them is left out, and the pruning above done again.
+        if (round >= 3) break;
+        const byEnds = new Map();
+        let dropped = 0;
         for (const chain of chains) {
-            if (chain.from === chain.to) {
-                isJunction[chain.interior[chain.interior.length >> 1]] = 1;
-                split = true;
+            let len = 0, cross = 0, at = chain.from;
+            for (const oe of chain.edges) {
+                len += oLen[oe];
+                cross += (oFrom[oe] === at ? 1 : -1) * oCross[oe];
+                at = other(oe, at);
+            }
+            const forward = chain.from < chain.to;
+            const key = forward ? chain.from * N + chain.to : chain.to * N + chain.from;
+            const mine = { len, cross: forward ? cross : -cross, chain };
+            const list = byEnds.get(key);
+            if (!list) {
+                byEnds.set(key, [mine]);
+                continue;
+            }
+            const twin = list.find(o => Math.abs(o.cross - mine.cross) / 2 < SOLVER.bubbleWidthM * Math.max(o.len, len));
+            if (twin) {
+                for (const oe of chain.edges) dead[oe] = 1;
+                dropped++;
+            } else {
+                list.push(mine);
             }
         }
-        for (let i = 0; i < N; i++) {
-            if (alive[i] && !covered[i]) {
-                isJunction[i] = 1;   // a ring with no junction on it
-                split = true;
-                break;
-            }
-        }
-        if (!split || pass > 6) break;
+        if (!dropped) break;
     }
-    chains = chains.filter(c => c.from !== c.to);
 
     const cid = new Int32Array(N).fill(-1);
     const cOrig = [];
@@ -309,7 +383,7 @@ function prepareGraph(network, params) {
     }
     const M = cOrig.length;
     const E = chains.length;
-    if (M < 2 || E < 2) throw new Error("There are no roads here that form a loop.");
+    if (M < 2 || E < 2) throw noLoopError("There are no roads here that form a loop.");
 
     const x = new Float64Array(M);
     const y = new Float64Array(M);
@@ -418,7 +492,9 @@ function prepareGraph(network, params) {
                 startOrig = i;
             }
         }
-        const { dist, prevEdge } = shortestPaths(N, adjOff, adjEdge, oFrom, oTo, oLen, startOrig, params.maxLengthM / 2);
+        // (Further if the roads are loaded further: see searchLoop.)
+        const reach = Math.max(params.maxLengthM / 2, network.region?.radiusMeters || 0);
+        const { dist, prevEdge } = shortestPaths(N, adjOff, adjEdge, oFrom, oTo, oLen, startOrig, reach);
         data.nStem = Float64Array.from(cOrig, i => dist[i]);
         data.startX = ox[startOrig];
         data.startY = oy[startOrig];
@@ -507,6 +583,7 @@ function largestComponent(g) {
 //   P, pFrom, pTo, pLen   pieces
 //   pCut, vCut            piece ends made by a split (bit 1: from, 2: to),
 //                         and vertices that have such ends
+//   vMain                 vertices of the biggest 2-connected part
 //   pEdge                 merged edge of each piece; pieces of edge e are
 //                         ePiece[eOff[e]…eOff[e+1]) in order from eFrom
 //   vOff, vPiece          pieces at each vertex
@@ -690,8 +767,22 @@ function buildFaces(N, eFrom, eTo, eLen, lines, target) {
         if (pCut[p] & 2) vCut[pTo[p]] = 1;
     }
 
+    // The vertices of the biggest 2-connected part (by length of road):
+    // where every big loop runs. A sweep started elsewhere (on a pocket of
+    // roads hanging off the rest by one junction) finds at most that pocket.
+    const partLen = new Float64Array(P);
+    let mainPart = 0;
+    for (let p = 0; p < P; p++) {
+        partLen[comp[p]] += pLen[p];
+        if (partLen[comp[p]] > partLen[mainPart]) mainPart = comp[p];
+    }
+    const vMain = new Uint8Array(V);
+    for (let p = 0; p < P; p++) {
+        if (comp[p] === mainPart) vMain[pFrom[p]] = vMain[pTo[p]] = 1;
+    }
+
     const faces = {
-        V, vX, vY, vCut, P, pFrom: Int32Array.from(pFrom), pTo: Int32Array.from(pTo), pLen: Float64Array.from(pLen),
+        V, vX, vY, vCut, vMain, P, pFrom: Int32Array.from(pFrom), pTo: Int32Array.from(pTo), pLen: Float64Array.from(pLen),
         pCut: Uint8Array.from(pCut), pCross: Float64Array.from(pCross),
         pEdge: Int32Array.from(pEdge), eOff, vOff, vPiece,
         F, hFace, faceOff: Int32Array.from(faceOff), faceHalf: Int32Array.from(faceHalf),
@@ -2174,7 +2265,54 @@ class SweepSearch {
             this.reach = Math.min(Math.max(Math.sqrt(coverage), Math.sqrt((minAreaM2 || 0) / this.targetArea)),
                 (maxLengthM || Infinity) / (2 * Math.PI * r), Math.sqrt((maxAreaM2 || Infinity) / this.targetArea));
             this.anchor = params.anchor ? project(params.anchor) : null;
+            // The radius of a circle as big as the loop asked for. Much
+            // smaller than the target, the loop can be anywhere in it: then
+            // every other sweep is centred on one of the spots where the
+            // roads allow a loop that size (see spots), not near the middle,
+            // which can have no roads round it (Siberia, the Amazon).
+            const want = (maxCoverage ? (coverage + maxCoverage) / 2 : coverage) * this.targetArea;
+            this.loopRadius = Math.min(Math.sqrt(Math.max(want, minAreaM2 || 0) / Math.PI), (maxLengthM || Infinity) / (2 * Math.PI),
+                Math.sqrt((maxAreaM2 || Infinity) / Math.PI));
+            this.spotted = !params.center && this.loopRadius < SOLVER.spotsBelow * this.radius;
         }
+    }
+
+    // Spots for a loop of loopRadius: points of a grid over the target
+    // around which a circle that size has roads near most of it, and is at
+    // least half inside the target, best first. Computed once.
+    spots() {
+        if (this.spotList) return this.spotList;
+        const { g, targetXY } = this;
+        const rc = this.loopRadius, nearest = this.nearestMain();
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const p of targetXY) {
+            minX = Math.min(minX, p.x);
+            maxX = Math.max(maxX, p.x);
+            minY = Math.min(minY, p.y);
+            maxY = Math.max(maxY, p.y);
+        }
+        const step = Math.max(rc / 2, Math.sqrt((maxX - minX) * (maxY - minY) / SOLVER.spotGrid));
+        const ring = SOLVER.spotRing, list = [];
+        for (let y = minY + step / 2; y < maxY; y += step) {
+            for (let x = minX + step / 2; x < maxX; x += step) {
+                if (!insideRing(targetXY, x, y)) continue;
+                // (Roads round it, and enough of it inside the target: a
+                // loop can follow roads outside it for a stretch.)
+                let roads = 0, inside = 0;
+                for (let k = 0; k < ring; k++) {
+                    const px = x + rc * Math.cos(2 * Math.PI * k / ring), py = y + rc * Math.sin(2 * Math.PI * k / ring);
+                    if (insideRing(targetXY, px, py)) inside++;
+                    const n = nearest(px, py);
+                    if (n >= 0 && (g.x[n] - px) ** 2 + (g.y[n] - py) ** 2 < (0.35 * rc) ** 2) roads++;
+                }
+                list.push({ x, y, roads, inside, score: roads + inside });
+            }
+        }
+        list.sort((a, b) => b.score - a.score);
+        // (The ones with roads most of the way round, or the best few.)
+        const good = list.filter(p => p.roads >= 0.75 * ring && p.inside >= ring / 2);
+        this.spotList = (good.length ? good : list.filter(p => p.roads >= ring / 2).slice(0, 10)).slice(0, SOLVER.maxSpots);
+        return this.spotList;
     }
 
     leader() {
@@ -2203,15 +2341,16 @@ class SweepSearch {
             // this search's first sweep goes in order along the rough loop
             // too, which can't cross itself, and is preferred if about as
             // good: everything after it can be polished.)
+            // (If it can't be traced at all, e.g. where the rough loop comes
+            // back close to itself, only that sweep in order along it.)
             const clean = traced && this.polishLoop(traced, true);
             this.alongFirst = !clean;
             const loop = clean || (traced && this.measureLoop(traced));
-            // (Then the roads along it are broken somewhere: searching them
-            // blindly would only find small loops, slowly.)
-            if (!loop) throw new Error("Couldn't follow the rough loop on these roads.");
-            const cand = this.candidate(loop, loop.join, loop.stem, this.fixedCenter);
-            cand.centroid = loopCentroid(g, cand.edges, cand.dirs);
-            this.best = cand;
+            if (loop) {
+                const cand = this.candidate(loop, loop.join, loop.stem, this.fixedCenter);
+                cand.centroid = loopCentroid(g, cand.edges, cand.dirs);
+                this.best = cand;
+            }
         }
         // Improving a rough loop: after the first sweep, mostly reroute the
         // best loop stretch by stretch.
@@ -2231,7 +2370,7 @@ class SweepSearch {
         const recentre = this.best && recentreSlot;
         const fresh = this.worker + this.workers * (this.rounds - Math.floor(this.rounds / every));
         const [u, v, w] = r3(recentreSlot ? 1e6 + i : fresh);
-        let center;
+        let center, spotted = false;
         if (this.fixedCenter) {
             // Improving a rough loop: its own centre first, then nearby.
             const spread = i === 0 ? 0 : 0.15 * this.radius * Math.sqrt(u);
@@ -2246,6 +2385,11 @@ class SweepSearch {
             // anywhere on it), now and then anywhere nearer.
             const r = this.radius * (i % 5 === 4 ? Math.sqrt(0.04 + 1.1 * u) : 0.6 + 0.6 * u);
             center = { x: this.origin.x + r * Math.cos(2 * Math.PI * v), y: this.origin.y + r * Math.sin(2 * Math.PI * v) };
+        } else if (this.spotted && fresh % 2 === 1 && this.spots().length) {
+            const spots = this.spots(), spot = spots[Math.floor(u * spots.length)];
+            const r = 0.15 * this.loopRadius * Math.sqrt(w);
+            center = { x: spot.x + r * Math.cos(2 * Math.PI * v), y: spot.y + r * Math.sin(2 * Math.PI * v) };
+            spotted = true;
         } else {
             const r = 0.35 * this.radius * Math.sqrt(u);
             center = { x: this.origin.x + r * Math.cos(2 * Math.PI * v), y: this.origin.y + r * Math.sin(2 * Math.PI * v) };
@@ -2258,7 +2402,6 @@ class SweepSearch {
             s = this.joins[k];
             stem = g.nStem[s];
             budget = this.params.maxLengthM - 2 * stem;
-            if (budget <= 0) return;
         } else {
             // A junction on the target's outline (or the rough loop's), in a
             // direction that turns by the golden angle each sweep.
@@ -2271,8 +2414,15 @@ class SweepSearch {
             // (No further out than the largest share asked for.)
             const top = Math.max(k, Math.min(1.05, Math.sqrt(this.params.maxCoverage || Infinity)));
             const scale = this.params.maxClimbM != null && i % 2 === 1 ? k * (0.25 + 0.75 * spread) : k + (top - k) * spread;
-            const at = this.anchor && (this.fixedCenter || i % 2 === 0) ? this.anchor : outlinePoint(this.targetXY, center, phi, scale);
-            s = nearestJunction(g, at.x, at.y, n => !g.faces.vCut[n]);
+            let at = this.anchor && (this.fixedCenter || i % 2 === 0) ? this.anchor : outlinePoint(this.targetXY, center, phi, scale);
+            if (spotted) {
+                // (Round a spot: a circle of the size asked for, or a little
+                // bigger, within the target.)
+                const far = outlinePoint(this.targetXY, center, phi, 1);
+                const r = Math.min(this.loopRadius * (1 + 0.25 * spread), 0.97 * Math.hypot(far.x - center.x, far.y - center.y));
+                at = { x: center.x + r * Math.cos(phi), y: center.y + r * Math.sin(phi) };
+            }
+            s = nearestJunction(g, at.x, at.y, n => !g.faces.vCut[n] && g.faces.vMain[n] && straddles(g.faces, n, center));
             budget = this.budget;
             const weights = SOLVER.coverageWeights;
             mu = weights[(i + (i / weights.length | 0)) % weights.length];
@@ -2294,24 +2444,84 @@ class SweepSearch {
         // Marginal area per meter of length for a round loop of this size.
         // (Area mode: a round loop of the target's size, or with an upper
         // bound on coverage, of the size asked for.)
-        const size = this.params.maxCoverage ? Math.sqrt((this.params.coverage + this.params.maxCoverage) / 2 * this.targetArea / Math.PI) : this.radius;
+        const size = spotted ? this.loopRadius
+            : this.params.maxCoverage ? Math.sqrt((this.params.coverage + this.params.maxCoverage) / 2 * this.targetArea / Math.PI) : this.radius;
         const lambda = 0.8 * (isStart ? budget : Math.min(2 * Math.PI * size, this.budget)) / (2 * Math.PI) * (1 + mu);
         // Improving a rough loop: the first sweep goes in order along it
         // rather than around the centre, so it can follow its every wiggle.
         const along = this.along && (i === 1 || alongFirst) ? this.along : null;
-        const swept = sweepLoop(g, s, center.x, center.y, budget,
-            { K: SOLVER.lengthBuckets, mu, lambda, target, close, climbWeight, order: along?.order, period: along?.period }, this.scratch);
+        let swept = budget > 0 ? sweepLoop(g, s, center.x, center.y, budget,
+            { K: SOLVER.lengthBuckets, mu, lambda, target, close, climbWeight, order: along?.order, period: along?.period }, this.scratch) : null;
         this.evaluations++;
-        if (!swept) return;
-        let cand = this.candidate(swept, s, stem, center);
+        if (swept) this.consider(swept, s, stem, center, alongFirst);
+        if (isStart) {
+            // Where no loop through the start fits the length (or a sweep
+            // finds none on a sparse map), one grown block by block, which
+            // may be too long: better than none, and the warning says so.
+            if (!swept && (!this.best || rankOf(this.best) > 0)) {
+                const grown = this.growLoop(center);
+                if (grown) this.consider(grown, grown.join, grown.stem, center, false, true);
+            }
+            return;
+        }
+        // Where no loop moves forward in angle all the way round, or none
+        // that reaches the coverage target (a long thin country, a sparse
+        // map of major roads): also a loop grown block by block.
+        // Also, as these sweeps find nothing on such a map, a circle of the
+        // size asked for followed along the roads. (While the target is out
+        // of reach, after the first few sweeps only now and then: polishing
+        // these takes a while, and it may be out of reach for good.)
+        const after = this.rounds - SOLVER.fallbackAfter;
+        const missing = this.best && rankOf(this.best) >= 2 && after >= 0 && (after < SOLVER.fallbackSweeps || i % 4 === 0);
+        const failed = !swept && (spotted || !this.best || rankOf(this.best) >= 2);
+        if (!this.fixedCenter && (failed || missing)) {
+            // (A little bigger: the roads round it are mostly further in.)
+            const r = (spotted ? this.loopRadius : this.radius * this.reach) * (1.05 + 0.3 * ((i * 0.381966) % 1));
+            const traced = this.circleLoop(center, r);
+            if (traced) this.consider(traced, traced.join, 0, center, false, true);
+            const grown = this.growLoop(center);
+            if (grown) this.consider(grown, grown.join, 0, center, false, true);
+        }
+    }
 
-        // Polish loops that come close to the best sweep so far, block by
-        // block.
+    // A loop along the roads round a circle (see traceLoop), or null.
+    circleLoop(center, radius) {
+        const ring = Array.from({ length: SOLVER.circleStops }, (_, k) => ({
+            x: center.x + radius * Math.cos(2 * Math.PI * k / SOLVER.circleStops),
+            y: center.y + radius * Math.sin(2 * Math.PI * k / SOLVER.circleStops)
+        }));
+        // (Stops a 2000th of the way round apart: a circle across a country
+        // mostly far from any road would otherwise take a long while.)
+        const loop = untangleLoop(this.g, traceLoop(this.g, ring, this.nearestMain(), Math.max(300, 2 * Math.PI * radius / 2000)));
+        return loop && this.measureLoop(loop);
+    }
+
+    // Finds the junction of the main part of the map nearest a point.
+    nearestMain() {
+        if (!this.findMain) {
+            const { g } = this, F = g.faces;
+            const main = [];
+            for (let n = 0; n < g.N; n++) if (F.vMain[n] && !F.vCut[n]) main.push(n);
+            const find = junctionFinder({ N: main.length, x: Float64Array.from(main, n => g.x[n]), y: Float64Array.from(main, n => g.y[n]) });
+            this.findMain = (px, py) => {
+                const k = find(px, py);
+                return k < 0 ? -1 : main[k];
+            };
+        }
+        return this.findMain;
+    }
+
+    // A loop found by a sweep: polished block by block if it comes close to
+    // the best sweep so far (always: a loop grown or traced round a circle,
+    // which is rarely good as it is), and kept if it's the best.
+    consider(swept, s, stem, center, alongFirst, polish = false) {
+        const { isStart, g } = this;
+        let cand = this.candidate(swept, s, stem, center);
         const best = this.best;
         const top = this.bestSwept;
         if (!top || isBetterResult(cand, top)) this.bestSwept = cand;
         const within = isStart ? 0 : SOLVER.polishWithin;
-        if (!top || rankOf(cand) <= rankOf(top) && cand.score >= top.score * (1 - within)) {
+        if (polish || !top || rankOf(cand) <= rankOf(top) && cand.score >= top.score * (1 - within)) {
             const polished = this.polishLoop(swept);
             if (polished) {
                 const next = this.candidate(polished, isStart ? polished.join : s, polished.stem, center);
@@ -2561,13 +2771,24 @@ class SweepSearch {
             ys.push(g.y[v]);
             if (join < 0 || (g.nStem && g.nStem[v] < g.nStem[join])) join = v;
         });
-        const covered = this.isStart ? 0 : createCoverageMeter(this.targetXY).measure(xs, ys) * this.targetArea;
+        this.meter ||= this.isStart ? null : createCoverageMeter(this.targetXY);
+        const covered = this.isStart ? 0 : this.meter.measure(xs, ys) * this.targetArea;
         return { edges, dirs, join, length, area: cross / 2, covered, stem: g.nStem ? g.nStem[join] : 0 };
     }
 
     // The loop polished block by block, or null if that didn't improve it
     // (with keep: the loop as loaded).
     polishLoop(loop, keep = false) {
+        this.makePolish();
+        if (!this.polish.load(loop.edges, loop.dirs)) return null;
+        // (A rough loop only sets the shape: a quarter of the effort.)
+        const most = this.params.rough ? SOLVER.polishMoves / 4 : SOLVER.polishMoves;
+        const moves = Math.max(most / 4, Math.min(most, 200 * this.polish.bCount));
+        return this.polish.anneal(moves, SOLVER.polishHeat, SOLVER.polishHeat / 100, this.random) || (keep ? this.polish.loop() : null);
+    }
+
+    // The block polish (FacePolish), scoring as this search does.
+    makePolish() {
         if (!this.polish) {
             const { isStart, objective, targetArea } = this;
             const withClimb = Boolean(this.g.eClimb);
@@ -2591,11 +2812,71 @@ class SweepSearch {
             const rank = (area, length, covered, stem, climb, realArea) => limitMisses(measure(area, length, covered, stem, climb, realArea), objective).rank;
             this.polish = new FacePolish(this.g, logScore, rank);
         }
-        if (!this.polish.load(loop.edges, loop.dirs)) return null;
-        // (A rough loop only sets the shape: a quarter of the effort.)
-        const most = this.params.rough ? SOLVER.polishMoves / 4 : SOLVER.polishMoves;
-        const moves = Math.max(most / 4, Math.min(most, 200 * this.polish.bCount));
-        return this.polish.anneal(moves, SOLVER.polishHeat, SOLVER.polishHeat / 100, this.random) || (keep ? this.polish.loop() : null);
+        return this.polish;
+    }
+
+    // A loop grown block by block around a centre: from the block nearest
+    // it (start mode: nearest the start), adding the nearest block next to
+    // the inside that keeps it one simple piece, until it covers the share
+    // of the target asked for (start mode: while it fits the length limit),
+    // or nothing more can be added. For a sweep that found no loop: where
+    // the roads are few (a country's major roads), no loop may move forward
+    // in angle all the way round. Null if there's no block to start from.
+    growLoop(center) {
+        const { g } = this;
+        const F = g.faces;
+        const polish = this.makePolish();
+        if (!this.faceMid) {
+            // Each block's middle (of its corners), and blocks a loop can
+            // start from (proper ones, in the main part of the map).
+            this.faceMid = { x: new Float64Array(F.F), y: new Float64Array(F.F), ok: new Uint8Array(F.F) };
+            for (let f = 0; f < F.F; f++) {
+                let sx = 0, sy = 0, main = true;
+                const n = F.faceOff[f + 1] - F.faceOff[f];
+                for (let k = F.faceOff[f]; k < F.faceOff[f + 1]; k++) {
+                    const h = F.faceHalf[k], v = h & 1 ? F.pTo[h >> 1] : F.pFrom[h >> 1];
+                    sx += F.vX[v];
+                    sy += F.vY[v];
+                    if (!F.vMain[v]) main = false;
+                }
+                this.faceMid.x[f] = sx / n;
+                this.faceMid.y[f] = sy / n;
+                this.faceMid.ok[f] = F.faceOk[f] && F.faceArea[f] > 0 && main ? 1 : 0;
+            }
+        }
+        const { x: mx, y: my, ok } = this.faceMid;
+        // (Blocks outside the target count as up to three times further.)
+        const d2 = (f) => ((mx[f] - center.x) ** 2 + (my[f] - center.y) ** 2) *
+            (F.faceCover ? (1 + 2 * (1 - Math.min(1, F.faceCover[f] / F.faceArea[f]))) ** 2 : 1);
+        // (Start mode: from the block nearest the start, and no longer than
+        // the length limit, if that can be helped.)
+        const { isStart } = this;
+        const from = isStart ? (f) => (mx[f] - this.origin.x) ** 2 + (my[f] - this.origin.y) ** 2 : d2;
+        let seed = -1;
+        for (let f = 0; f < F.F; f++) if (ok[f] && (seed < 0 || from(f) < from(seed))) seed = f;
+        if (seed < 0) return null;
+        const inside = new Uint8Array(F.F);
+        inside[seed] = 1;
+        polish.setInside(inside);
+        const { coverage, maxCoverage, maxLengthM } = this.params;
+        const want = isStart ? Infinity : (maxCoverage ? (coverage + maxCoverage) / 2 : coverage * 1.02) * this.targetArea;
+        const heap = new MinHeap(1024);
+        const offer = (f) => {
+            for (let k = F.faceOff[f]; k < F.faceOff[f + 1]; k++) {
+                const next = F.hFace[F.faceHalf[k] ^ 1];
+                if (!polish.inR[next] && ok[next]) heap.push(d2(next), next);
+            }
+        };
+        offer(seed);
+        while (heap.size && polish.covered < want) {
+            const f = heap.pop();
+            if (polish.inR[f] || !polish.check(f)) continue;
+            if (isStart && polish.nextLength + 2 * polish.nextStem > maxLengthM) continue;
+            polish.flip(f);
+            polish.stem = polish.nextStem;
+            offer(f);
+        }
+        return polish.loop();
     }
 
     // The leader as plain data (for postMessage). See expandLoop() for the
@@ -2729,13 +3010,11 @@ function mulberry32(seed) {
 }
 
 // A loop of merged edges that follows a ring of points (counter-clockwise):
-// shortest paths between the junctions nearest to points every few hundred
+// shortest paths between the junctions nearest to points every `spacing`
 // meters along it, with any detours that come back to the same junction cut
 // out. Null if the roads don't connect.
-function traceLoop(g, ring) {
+function traceLoop(g, ring, nearest = junctionFinder(g), spacing = 300) {
     const { N, x, y, eFrom, eTo, eLen, adjOff, adjEdge } = g;
-    const spacing = 300;
-    const nearest = junctionFinder(g);
     const stops = [];
     for (let i = 0; i < ring.length; i++) {
         const a = ring[i], b = ring[(i + 1) % ring.length];
@@ -2752,7 +3031,13 @@ function traceLoop(g, ring) {
     const prev = new Int32Array(N);
     const heap = new MinHeap(256);
     const touched = [];
-    const route = (from, to) => {
+    // Position of each junction on the walk's stack (below), or -1; and
+    // whether it was passed long before (not just on a detour now).
+    const pos = new Int32Array(N).fill(-1);
+    const old = (v) => pos[v] >= 0 && pos[v] < nodes.length - SOLVER.traceRecent;
+    // The shortest path between two junctions, or null if it's longer
+    // than `limit` (avoiding junctions passed long before: see below).
+    const route = (from, to, limit = Infinity, avoidOld = false) => {
         for (const v of touched) dist[v] = Infinity;
         touched.length = 0;
         heap.size = 0;
@@ -2760,11 +3045,13 @@ function traceLoop(g, ring) {
         touched.push(from);
         heap.push(Math.hypot(x[from] - x[to], y[from] - y[to]), from);
         while (heap.size > 0) {
+            if (heap.keys[0] > limit) return null;
             const u = heap.pop();
             if (u === to) break;
             for (let k = adjOff[u]; k < adjOff[u + 1]; k++) {
                 const e = adjEdge[k];
                 const v = eFrom[e] === u ? eTo[e] : eFrom[e];
+                if (avoidOld && v !== to && old(v)) continue;
                 const d = dist[u] + eLen[e];
                 if (d < dist[v]) {
                     if (dist[v] === Infinity) touched.push(v);
@@ -2790,29 +3077,57 @@ function traceLoop(g, ring) {
     // half closes the ring there instead, and the start of the stack before
     // it is dropped.
     let nodes = [stops[0]], edges = [];
-    const onStack = new Map([[stops[0], 0]]);
+    pos[stops[0]] = 0;
+    // (Where the roads along the line are broken, e.g. a road missing from
+    // the tiles for a stretch, the way to the next stop can be a detour all
+    // the way round the corridor, which would undo the whole walk: then
+    // later stops, up to gapM further on, are tried instead. And where the
+    // line comes back close to itself, the way on shouldn't run through
+    // junctions passed long before, nor head for one, which would cut out
+    // everything since: until near the end, where that closes the ring.)
+    const detour = (from, to) => SOLVER.traceDetour * Math.hypot(x[from] - x[to], y[from] - y[to]) + SOLVER.traceGapM;
     walk: for (let i = 0; i < stops.length; i++) {
-        const to = stops[(i + 1) % stops.length];
-        const path = route(nodes[nodes.length - 1], to);
+        const from = nodes[nodes.length - 1];
+        const closing = i >= 0.9 * stops.length;
+        const usable = (t) => closing || t >= stops.length || !old(stops[t]);
+        let next = i + 1;
+        while (!usable(next)) next++;
+        let path = route(from, stops[next % stops.length], detour(from, stops[next % stops.length]), !closing);
+        while (!path && next < stops.length) {
+            next++;
+            if (!usable(next)) continue;
+            const to = stops[next % stops.length];
+            if (Math.hypot(x[from] - x[to], y[from] - y[to]) > SOLVER.traceGapM) break;
+            path = route(from, to, detour(from, to), !closing);
+        }
+        if (!path) {
+            next = i + 1;
+            path = route(from, stops[next % stops.length]);
+        }
         if (!path) return null;
+        i = next - 1;
         for (const e of path) {
             const u = nodes[nodes.length - 1];
             const v = eFrom[e] === u ? eTo[e] : eFrom[e];
-            if (onStack.has(v)) {
-                const j = onStack.get(v);
+            if (pos[v] >= 0) {
+                const j = pos[v];
                 if ((j === 0 && i === stops.length - 1) || (i >= 0.9 * stops.length && j < nodes.length / 2)) {
                     edges.push(e);
                     nodes = nodes.slice(j);
                     edges = edges.slice(j);
                     break walk;
                 }
+                // (A cut of a third of the way so far is no detour: the roads
+                // are broken here, and following them would collapse the
+                // loop to a small one.)
+                if (nodes.length - 1 - j > Math.max(SOLVER.traceCutMin, nodes.length / 3)) return null;
                 while (nodes.length - 1 > j) {
-                    onStack.delete(nodes.pop());
+                    pos[nodes.pop()] = -1;
                     edges.pop();
                 }
                 continue;
             }
-            onStack.set(v, nodes.length);
+            pos[v] = nodes.length;
             nodes.push(v);
             edges.push(e);
         }
@@ -2892,6 +3207,11 @@ function positionsAlong(faces, ring, smooth = 3) {
     const near = (cx, cy, reach, fn) => {
         const rings = Math.ceil(reach / CELL) + 1;
         let any = false;
+        // (Far from a short ring, all of it: fewer than the cells.)
+        if ((2 * rings + 1) ** 2 > n) {
+            for (let i = 0; i < n; i++) fn(i);
+            return n > 0;
+        }
         for (let gy = Math.max(0, cy - rings); gy <= Math.min(H - 1, cy + rings); gy++) {
             for (let gx = Math.max(0, cx - rings); gx <= Math.min(W - 1, cx + rings); gx++) {
                 const c = gy * W + gx;
@@ -2916,7 +3236,8 @@ function positionsAlong(faces, ring, smooth = 3) {
         let d = Infinity;
         for (let reach = CELL; ; reach *= 2) {
             const any = near(cx, cy, reach, i => { d = Math.min(d, segDist2(i, mx, my)); });
-            if ((any && reach * reach >= d) || reach > 2 * (W + H) * CELL) break;
+            const all = (2 * Math.ceil(reach / CELL) + 3) ** 2 > n;
+            if ((any && (all || reach * reach >= d)) || reach > 2 * (W + H) * CELL) break;
         }
         const limit = Math.sqrt(d) + CELL * Math.SQRT2;
         candOff[c] = candCount;
@@ -2952,6 +3273,33 @@ function positionsAlong(faces, ring, smooth = 3) {
 }
 
 // Point i of an evenly spread 3D sequence in [0, 1)³ (Roberts' R3).
+// Whether junction n of the planar map has roads both ahead of it and
+// behind it, going round `center` counter-clockwise: a loop round the
+// centre can only start (and end) at such a junction (see sweepLoop). On a
+// road running toward the centre, with every other road at the junction
+// leaving forward, it can't.
+function straddles(F, n, center) {
+    const a0 = Math.atan2(F.vY[n] - center.y, F.vX[n] - center.x);
+    let ahead = false, behind = false;
+    for (let k = F.vOff[n]; k < F.vOff[n + 1]; k++) {
+        const p = F.vPiece[k], w = F.pFrom[p] === n ? F.pTo[p] : F.pFrom[p];
+        const d = Math.sin(Math.atan2(F.vY[w] - center.y, F.vX[w] - center.x) - a0);
+        if (d > 0) ahead = true;
+        else if (d < 0) behind = true;
+    }
+    return ahead && behind;
+}
+
+// Whether (x, y) is inside a polygon of {x, y} points (even-odd rule).
+function insideRing(ring, x, y) {
+    let inside = false;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+        const a = ring[i], b = ring[j];
+        if ((a.y > y) !== (b.y > y) && x < a.x + (y - a.y) * (b.x - a.x) / (b.y - a.y)) inside = !inside;
+    }
+    return inside;
+}
+
 function r3(i) {
     const phi = 1.2207440846057596;
     return [(0.5 + i / phi) % 1, (0.5 + i / phi ** 2) % 1, (0.5 + i / phi ** 3) % 1];
@@ -3078,6 +3426,14 @@ class SearchTracker {
 // A search that has found no loop at all after this many sweeps gives up.
 const MAX_EMPTY_SWEEPS = 12;
 
+// An error for "no loop here" (a start search then looks further out, see
+// searchStart in js/pipeline.js).
+function noLoopError(message) {
+    const err = new Error(message);
+    err.noLoop = true;
+    return err;
+}
+
 const noLoopMessage = (params) => params.mode === "start"
     ? "Couldn't form a loop here. Try a larger distance or a different start point."
     : "Couldn't form a loop here. Try a larger area.";
@@ -3137,16 +3493,18 @@ function expandLoop(prep, res, params, exact) {
     }
 
     // Stretches to check before running: fence hops, railroad tracks,
-    // motorways (usually closed to people on foot or bike) and roads marked
-    // private (each a run of road geometry).
+    // motorways (usually closed to people on foot or bike), roads marked
+    // private, and connectors (the rough loop on simplified major roads,
+    // see searchStaged), each a run of road geometry.
     const coords = [], flags = [];
-    let hops = 0, railM = 0, motorwayM = 0, privateM = 0;
+    let hops = 0, railM = 0, motorwayM = 0, privateM = 0, connectorM = 0;
     for (const [e, dir] of ordered) {
         const edge = prep.source[e];
-        const kind = edge.highway === "hop" ? "hop" : edge.highway === "railway" ? "rail"
+        const kind = edge.highway === "hop" ? "hop" : edge.highway === "railway" ? "rail" : edge.highway === "connector" ? "connector"
             : edge.highway === "motorway" || edge.highway === "motorway_link" ? "motorway" : edge.restricted ? "private" : null;
         if (kind === "hop") hops++;
         else if (kind === "rail") railM += edge.distance;
+        else if (kind === "connector") connectorM += edge.distance;
         else if (kind === "motorway") motorwayM += edge.distance;
         else if (kind === "private") privateM += edge.distance;
         const line = edgeCoords(edge);
@@ -3193,7 +3551,8 @@ function expandLoop(prep, res, params, exact) {
         railM,                        // length along railroad tracks
         motorwayM,                    // length on motorways
         privateM,                     // length on roads marked private
-        flags: kept,                  // [{ kind: "hop" | "rail" | "motorway" | "private", coords }]
+        connectorM,                   // length on corridor connectors
+        flags: kept,                  // [{ kind: "hop" | "rail" | "connector" | "motorway" | "private", coords }]
         score: res.score,
         feasible: res.feasible,
         rank: res.rank,
