@@ -41,7 +41,7 @@ async function searchLoop(job, options) {
     let best = null;
     const margins = CONFIG.areaMargins;
     for (let i = 0; i < margins.length; i++) {
-        const region = i === 0 ? job.region : marginRegion(job.target, margins[i]);
+        const region = i === 0 ? job.region : marginRegion(job.target, margins[i], job.objective.coverage);
         let result;
         try {
             result = await searchRegion({ ...job, region }, options);
@@ -77,7 +77,7 @@ async function searchStart(job, options) {
             return await searchRegion(k === 0 ? job : { ...job, region: createCircleRegion(start, radius) }, options);
         } catch (err) {
             if (!err.noLoop) throw err;
-            if (radius >= CONFIG.startWideningMaxM) throw new Error(`No roads that form a loop within ${formatDistance(radius)} of this start point.`);
+            if (radius >= CONFIG.startWideningMaxM) throw new Error(`No roads that form a loop within ${formatDistance(radius, 0)} of this start point.`);
             options.onStatus(`No loop within ${formatDistance(maxLengthM)} here. Looking further out…`, 0);
         }
     }
@@ -111,7 +111,7 @@ async function searchFullDetail(job, { signal, onStatus, onLoop, onNetwork }, ma
     onStatus("Building road network…", 0);
     await nextFrame();
     const network = buildRoadNetwork(osm, job.region);
-    if (network.edges.length === 0) throw noLoopError("No roads found here.");
+    if (network.edges.length === 0) throw noLoopError("There are no roads here.");
     onNetwork(network);
     await loadClimb(network, job, signal, onStatus, 0);
 
@@ -147,7 +147,7 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
     await nextFrame();
     let coarse = buildRoadNetwork(osm, coarseRegion);
     osm = null;   // (no longer needed: memory is tight on big searches)
-    if (coarse.edges.length === 0) throw noLoopError("No major roads found here.");
+    if (coarse.edges.length === 0) throw noLoopError("There are no roads here.");
     onNetwork(coarse);
     // (The climb too, from coarse terrain tiles here: only an estimate, but
     // enough that the rough loop doesn't settle in the hills, where the
@@ -160,7 +160,7 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
     const prefetch = corridorPrefetcher(objective);
     let roughRounds = 0;
     const roughStart = Date.now();
-    const rough = { ...await runSolver(coarse, { ...roughParams(solverParams(job)), avoidMotorways, rough: true }, {
+    const rough = { ...await runSolver(coarse, { ...roughParams(solverParams(job), huge), avoidMotorways, rough: true }, {
         signal,
         onProgress: ({ fraction, rounds, best }) => {
             if (best) onLoop({ ...best, chunked: true }, false);
@@ -259,14 +259,13 @@ async function searchStaged(job, { signal, onStatus, onLoop, onNetwork }) {
 }
 
 // Whether a corridor pass's loop replaces the loop it started from: if it's
-// better, or (first pass) not far worse; see searchStaged. (The rough loop
-// counts as missing every limit, as that's known only on all roads: the
-// first pass's loop replaces it if it meets them all, or is at least half
-// as good. Not a small loop that covers next to nothing, where the rough
-// loop couldn't be followed.)
+// better, or (first pass) if it scores at least half as well; see
+// searchStaged. (The rough loop counts as missing every limit, as that's
+// known only on all roads, so any loop ranks above it: but not a small
+// loop that covers next to nothing, where the rough loop couldn't be
+// followed.)
 const keeps = (loop, from, pass) => pass === 1
-    ? rankOf(loop) === 0 || (isBetterResult(loop, from) && loop.score > 0.5 * from.score) ||
-        (rankOf(loop) <= rankOf(from) && loop.score > 0.9 * from.score)
+    ? loop.score > from.score - 0.5 * Math.abs(from.score)
     : isBetterResult(loop, from);
 
 // The corridor of all roads along a loop for the next pass (see
@@ -459,15 +458,25 @@ function loopPart(loop) {
     return kept.length >= 3 ? kept : points.slice(0, -1);
 }
 
-// The rough stage's params: a narrow range of coverage or area widened by
-// CONFIG.chunked.roughSlack each way, with a mild pull toward the middle of
-// the real range (aimCoverage). Its big blocks of major roads can rarely
+// The rough stage's params: for a huge loop from a start point a length
+// limit a little shorter (CONFIG.chunked.roughLengthSlack), a climb limit a
+// little lower (roughClimbSlack), and a narrow range of coverage or area
+// widened by CONFIG.chunked.roughSlack each way, with a mild pull toward the
+// middle of the real range (aimCoverage). Its big blocks of major roads can rarely
 // land in a range that narrow, and its job is the shape; but the roads
 // along it can only move it a little (a corridor a few km wide), so it
 // should end up close.
-function roughParams(params) {
+function roughParams(params, huge) {
     const slack = CONFIG.chunked.roughSlack;
     const out = { ...params };
+    // (A huge loop's roads, from zoom 7 tiles, are much simplified: on all
+    // roads the same loop is a few percent longer, and a loop from a start
+    // point over its length limit, the most important one, would lose to
+    // any small loop that fits. In area mode the improvement along it
+    // shortens it.)
+    if (huge && params.mode === "start") out.maxLengthM = params.maxLengthM * (1 - CONFIG.chunked.roughLengthSlack);
+    // (Likewise the climb, estimated from coarse terrain tiles.)
+    if (params.maxClimbM != null) out.maxClimbM = params.maxClimbM * (1 - CONFIG.chunked.roughClimbSlack);
     if (params.maxCoverage) {
         out.coverage = params.coverage * (1 - slack);
         out.maxCoverage = params.maxCoverage * (1 + slack);

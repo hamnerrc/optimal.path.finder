@@ -151,10 +151,11 @@ const SOLVER = {
     // Points on a circle followed along the roads (SweepSearch.circleLoop).
     circleStops: 64,
     // Loops grown or traced round a circle (SweepSearch.growLoop,
-    // circleLoop): for every sweep that finds no loop (centred on a spot, or
-    // while there's no loop meeting the coverage target); and while the
-    // best loop misses the target after fallbackAfter sweeps, for the next
-    // fallbackSweeps sweeps, then every fourth.
+    // circleLoop): for every sweep that finds no loop (centred on a spot,
+    // before any loop is found, or in the rough stage of a big search while
+    // the best misses the coverage target); and in that rough stage, while
+    // the best loop misses the target after fallbackAfter sweeps, for the
+    // next fallbackSweeps sweeps, then every fourth.
     fallbackAfter: 6,
     fallbackSweeps: 12,
     // Two roads between the same junctions enclosing less than this
@@ -183,7 +184,8 @@ const SOLVER = {
 //   ePen                        start mode, or area mode with a length
 //                               limit: area lost to each merged edge's
 //                               extra cost (see SOLVER.climbCost); also
-//                               faces.pPen per piece. Otherwise the extra
+//                               faces.pPen per piece, and eRoute, the length
+//                               with the extra cost. Otherwise the extra
 //                               cost is part of eLen and pLen.
 // params.preferSmall: count big roads as a little longer (bigRoadCost).
 // params.preferFlat: count the climb along roads as extra length
@@ -453,7 +455,7 @@ function prepareGraph(network, params) {
     const data = {
         N: M, E, x, y, eFrom, eTo, eLen, eCross,
         adjOff: adjacency.adjOff, adjEdge: adjacency.adjEdge,
-        nStem: null, ePen: null, eClimb: null,
+        nStem: null, ePen: null, eClimb: null, eRoute: null,
         lat0, lng0, kx, ky, equalArea,
         faces: buildFaces(M, eFrom, eTo, eLen, lines, targetXY)
     };
@@ -467,6 +469,9 @@ function prepareGraph(network, params) {
         const perMeter = 0.8 * expectedLength(params, targetXY) / (2 * Math.PI);
         data.ePen = Float64Array.from(eExtra, extra => perMeter * extra);
         data.faces.pPen = perPiece(data.ePen);
+        // (Shortest paths, e.g. tracing a rough loop, still go by the length
+        // with the extra cost: not along a corridor connector.)
+        data.eRoute = Float64Array.from(eLen, (len, e) => len + eExtra[e]);
     }
     if (hasClimbLimits(params)) {
         // The climb of each road, for the climb limits.
@@ -2472,8 +2477,8 @@ class SweepSearch {
         // of reach, after the first few sweeps only now and then: polishing
         // these takes a while, and it may be out of reach for good.)
         const after = this.rounds - SOLVER.fallbackAfter;
-        const missing = this.best && rankOf(this.best) >= 2 && after >= 0 && (after < SOLVER.fallbackSweeps || i % 4 === 0);
-        const failed = !swept && (spotted || !this.best || rankOf(this.best) >= 2);
+        const missing = this.params.rough && this.best && rankOf(this.best) >= 2 && after >= 0 && (after < SOLVER.fallbackSweeps || i % 4 === 0);
+        const failed = !swept && (spotted || !this.best || (this.params.rough && rankOf(this.best) >= 2));
         if (!this.fixedCenter && (failed || missing)) {
             // (A little bigger: the roads round it are mostly further in.)
             const r = (spotted ? this.loopRadius : this.radius * this.reach) * (1.05 + 0.3 * ((i * 0.381966) % 1));
@@ -3014,7 +3019,8 @@ function mulberry32(seed) {
 // meters along it, with any detours that come back to the same junction cut
 // out. Null if the roads don't connect.
 function traceLoop(g, ring, nearest = junctionFinder(g), spacing = 300) {
-    const { N, x, y, eFrom, eTo, eLen, adjOff, adjEdge } = g;
+    const { N, x, y, eFrom, eTo, adjOff, adjEdge } = g;
+    const eLen = g.eRoute || g.eLen;
     const stops = [];
     for (let i = 0; i < ring.length; i++) {
         const a = ring[i], b = ring[(i + 1) % ring.length];

@@ -923,7 +923,7 @@ function searchJobs() {
         label,
         key: `area:${outline.map(p => `${p.lat.toFixed(5)},${p.lng.toFixed(5)}`).join(";")}:${coverage.toFixed(6)}:${maxCoverage?.toFixed(6)}:${roadsKey()}:${limitsKey()}`,
         networkKey: "area",
-        region: marginRegion(target, CONFIG.areaMargins[0]),
+        region: marginRegion(target, CONFIG.areaMargins[0], coverage),
         target,
         roads: roadOptions(),
         objective: { mode: "area", target: outline, coverage, ...(maxCoverage ? { maxCoverage } : {}), ...limitsFor() }
@@ -970,9 +970,9 @@ async function findLoops() {
         if (control.stop) break;
         const prefix = jobs.length > 1 ? `${job.label} (${index + 1} of ${jobs.length}): ` : "";
         let route = null;
-        const show = (loop) => {
+        const show = (loop, final = false) => {
             const isNew = !route;
-            route = showLoop(route, loop, job);
+            route = showLoop(route, loop, job, final);
             if (isNew) {
                 found.push(route);
                 if (found.length === 1) {
@@ -998,7 +998,7 @@ async function findLoops() {
                     console.log("[Network]", network.stats);
                 }
             });
-            show(result);
+            show(result, true);
             route.searching = false;
             // A search that ran to the end needn't be repeated.
             if (!control.stop) route.jobKey = job.key;
@@ -1081,7 +1081,7 @@ function removeNetworkLayer(key) {
 
 // Creates the route for a job on its first loop, then updates it in place as
 // the search finds better loops.
-function showLoop(route, loop, job) {
+function showLoop(route, loop, job, final = false) {
     if (!route) {
         // A new loop replaces the previous one for the same start point or area.
         const replaces = state.routes.find(r =>
@@ -1117,7 +1117,7 @@ function showLoop(route, loop, job) {
     // Start where the loop passes closest to the pin.
     if (job.kind === "start") route.startOffsetM = nearestOffset(route, job.start.latlng);
     route.warning = routeWarning(route, loop, job);
-    route.note = [routeNote(loop), limitedCoverageNote(loop, job)].filter(Boolean).join(" ");
+    route.note = [routeNote(loop, job, final), limitedCoverageNote(loop, job)].filter(Boolean).join(" ");
 
     if (route.id === state.activeRouteId) {
         drawRouteDecor();
@@ -1137,8 +1137,15 @@ function createRoute(fields) {
     return route;
 }
 
-function routeNote(result) {
-    return result.stemM > 30 ? `The loop starts with ${formatDistance(result.stemM)} out to it, and ends with the same stretch back.` : "";
+function routeNote(result, job, final) {
+    const notes = [];
+    if (result.stemM > 30) notes.push(`The loop starts with ${formatDistance(result.stemM)} out to it, and ends with the same stretch back.`);
+    // (The search's answer, far short of the length asked for: the roads
+    // around don't make a bigger loop, e.g. in the countryside of Siberia.)
+    if (final && job.kind === "start" && result.lengthM < 0.5 * job.objective.maxLengthM) {
+        notes.push(`It's the biggest loop the roads around here make: none longer fits in ${formatDistance(job.objective.maxLengthM)}.`);
+    }
+    return notes.join(" ");
 }
 
 // What a loop uses that should be checked before running it (marked in

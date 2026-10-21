@@ -4,7 +4,7 @@
 
 const CONFIG = {
     // Release number, as in index.html's ?v= (for the worker's scripts).
-    release: 14,
+    release: 15,
 
     map: {
         initialCenter: [20, 0],
@@ -121,6 +121,13 @@ const CONFIG = {
         // A coverage or area range is this much wider each way for the
         // rough loop (see roughParams).
         roughSlack: 0.06,
+        // ...and a huge loop's length limit from a start point this much
+        // shorter (zoom 7 roads are much simplified, so the loop is longer
+        // on all roads).
+        roughLengthSlack: 0.05,
+        // ...and a climb limit this much lower (the climb of simplified roads
+        // from coarse terrain tiles is an underestimate).
+        roughClimbSlack: 0.15,
         // The tiles along a search's best loop start downloading once the
         // search is this settled (0..1, see SearchTracker.fraction): before
         // that the loop still changes a lot, and the downloads are wasted.

@@ -4,6 +4,107 @@ Live site: https://hamnerrc.github.io/optimal.path.finder/ (updates on push)
 =============================================================================
 
 -----------------------------------------------------------------------------
+ROUND 13 (2026-10-20): NO SETTING FAILS; NO MORE COLLAPSING; WIDER CORRIDOR
+-----------------------------------------------------------------------------
+Asked for: no setting that causes an error (Russia at 10% failed), big
+searches that "collapsed" to a small loop, a corridor too narrow to find
+some improvements, and more speed.
+
+What I tested (node test harness and Chrome, on this laptop): 15 countries
+and states at various shares (Russia 10% and 90%, Canada, Brazil, China,
+Australia, USA, Texas 90%, Alaska 50%, Norway 30%, Chile 30%, Indonesia,
+Fiji, Greenland, Iowa, Nebraska, Oklahoma, Colorado), start points from
+0.05 mi to 3,000 mi (Moscow, Kansas, Yakutsk, a farm, the open ocean),
+limits (a length cap, a climb cap, a narrow area range, contradictory
+limits), avoid motorways, hills at 10x, tiny and 100% circles, plus the
+usual 15 test searches and the full browser test of the panel.
+
+Before: 9 of 13 country searches failed ("Couldn't form a loop here"),
+and Chile at 30% collapsed to a 443 mi loop covering 1%. Now every one
+of them finds a loop (times in node, roads already downloaded):
+  Russia 10%            roundness 0.28-0.31, 10-11% covered, 15-25 s
+  Canada 10%            0.29, ~25 s
+  Brazil 10%            0.65 (failed before)
+  China 10%             0.55 (0.47 before), 45-60 s
+  Australia 10%         0.57
+  USA 10%               0.75-0.78, ~40 s
+  Texas 90%             90% covered (87%, out of reach, before)
+  Russia 90%            ~19% (all the roads allow), under a minute (was 7 min)
+  Moscow, 3,000 mi      2,961 mi, roundness 0.58, ~20 s
+  Kansas, 3,000 mi      0.67-0.73
+In Chrome, Russia at 10% from a cold start: 69 s, no errors, Chrome at
+about 1.8 GB.
+
+Why they failed, and what changed:
+- Coarse road tiles (the first stage of a big search uses zoom 7 tiles)
+  had flaws that broke the map: both carriageways of divided roads drawn
+  as one line twice (about a quarter of all roads), roads crossing near a
+  vertex never joined, long merged lines crossing themselves, and roads
+  cut at tile edges joined to the wrong road (a highway to the railroad
+  beside it, leaving the highway broken). All fixed: the coarse maps are
+  now properly connected.
+- On sparse maps (a country's major roads) the main search method, which
+  goes once round a centre always moving forward, often finds nothing,
+  and the middle of a country can have no roads at all (Siberia, the
+  Amazon). The search now also tries centres spread over the whole area
+  where roads ring a loop of the size asked for, traces circles along the
+  roads, and grows loops block by block, then polishes them.
+- The collapse: the first loop on all roads always replaced the rough
+  loop, even when the roads along the rough loop were broken somewhere and
+  the search could only find small loops. Now it must be at least half as
+  good. And a broken corridor is bridged: the rough loop itself is added as
+  a "connector" road (it counts as twice as long, so real roads win where
+  they exist); a loop that needs it says so ("X mi of it follows major
+  roads from simplified maps"), marked in orange like railroad tracks.
+- A search that couldn't improve the rough loop on all roads now says so
+  in the warning (it's on simplified major roads).
+
+Corridor: now 5% of the loop's size to either side (was 3%). Tested on
+Kansas 63%, Iowa 70%, Nebraska 50%, Colorado 60%:
+  3%: 0.731, 0.776, 0.732, 0.566     5%: 0.764, 0.788, 0.738, 0.587
+  8%: 0.731, 0.772, 0.733, 0.583 (no better than 5%, and more to load)
+Note: a loop can change by about +-0.02 in roundness from tiny changes
+(nudging the corridor width by 0.3% moved Iowa from 0.792 to 0.776), so
+I compared over several states rather than one.
+
+Start point mode: if no loop fits the length (a 1 mi loop on mile-long
+farm sections), roads further out are loaded and the shortest loop there
+is shown, with a warning that it's longer than the limit; with no roads
+at all within 20 mi it says so. Where the roads make only small loops
+(500 mi around Yakutsk: 10 mi), the note says it's the biggest loop the
+roads around make. A 3,000 mi loop from Moscow no longer collapses.
+
+Speed:
+- Russia at 90%: 7 min -> under a minute (circles traced across empty Siberia made
+  millions of slow lookups; a dead end in the search's bookkeeping took
+  minutes on a 900,000-node corridor; a pointless second widening).
+- Corridors of very dense roads (Java) are made narrower, and corridors
+  across a country may use zoom 11 tiles if zoom 12 would need over 3,000.
+- An area that's big and far from convex (China, Brazil, Norway...) with
+  a target of at most half of it loads roads only within a margin of the
+  area itself, not of its whole convex hull: e.g. China's first stage
+  needs 264 tiles instead of 560.
+- Most of the standard searches are the same or faster (Kansas at 63%:
+  33 s -> 10 s with the roads downloaded; Chicago circle 22 s -> 18 s).
+
+Known limits:
+- Long thin countries at a high share (Norway or Chile at 30%) come out
+  far from round, or short of the target.
+- Place boundaries of island countries and ones across the date line
+  (Indonesia, Fiji) come from OpenStreetMap as rough sea borders: the
+  coverage is measured against that, so it's misleading. Searching for
+  the island itself (Java, Viti Levu) works.
+- Russia at 10% still downloads the major roads of most of northern Asia
+  first (about half of its 70 s in Chrome).
+
+Questions:
+Q74. For a share the roads can't reach (90% of Russia), the search now
+     shows the loop surrounding the most, with a warning. OK, or would you
+     rather it said so before searching, when it can tell?
+Q75. Thin countries (Norway, Chile): is a loop surrounding as much as
+     possible (not round at all) what you'd want there, or roundness first?
+
+-----------------------------------------------------------------------------
 ROUND 12 (2026-10-20): ONE AREA CONTROL, NARROW AREA RANGES AT COUNTRY SCALE
 -----------------------------------------------------------------------------
 "Surround at least" and the Limits area row are now one control in Area and

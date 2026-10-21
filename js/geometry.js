@@ -409,7 +409,100 @@ function createShapeRegion(shape) {
 // area: the shape's convex hull grown by `factor` around its centre,
 // together with its bounding box (north-south and east-west, like most road
 // grids) grown by `factor` around its centre (the convex hull of both).
-function marginRegion(region, factor) {
+function marginRegion(region, factor, coverage = 1) {
+    const hulled = hullMargin(region, factor);
+    // (A big area far from convex, e.g. Russia, whose hull takes in
+    // Mongolia, Kazakhstan and much of the Arctic Ocean, when the loop is
+    // to surround no more than half of it: just what's within as wide a
+    // margin of the area itself, if that's much less to load, counted in
+    // the major-road tiles of a big search. A loop surrounding most of an
+    // area follows its edge, and is rounder with all the room of the hull.)
+    if (region.areaSqKm < BUFFER_MIN_SQ_KM || coverage > BUFFER_MAX_COVERAGE) return hulled;
+    const buffered = bufferedRegion(region, (factor - 1) / 2 * Math.sqrt(region.areaSqKm * 1e6), hulled);
+    const tiles = (r) => tilesCovering(r, CONFIG.chunked.hugeZoom).length;
+    return tiles(buffered) < BUFFER_MAX_SHARE * tiles(hulled) ? buffered : hulled;
+}
+
+// Big areas only (a few states' worth), and only if it's much smaller.
+const BUFFER_MIN_SQ_KM = 100000;
+const BUFFER_MAX_SHARE = 0.7;
+const BUFFER_MAX_COVERAGE = 0.5;
+
+// Everything within `distance` meters of a polygon region (or in it), as
+// a grid of cells about 1/256 of its size. outline is the polygon's (the
+// tiles along it are loaded, see tilesCovering), the Overpass filter
+// `fallback`'s (a region around it).
+function bufferedRegion(region, distance, fallback) {
+    const { toXY, toLatLng } = projectionFor(region.bbox);
+    const xy = region.outline.map(p => toXY(p)), n = xy.length;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const p of xy) {
+        minX = Math.min(minX, p.x - distance);
+        maxX = Math.max(maxX, p.x + distance);
+        minY = Math.min(minY, p.y - distance);
+        maxY = Math.max(maxY, p.y + distance);
+    }
+    const cell = Math.max(maxX - minX, maxY - minY) / 256;
+    const W = Math.ceil((maxX - minX) / cell), H = Math.ceil((maxY - minY) / cell);
+    const mask = new Uint8Array(W * H);
+    // Inside: the cells between crossings of each row's middle line.
+    const xs = [];
+    for (let cy = 0; cy < H; cy++) {
+        const py = minY + (cy + 0.5) * cell;
+        xs.length = 0;
+        for (let i = 0, j = n - 1; i < n; j = i++) {
+            const a = xy[i], b = xy[j];
+            if ((a.y > py) !== (b.y > py)) xs.push(a.x + (py - a.y) * (b.x - a.x) / (b.y - a.y));
+        }
+        xs.sort((p, q) => p - q);
+        for (let k = 0; k + 1 < xs.length; k += 2) {
+            const c0 = Math.max(0, Math.ceil((xs[k] - minX) / cell - 0.5)), c1 = Math.min(W - 1, Math.floor((xs[k + 1] - minX) / cell - 0.5));
+            for (let cx = c0; cx <= c1; cx++) mask[cy * W + cx] = 1;
+        }
+    }
+    // Near: cells whose middle is within the distance of an edge, with half
+    // a cell's diagonal more.
+    const reach = distance + cell * Math.SQRT1_2;
+    for (let i = 0, j = n - 1; i < n; j = i++) {
+        const a = xy[i], b = xy[j];
+        const ex = b.x - a.x, ey = b.y - a.y, len2 = ex * ex + ey * ey;
+        const x0 = Math.max(0, Math.floor((Math.min(a.x, b.x) - reach - minX) / cell)), x1 = Math.min(W - 1, Math.floor((Math.max(a.x, b.x) + reach - minX) / cell));
+        const y0 = Math.max(0, Math.floor((Math.min(a.y, b.y) - reach - minY) / cell)), y1 = Math.min(H - 1, Math.floor((Math.max(a.y, b.y) + reach - minY) / cell));
+        for (let cy = y0; cy <= y1; cy++) {
+            const py = minY + (cy + 0.5) * cell;
+            for (let cx = x0; cx <= x1; cx++) {
+                if (mask[cy * W + cx]) continue;
+                const px = minX + (cx + 0.5) * cell;
+                const t = len2 > 0 ? Math.max(0, Math.min(1, ((px - a.x) * ex + (py - a.y) * ey) / len2)) : 0;
+                if ((a.x + t * ex - px) ** 2 + (a.y + t * ey - py) ** 2 <= reach * reach) mask[cy * W + cx] = 1;
+            }
+        }
+    }
+    let cells = 0;
+    for (let k = 0; k < W * H; k++) cells += mask[k];
+    // (The latitude and longitude range: of points round the grid's edge.)
+    const edge = [];
+    for (let k = 0; k <= 64; k++) {
+        const fx = minX + (maxX - minX) * k / 64, fy = minY + (maxY - minY) * k / 64;
+        edge.push(toLatLng(fx, minY), toLatLng(fx, maxY), toLatLng(minX, fy), toLatLng(maxX, fy));
+    }
+    return {
+        type: "buffer",
+        outline: region.outline,
+        areaSqKm: cells * cell * cell / 1e6,
+        bbox: boundsOf(edge),
+        contains(lat, lng) {
+            const p = toXY({ lat, lng });
+            const cx = Math.floor((p.x - minX) / cell), cy = Math.floor((p.y - minY) / cell);
+            return cx >= 0 && cy >= 0 && cx < W && cy < H && mask[cy * W + cx] === 1;
+        },
+        overpassFilter: fallback.overpassFilter
+    };
+}
+
+// The region's convex hull and north-south bounding box, both enlarged by
+// `factor` (see marginRegion).
+function hullMargin(region, factor) {
     const bbox = region.bbox;
     const { toXY, toLatLng } = localProjection((bbox.minLat + bbox.maxLat) / 2, (bbox.minLng + bbox.maxLng) / 2);
     const hull = convexHull(region.outline.map(toXY));

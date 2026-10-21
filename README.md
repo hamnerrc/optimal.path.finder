@@ -136,7 +136,11 @@ If the tile server can't be reached, the Overpass API is used instead.
    road network and prunes it to the part a ring can use: dead-end streets,
    and whole trees of streets hanging off them, are removed repeatedly
    until every node has at least two streets. Chains of roads between
-   junctions are merged into single edges. In start point mode it also finds
+   junctions are merged into single edges, and of two such edges between
+   the same junctions that run along each other (closer than 15 m on
+   average: both carriageways of a divided road, as coarse tiles draw them)
+   one is dropped, since the sliver between them is no use to a loop. In
+   start point mode it also finds
    the shortest path from the start to every junction within half the length
    limit, for the out-and-back stem. `buildFaces()` then makes the map planar
    (a road crossing another without a junction, e.g. on a bridge, gets a
@@ -170,13 +174,29 @@ If the tile server can't be reached, the Overpass API is used instead.
    area mode around the area's middle; every third sweep of each search is
    re-centred on its best loop so far, and the other sweeps of all searches
    together take consecutive points of the sequence, so every direction is
-   tried), polishing each loop that comes close to the best.
+   tried), polishing each loop that comes close to the best. A sweep starts
+   at a junction of the map's biggest 2-connected part with roads both ahead
+   of it and behind it around the centre (a loop can't close anywhere else).
+   When the loop asked for is much smaller than the area (under about a
+   fifth of it, e.g. 10% of Russia), every other sweep is centred on one of
+   the "spots" where roads ring a circle of that size, spread over the whole
+   area: the middle can be roadless (Siberia, the Amazon).
    `js/solve.js` runs one search per spare CPU core in Web Workers (started
    when the page loads and kept between searches), each taking its share of
    the sequence. `SearchTracker` stops them once enough sweeps in a row
    (40 + 4 per worker, and at least half as many as it took to find the
    best loop) have found nothing more than 0.1% better. Sweeps are counted
    in sequence order, so the same search always gives the same loop.
+5. **Fallbacks for sparse maps.** On a country's major roads a sweep often
+   finds nothing: no loop keeps moving forward in angle all the way round.
+   Then (and in a big search's rough stage while the best loop misses the
+   coverage target) two more loops are tried and polished: one traced along
+   the roads round a circle of the size asked for (`circleLoop`), and one
+   grown block by block from the centre until it covers enough
+   (`growLoop`). Start point mode grows from the block nearest the start
+   while the loop fits the length; if no loop fits at all (a farm road in a
+   grid of mile-long sections), roads further out are loaded
+   (`searchStart`) and the shortest loop there is shown, flagged as too long.
 
 At a virtual vertex (a road crossing another without a junction) the way
 on depends on the way in, so the sweep keeps separate states for paths
@@ -202,7 +222,9 @@ its convex hull and its north-south bounding box, both enlarged by 20%, so
 the loop can use roads outside its edge, including the corners of a
 square of grid streets around a round area. A wider margin often gives a
 much rounder loop. If the coverage target still can't be reached, the
-search is repeated with 40%.
+search is repeated with 40% (unless the loop got less than halfway there:
+then the area has too few roads, e.g. 90% of Russia, and a wider margin
+won't help).
 
 **Areas at country scale.** Areas are measured in a Lambert azimuthal
 equal-area projection for anything more than about 200 km across
@@ -233,8 +255,9 @@ that, `js/pipeline.js` searches in stages:
    motorways, trunk and primary roads from zoom 7 tiles instead (the US:
    390 tiles). This stage settles sooner than other searches (it only sets
    the shape).
-2. All roads within 3% of the rough loop's size (its length / π, at least
-   1 km) to either side are loaded (just the tiles along it), the rough loop is traced onto them, and it is improved stretch by
+2. All roads within 5% of the rough loop's size (its length / π, at least
+   1 km, 3 km for a loop over 2,000 km) to either side are loaded (just the
+   tiles along it), the rough loop is traced onto them, and it is improved stretch by
    stretch (`SweepSearch.refine`): each stretch between two junctions, from
    3 km (or a 400th of the loop) up to a twelfth of the loop long, is replaced by the best path between its
    ends that keeps moving forward along the loop, if that makes the whole
@@ -249,17 +272,42 @@ that, `js/pipeline.js` searches in stages:
    ones from coarse terrain tiles (an estimate, but enough that the rough
    loop doesn't settle somewhere the later stages couldn't get it out of).
 
-A corridor takes at most about 1,500 tiles (`corridorPlan`). Tile servers
-answer about 150 requests a second whatever their size, so the number of
-tiles is what a download costs. If full-detail tiles (zoom 14) would need
-more, zoom 13 tiles (every road but paths and tracks) or zoom 12 tiles
-(also no service roads), which cover 4 and 16 times the area each, are used
-instead, and at zoom 12 the corridor is narrowed if needed (to no less
-than a quarter of a tile, about 2 km: a rough loop from zoom 7 tiles can
-be a kilometer off its roads). Once a stage's search begins to settle, the
-tiles along its best loop so far start downloading, so the next corridor
-is mostly loaded when it starts. Ends of a road cut at a tile edge are joined up to 15 m
-apart at zoom 12 (coarse tiles are simplified separately on each side).
+A corridor takes at most about 1,500 tiles (`corridorPlan`, which counts
+them exactly). Tile servers answer about 150 requests a second whatever
+their size, so the number of tiles is what a download costs. If
+full-detail tiles (zoom 14) would need more, zoom 13 tiles (every road but
+paths and tracks) or zoom 12 tiles (also no service roads), which cover 4
+and 16 times the area each, are used instead, and at zoom 12 the corridor
+is narrowed if needed (to no less than a quarter of a tile, about 2 km: a
+rough loop from zoom 7 tiles can be a kilometer off its roads). Only a
+loop across a country that would need over 3,000 zoom 12 tiles gets zoom
+11 tiles (no streets). A corridor holding more than 1.5 million road
+points (very dense roads, e.g. Java) is made half as wide. Once a stage's
+search begins to settle, the tiles along its best loop so far start
+downloading, so the next corridor is mostly loaded when it starts.
+
+The first corridor also gets the rough loop itself as a "connector" road,
+counted as twice as long: where the roads in the corridor are broken (a
+road missing from the tiles for a stretch, a gap at a tile edge), the loop
+still gets round, and the stretch is flagged. Tracing the rough loop
+skips gaps in the roads (trying stops further on), and doesn't route
+through junctions it passed long before, where the rough loop comes back
+close to itself. The rough loop counts as missing every limit (that's
+known only on all roads), so the first corridor's loop replaces it only
+if it scores at least half as well: a loop that collapsed to a small one
+where the rough loop couldn't be followed is never kept. If no corridor
+loop is kept, the rough loop is the answer, and says it's on simplified
+major roads.
+
+Coarse tiles need care to make a connected map: both carriageways of a
+divided road are often the same line (kept once), roads crossing within a
+unit (zoom 7: 76 m) of a vertex of one of them are joined there, a merged
+line crossing itself is joined at the crossing, and the noding runs twice
+(rounding split points to whole units makes new crossings). Ends of roads
+cut at a tile edge are paired across the edge, closest first and the same
+kind of road before another, up to 1.5 pixels apart (zoom 12: about 57 m;
+a road and a railroad side by side were otherwise joined the wrong way
+round, breaking the road). Tiles across the antimeridian wrap round.
 
 To keep memory low on such searches, road geometry is kept in flat arrays
 (not an array or object per point), coarse tiles skip the water layers
@@ -273,7 +321,9 @@ Times in Chrome on a 2015 dual-core laptop, from a cold start (nothing
 downloaded yet): Kansas at 75% about 45 seconds (it was about 3 minutes,
 for a less round loop); the United States at 10% about 50 seconds, with
 the tab's memory peaking around 1.4 GB (the live data is under 1 GB; the
-rest is garbage the browser hasn't collected yet).
+rest is garbage the browser hasn't collected yet); Russia at 10% about 70
+seconds (half of it downloading the major roads of its whole convex hull),
+Chrome peaking around 1.8 GB.
 
 ## External services
 
